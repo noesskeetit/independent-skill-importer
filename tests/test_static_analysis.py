@@ -42,16 +42,22 @@ def _symlink(path: str, target: str) -> InventoryEntry:
     )
 
 
+def _directory(path: str) -> InventoryEntry:
+    return InventoryEntry(path=path, kind="directory", size=0)
+
+
 def _inventory(
     files: Mapping[str, str],
     *,
     symlinks: Mapping[str, str] | None = None,
     executables: frozenset[str] = frozenset(),
+    directories: frozenset[str] = frozenset(),
 ) -> Inventory:
     entries = [
         _file(path, content, executable=path in executables) for path, content in files.items()
     ]
     entries.extend(_symlink(path, target) for path, target in (symlinks or {}).items())
+    entries.extend(_directory(path) for path in directories)
     return Inventory(entries=tuple(sorted(entries, key=lambda item: item.path)))
 
 
@@ -76,8 +82,14 @@ def _analyze(
     root: str = "skills/alpha",
     symlinks: Mapping[str, str] | None = None,
     executables: frozenset[str] = frozenset(),
+    directories: frozenset[str] = frozenset(),
 ) -> StaticAnalysisResult:
-    inventory = _inventory(files, symlinks=symlinks, executables=executables)
+    inventory = _inventory(
+        files,
+        symlinks=symlinks,
+        executables=executables,
+        directories=directories,
+    )
     boundaries = detect_boundaries(inventory)
     candidates = discover_candidates(_resolved(tmp_path), inventory, boundaries)
     candidate = next(item for item in candidates if item.root == root)
@@ -209,6 +221,16 @@ def test_blocked_signal_is_stronger_than_invalid_but_both_reasons_survive(
         "${PLUGIN_ROOT:?plugin required}",
         "${CLAUDE_PLUGIN_ROOT:-}",
         "${PLUGIN_ROOT%/}",
+        "${PLUGIN_ROOT-default}",
+        "${PLUGIN_ROOT?plugin required}",
+        "${PLUGIN_ROOT+alternate}",
+        "${PLUGIN_ROOT=default}",
+        "${PLUGIN_ROOT/foo/bar}",
+        "${PLUGIN_ROOT^}",
+        "${#PLUGIN_ROOT}",
+        "${!PLUGIN_ROOT}",
+        "${env:PLUGIN_ROOT}",
+        "%PLUGIN_ROOT:~0,-1%",
         "extensionPath",
     ],
 )
@@ -271,6 +293,8 @@ def test_plugin_root_environment_access_is_plugin_bound(
     "text",
     [
         "Read `process.env.HOME`.",
+        "Read `${OTHER-default}`.",
+        "Read `${PLUGIN_ROOT_BACKUP}`.",
         "The PLUGIN_ROOT identifier is mentioned only as prose.",
     ],
 )
@@ -314,6 +338,16 @@ def test_metadata_only_root_plugin_can_package_a_self_contained_script(tmp_path:
         "Never use this skill without enabling the plugin.",
         "This skill cannot run without the plugin installed.",
         "Not only does this skill require the plugin to be installed, it also needs setup.",
+        "This skill does not require the plugin to be installed unless cloud mode is active.",
+        (
+            "This skill does not require the plugin to be installed, "
+            "but the plugin must already be enabled."
+        ),
+        (
+            "This skill does not require the plugin locally, "
+            "but cloud mode requires the plugin enabled."
+        ),
+        "It is false that this skill does not require the plugin to be installed.",
     ],
 )
 def test_affirmative_plugin_install_instruction_is_plugin_bound(
@@ -347,6 +381,36 @@ def test_negated_plugin_install_instruction_is_not_plugin_bound(
 
     assert result.classification is Classification.PORTABLE
     assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        pytest.param(
+            "It is false that "
+            + " " * 300
+            + "this skill does not require the plugin to be installed.",
+            id="negation_before_bounded_window",
+        ),
+        pytest.param(
+            "This skill does not require the plugin to be installed"
+            + " " * 300
+            + "unless cloud mode is active.",
+            id="condition_after_bounded_window",
+        ),
+    ],
+)
+def test_plugin_independence_requires_complete_bounded_sentence(
+    instruction: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill(f"{instruction}\n")},
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE in result.reason_codes
 
 
 def test_negated_plugin_install_instruction_keeps_mixed_package_ambiguous(
@@ -874,6 +938,156 @@ def test_outer_manifest_declared_runtime_inside_nested_boundary_references_skill
     reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
     assert reason.evidence[0].path == "packages/b/lib/tool.py"
     assert "packages/b/skills/x/SKILL.md" in reason.evidence[0].value
+
+
+def test_outer_manifest_declared_runtime_directory_owns_nested_descendant(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "packages/b/lib"}),
+            "packages/b/plugin.json": json.dumps({}),
+            "packages/b/lib/tool.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        directories=frozenset({"packages/b/lib"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "packages/b/lib/tool.py"
+
+
+@pytest.mark.parametrize(
+    ("runtime_root", "directories"),
+    [
+        pytest.param("packages/b", frozenset({"packages/b"}), id="candidate_ancestor"),
+        pytest.param(".", frozenset(), id="boundary_root"),
+    ],
+)
+def test_outer_manifest_declared_runtime_root_contains_nested_candidate(
+    runtime_root: str,
+    directories: frozenset[str],
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": runtime_root}),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        directories=directories,
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "plugin.json"
+    assert reason.evidence[0].field == "runtime"
+    assert reason.evidence[0].value == runtime_root
+
+
+def test_outer_manifest_declared_runtime_inside_sibling_skill_owns_file(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "skills/internal/scripts/runtime.py"}),
+            "skills/internal/SKILL.md": _skill(name="internal"),
+            "skills/internal/scripts/runtime.py": ('open("packages/b/skills/x/SKILL.md")'),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "skills/internal/scripts/runtime.py"
+
+
+def test_undeclared_sibling_skill_file_is_not_reverse_dependency(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "src/runtime.py"}),
+            "src/runtime.py": "pass",
+            "skills/internal/SKILL.md": _skill(name="internal"),
+            "skills/internal/scripts/runtime.py": ('open("packages/b/skills/x/SKILL.md")'),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
+def test_outer_manifest_declared_runtime_directory_overrides_documentation_exclusion(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "examples/runtime"}),
+            "examples/runtime/tool.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        directories=frozenset({"examples/runtime"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "examples/runtime/tool.py"
+
+
+def test_package_plugin_wrapper_source_declares_runtime_inside_nested_docs(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {"plugin": {"source": "packages/b/examples/runtime/tool.ts"}}
+            ),
+            "packages/b/examples/runtime/tool.ts": ('open("packages/b/skills/x/SKILL.md")'),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "packages/b/examples/runtime/tool.ts"
+
+
+def test_package_top_level_source_is_not_plugin_runtime_declaration(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {
+                    "source": "packages/b/examples/runtime/tool.ts",
+                    "plugin": {"skills": ["packages/b/skills/x"]},
+                }
+            ),
+            "packages/b/examples/runtime/tool.ts": ('open("packages/b/skills/x/SKILL.md")'),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
 
 
 def test_reverse_structured_skill_name_is_plugin_bound(tmp_path: Path) -> None:

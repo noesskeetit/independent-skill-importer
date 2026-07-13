@@ -33,12 +33,13 @@ _PLUGIN_ENV_NAME_PATTERN = (
     r"|EXTENSION_(?:ROOT|DIR|PATH))"
 )
 _PLUGIN_VARIABLE_RE = re.compile(
-    rf"\$\{{{_PLUGIN_ENV_NAME_PATTERN}"
-    r"(?:(?::[-=?+]?|[#%]{1,2})[^}\r\n]{0,256})?\}"
+    rf"\$\{{{_PLUGIN_ENV_NAME_PATTERN}(?![A-Za-z0-9_])[^}}\r\n]{{0,256}}\}}"
+    rf"|\$\{{[#!]{_PLUGIN_ENV_NAME_PATTERN}(?![A-Za-z0-9_])[^}}\r\n]{{0,256}}\}}"
+    rf"|\$\{{env:{_PLUGIN_ENV_NAME_PATTERN}\}}"
     r"|\$(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)\b"
     r"|\$EXTENSION_(?:ROOT|DIR|PATH)\b"
     rf"|\$env:{_PLUGIN_ENV_NAME_PATTERN}\b"
-    rf"|%{_PLUGIN_ENV_NAME_PATTERN}%"
+    rf"|%{_PLUGIN_ENV_NAME_PATTERN}(?::[^%\r\n]{{0,256}})?%"
     rf"|\b(?:process|Deno|Bun)\.env\.{_PLUGIN_ENV_NAME_PATTERN}\b"
     rf"|\b(?:process|Deno|Bun)\.env\[\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\]"
     rf"|\bos\.environ\[\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\]"
@@ -64,7 +65,7 @@ _PATH_TOKEN_RE = re.compile(
 _HOST_PATH_TOKEN_RE = re.compile(
     r"(?P<file>file://[^\s`'\"<>]+)"
     r"|(?P<windows>(?<![A-Za-z0-9])[A-Za-z]:(?:\\|/(?!/))[^\s`'\"<>]+)"
-    r"|(?P<posix>(?<![\w:/.$}])/(?!/)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)"
+    r"|(?P<posix>(?<![\w:/.$}%])/(?!/)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)"
     r"|(?P<encoded>(?<![A-Za-z0-9:/])(?:%2e|%2f|%5c)[^\s`'\"<>]+)",
     re.IGNORECASE,
 )
@@ -107,14 +108,16 @@ _RUNTIME_FILENAME_RE = re.compile(
 _PLUGIN_INSTALL_RE = re.compile(
     r"(?:requires?|needs?)\b[^\n]{0,80}\bplugin\b[^\n]{0,80}\b(?:installed|enabled)\b"
     r"|\b(?:install|enable)\b[^\n]{0,80}\bplugin\b"
-    r"|\bplugin\b[^\n]{0,80}\bmust\s+be\s+(?:installed|enabled)\b"
+    r"|\bplugin\b[^\n]{0,80}\bmust(?:\s+already)?\s+be\s+(?:installed|enabled)\b"
     r"|\bwithout\b[^\n]{0,80}\b(?:installing|enabling)\b[^\n]{0,80}\bplugin\b"
     r"|\bwithout\b[^\n]{0,80}\bplugin\b[^\n]{0,80}\b(?:installed|enabled)\b",
     re.IGNORECASE,
 )
 _PROVEN_PLUGIN_INDEPENDENCE_RE = re.compile(
-    r"\b(?:do|does|did)\s+not\s+(?:require|need)\b"
-    r"|\bneed\s+not\s+(?:to\s+)?(?:install|enable)\b",
+    r"^\s*(?:this\s+skill\s+)?(?:do|does|did)\s+not\s+require\s+"
+    r"(?:the\s+|a\s+|any\s+)?plugin\s+to\s+be\s+(?:installed|enabled)\s*[.!]?\s*$"
+    r"|^\s*(?:you\s+)?(?:do|does|did)\s+not\s+need\s+to\s+(?:install|enable)\s+"
+    r"(?:the\s+|a\s+|any\s+)?plugin\s*[.!]?\s*$",
     re.IGNORECASE,
 )
 _URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
@@ -270,6 +273,8 @@ _RUNTIME_MANIFEST_KEYS = frozenset(
         "src",
     }
 )
+_DECLARED_RUNTIME_ROOT_KEYS = _RUNTIME_MANIFEST_KEYS - {"source", "src"}
+_CONTEXTUAL_RUNTIME_ROOT_KEYS = frozenset({"source", "src"})
 _BLOCKED_CODES = frozenset(
     {
         ReasonCode.SYMLINK_ESCAPE,
@@ -345,11 +350,12 @@ class _OwnedComponents:
     providers: set[str]
     binaries: set[str]
     runtime_paths: set[str]
+    declared_runtime_roots: set[str]
     runtime_modules: set[str]
 
     @classmethod
     def empty(cls) -> _OwnedComponents:
-        return cls(set(), set(), set(), set(), set(), set(), set(), set())
+        return cls(set(), set(), set(), set(), set(), set(), set(), set(), set())
 
 
 @dataclass(frozen=True, slots=True)
@@ -610,12 +616,63 @@ def _component_symbols(value: object) -> set[str]:
 
 
 def _path_if_owned(value: str, boundary: PackageBoundary, inventory: Inventory) -> str | None:
-    cleaned = _clean_reference(value)
+    literal = value.strip().strip("`'\"<>")
+    cleaned = literal if literal in {".", "./"} else _clean_reference(value)
     if not cleaned or _URL_SCHEME_RE.match(cleaned) is not None:
         return None
-    relative = cleaned.removeprefix("./")
-    candidate = relative if boundary.root == "." else f"{boundary.root}/{relative}"
-    return candidate if candidate in inventory.by_path else None
+    candidate, escaped = _collapse_path(PurePosixPath(boundary.root), cleaned)
+    if escaped or candidate is None:
+        return None
+    return candidate if candidate == boundary.root or candidate in inventory.by_path else None
+
+
+def _is_declared_runtime_root_key(
+    key: str,
+    *,
+    depth: int,
+    parent_key: str,
+    manifest_path: str,
+) -> bool:
+    if key in _DECLARED_RUNTIME_ROOT_KEYS:
+        return True
+    if key not in _CONTEXTUAL_RUNTIME_ROOT_KEYS:
+        return False
+    return (depth == 0 and PurePosixPath(manifest_path).name.casefold() != "package.json") or (
+        depth == 1 and parent_key in _PACKAGE_PLUGIN_WRAPPERS
+    )
+
+
+def _iter_declared_runtime_values(
+    parsed: Mapping[str, object],
+    manifest_path: str,
+) -> Iterable[tuple[str, str]]:
+    pending: list[tuple[object, int, str]] = [(parsed, 0, "")]
+    visited = 0
+    while pending:
+        current, depth, parent_key = pending.pop()
+        visited += 1
+        if visited > _MAX_MANIFEST_NODES:
+            return
+        if isinstance(current, Mapping):
+            for raw_key, value in current.items():
+                if visited + len(pending) >= _MAX_MANIFEST_NODES:
+                    return
+                if not isinstance(raw_key, str):
+                    continue
+                key = _normalized_component(raw_key)
+                if _is_declared_runtime_root_key(
+                    key,
+                    depth=depth,
+                    parent_key=parent_key,
+                    manifest_path=manifest_path,
+                ):
+                    for string in _iter_strings(value):
+                        yield raw_key, string
+                    continue
+                pending.append((value, depth + 1, key))
+        elif isinstance(current, (list, tuple)):
+            remaining = _MAX_MANIFEST_NODES - visited - len(pending)
+            pending.extend((item, depth + 1, parent_key) for item in current[:remaining])
 
 
 def _is_known_runtime_component_path(path: str, boundary: PackageBoundary) -> bool:
@@ -632,11 +689,12 @@ def _collect_manifest_components(
     boundary: PackageBoundary,
     inventory: Inventory,
     owned: _OwnedComponents,
+    manifest_path: str,
 ) -> None:
-    pending: list[object] = [parsed]
+    pending: list[tuple[object, int, str]] = [(parsed, 0, "")]
     visited = 0
     while pending:
-        current = pending.pop()
+        current, depth, parent_key = pending.pop()
         visited += 1
         if visited > _MAX_MANIFEST_NODES:
             return
@@ -655,10 +713,17 @@ def _collect_manifest_components(
                         path = _path_if_owned(string, boundary, inventory)
                         if path is not None:
                             owned.runtime_paths.add(path)
-                pending.append(value)
+                            if _is_declared_runtime_root_key(
+                                key,
+                                depth=depth,
+                                parent_key=parent_key,
+                                manifest_path=manifest_path,
+                            ):
+                                owned.declared_runtime_roots.add(path)
+                pending.append((value, depth + 1, key))
         elif isinstance(current, (list, tuple)):
             remaining = _MAX_MANIFEST_NODES - visited - len(pending)
-            pending.extend(current[:remaining])
+            pending.extend((item, depth + 1, parent_key) for item in current[:remaining])
 
 
 def _boundary_depth(boundary: PackageBoundary) -> int:
@@ -703,16 +768,25 @@ def _derive_boundary_owned_components(
             continue
         parsed = _manifest_json(entry)
         if parsed is not None:
-            _collect_manifest_components(parsed, boundary, inventory, owned)
+            _collect_manifest_components(parsed, boundary, inventory, owned, path)
 
-    declared_runtime_roots = frozenset(owned.runtime_paths)
+    declared_runtime_roots = frozenset(owned.declared_runtime_roots)
     for entry in inventory.entries:
         if (
             not _is_within(entry.path, boundary.root)
             or _is_within(entry.path, candidate.root)
-            or _is_within_any(entry.path, nested_roots)
-            or _is_within_any(entry.path, skill_roots)
-            or _is_documentation(entry.path, boundary)
+            or (
+                _is_within_any(entry.path, nested_roots)
+                and not _is_within_any(entry.path, declared_runtime_roots)
+            )
+            or (
+                _is_within_any(entry.path, skill_roots)
+                and not _is_within_any(entry.path, declared_runtime_roots)
+            )
+            or (
+                _is_documentation(entry.path, boundary)
+                and not _is_within_any(entry.path, declared_runtime_roots)
+            )
         ):
             continue
         relative = PurePosixPath(_relative_to(entry.path, boundary.root))
@@ -795,6 +869,7 @@ def _aggregate_owned_components(
         aggregate.providers.update(ownership.components.providers)
         aggregate.binaries.update(ownership.components.binaries)
         aggregate.runtime_paths.update(ownership.components.runtime_paths)
+        aggregate.declared_runtime_roots.update(ownership.components.declared_runtime_roots)
         aggregate.runtime_modules.update(ownership.components.runtime_modules)
     return aggregate
 
@@ -1003,12 +1078,20 @@ def _command_binary(line: str) -> str | None:
 def _plugin_install_match_proves_independence(content: str, match: re.Match[str]) -> bool:
     window_start = max(0, match.start() - _PLUGIN_NEGATION_CONTEXT_CHARS)
     prefix = content[window_start : match.start()]
-    clause_start = max(
-        (prefix.rfind(delimiter) for delimiter in "\n.!?;,:"),
-        default=-1,
-    )
-    clause = f"{prefix[clause_start + 1 :]}{match.group(0)}"
-    return _PROVEN_PLUGIN_INDEPENDENCE_RE.search(clause) is not None
+    sentence_start = max((prefix.rfind(delimiter) for delimiter in "\n.!?;"), default=-1)
+    if window_start > 0 and sentence_start < 0:
+        return False
+
+    window_end = min(len(content), match.end() + _PLUGIN_NEGATION_CONTEXT_CHARS)
+    suffix = content[match.end() : window_end]
+    sentence_end_candidates = [
+        position for delimiter in "\n.!?;" if (position := suffix.find(delimiter)) >= 0
+    ]
+    if window_end < len(content) and not sentence_end_candidates:
+        return False
+    sentence_end = min(sentence_end_candidates) + 1 if sentence_end_candidates else len(suffix)
+    sentence = f"{prefix[sentence_start + 1 :]}{match.group(0)}{suffix[:sentence_end]}"
+    return _PROVEN_PLUGIN_INDEPENDENCE_RE.fullmatch(sentence) is not None
 
 
 def _is_owned_runtime_path(
@@ -1487,6 +1570,7 @@ def _analyze_boundary_reverse_dependencies(
         for item in boundaries
         if item.root != boundary.root and _is_within(item.root, boundary.root)
     )
+    declared_runtime_roots = frozenset(owned.declared_runtime_roots)
     skill_roots = _excluded_skill_roots(candidate, inventory)
     for entry in inventory.entries:
         if (
@@ -1494,9 +1578,18 @@ def _analyze_boundary_reverse_dependencies(
             or entry.content is None
             or not _is_within(entry.path, boundary.root)
             or _is_within(entry.path, candidate.root)
-            or (_is_within_any(entry.path, nested_roots) and entry.path not in owned.runtime_paths)
-            or _is_within_any(entry.path, skill_roots)
-            or _is_documentation(entry.path, boundary)
+            or (
+                _is_within_any(entry.path, nested_roots)
+                and not _is_within_any(entry.path, declared_runtime_roots)
+            )
+            or (
+                _is_within_any(entry.path, skill_roots)
+                and not _is_within_any(entry.path, declared_runtime_roots)
+            )
+            or (
+                _is_documentation(entry.path, boundary)
+                and not _is_within_any(entry.path, declared_runtime_roots)
+            )
             or not (
                 entry.path in manifest_paths
                 or entry.executable
@@ -1507,6 +1600,28 @@ def _analyze_boundary_reverse_dependencies(
             continue
         content = entry.content
         parsed = _manifest_json(entry)
+        declared_root_contains_candidate = False
+        if entry.path in manifest_paths and parsed is not None:
+            for field, raw_value in _iter_declared_runtime_values(parsed, entry.path):
+                declared_root = _path_if_owned(raw_value, boundary, inventory)
+                if declared_root is None or not _is_within(candidate.root, declared_root):
+                    continue
+                if collector.has_capacity(ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME):
+                    collector.add(
+                        ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            max(content.find(raw_value), 0),
+                            raw_value,
+                            "static.reverse.runtime_root_contains_skill",
+                            field=field,
+                        ),
+                    )
+                declared_root_contains_candidate = True
+                break
+        if declared_root_contains_candidate:
+            continue
         path_search_content = content
         if entry.path in manifest_paths and parsed is not None:
             path_search_content = json.dumps(
