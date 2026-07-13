@@ -94,6 +94,7 @@ _RUNTIME_DIRECTORY_NAMES = frozenset(
         "src",
     }
 )
+_ROOT_SKILL_PAYLOAD_DIRECTORY_NAMES = frozenset({"script", "scripts"})
 _MAX_MANIFEST_NODES = 4096
 
 
@@ -213,6 +214,21 @@ def _is_known_runtime_directory(path: str, root: str) -> bool:
     )
 
 
+def _is_root_skill_script_payload(entry: InventoryEntry, root: str) -> bool:
+    """Recognize only a conventional top-level script(s) directory as skill payload."""
+    relative = PurePosixPath(_relative_to(entry.path, root))
+    parts = relative.parts
+    if not parts or parts[0].casefold() not in _ROOT_SKILL_PAYLOAD_DIRECTORY_NAMES:
+        return False
+    if len(parts) == 1 and entry.kind != "directory":
+        return False
+    return not any(
+        normalized in _RUNTIME_DIRECTORY_NAMES
+        and normalized not in _ROOT_SKILL_PAYLOAD_DIRECTORY_NAMES
+        for normalized in (_normalized_component_name(part) for part in parts[1:])
+    )
+
+
 def _classify_package(
     root: str,
     inventory: Inventory,
@@ -228,7 +244,11 @@ def _classify_package(
             if _manifest_is_invalid_or_runtime(entry):
                 return "mixed"
             continue
-        if root_is_skill and _is_known_runtime_directory(entry.path, root):
+        if (
+            root_is_skill
+            and _is_known_runtime_directory(entry.path, root)
+            and not _is_root_skill_script_payload(entry, root)
+        ):
             return "mixed"
         if any(_is_within(entry.path, skill_root) for skill_root in enclosed_skill_roots):
             continue

@@ -309,6 +309,44 @@ def test_root_skill_with_metadata_only_plugin_manifest_is_skills_only() -> None:
     assert detect_boundaries(inventory)[0].package_kind == "skills_only"
 
 
+def test_root_skill_local_scripts_are_payload_without_manifest_runtime_declaration() -> None:
+    inventory = _inventory(
+        {
+            "plugin.json": '{"name":"metadata-only"}',
+            "SKILL.md": "---\nname: x\ndescription: x\n---\nRun `scripts/tool.sh`.\n",
+            "scripts/tool.sh": "#!/bin/sh\nexit 0\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "skills_only"
+
+
+@pytest.mark.parametrize(
+    ("runtime_path", "kind"),
+    [
+        ("vendor/scripts/tool.sh", "file"),
+        ("script-s/tool.sh", "file"),
+        ("scripts", "file"),
+    ],
+)
+def test_root_skill_script_exception_is_limited_to_top_level_directories(
+    runtime_path: str,
+    kind: str,
+) -> None:
+    runtime_entry = (
+        _directory(runtime_path) if kind == "directory" else _file(runtime_path, "runtime")
+    )
+    inventory = Inventory(
+        entries=(
+            _file("plugin.json", '{"name":"metadata-only"}'),
+            _file("SKILL.md", "---\nname: x\ndescription: x\n---\n"),
+            runtime_entry,
+        )
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
 def test_root_skill_manifest_runtime_declaration_keeps_package_mixed() -> None:
     inventory = _inventory(
         {
@@ -807,6 +845,17 @@ def test_discovery_ignores_directory_named_skill_entrypoint(tmp_path: Path) -> N
     inventory = Inventory(entries=(InventoryEntry(path="SKILL.md", kind="directory", size=0),))
 
     assert discover_candidates(_resolved(tmp_path), inventory, ()) == ()
+
+
+def test_discovery_keeps_symlink_entrypoint_for_fail_closed_analysis(tmp_path: Path) -> None:
+    inventory = Inventory(entries=(_symlink("skill/SKILL.md", "../outside.md"),))
+
+    candidates = discover_candidates(_resolved(tmp_path), inventory, ())
+
+    assert [candidate.root for candidate in candidates] == ["skill"]
+    validation = validate_candidate(candidates[0], inventory)
+    assert validation.valid is False
+    assert validation.reasons[0].code is ReasonCode.INVALID_FRONTMATTER
 
 
 def test_validation_handles_missing_inventory_entry_without_aborting(tmp_path: Path) -> None:

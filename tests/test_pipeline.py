@@ -136,6 +136,62 @@ def test_invalid_frontmatter_does_not_abort_valid_sibling(tmp_path: Path) -> Non
     assert report.counts["total"] == 2
 
 
+def test_symlink_entrypoint_escaping_skill_root_is_discovered_and_blocked(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    (source / "skill").mkdir(parents=True)
+    (source / "outside").mkdir()
+    (source / "outside/real.md").write_text(_skill("outside"), encoding="utf-8")
+    (source / "skill/SKILL.md").symlink_to("../outside/real.md")
+
+    report = _scan(source)
+
+    assert report.counts == {
+        "total": 1,
+        "portable": 0,
+        "plugin_bound": 0,
+        "ambiguous": 0,
+        "invalid": 0,
+        "blocked": 1,
+    }
+    skill = report.skills[0]
+    assert skill.candidate.root == "skill"
+    assert skill.classification is Classification.BLOCKED
+    assert {ReasonCode.INVALID_FRONTMATTER, ReasonCode.SYMLINK_ESCAPE} <= skill.reason_codes
+    reason = next(item for item in skill.reasons if item.code is ReasonCode.SYMLINK_ESCAPE)
+    assert reason.evidence[0].path == "skill/SKILL.md"
+    assert reason.evidence[0].field == "symlinkTarget"
+
+
+def test_metadata_only_root_plugin_skill_imports_its_local_script(tmp_path: Path) -> None:
+    from skill_importer.importer import SkillImporter
+
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(
+        source,
+        {
+            "plugin.json": '{"name":"metadata-only"}',
+            "SKILL.md": _skill("root", body="Run `scripts/tool.sh`.\n"),
+            "scripts/tool.sh": "#!/bin/sh\nexit 0\n",
+        },
+    )
+    out = tmp_path / "out"
+    pipeline = SkillImporterPipeline(api_key_provider=lambda: None)
+
+    result = SkillImporter(pipeline=pipeline).import_source(
+        SourceSpec.local(source),
+        out,
+        ScanOptions(use_llm=False),
+    )
+
+    assert len(result.imported) == 1
+    payloads = [path for path in out.iterdir() if path.is_dir()]
+    assert len(payloads) == 1
+    assert (payloads[0] / "scripts/tool.sh").read_text(encoding="utf-8") == ("#!/bin/sh\nexit 0\n")
+
+
 def test_subpath_limits_discovery_but_reverse_analysis_uses_full_inventory(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

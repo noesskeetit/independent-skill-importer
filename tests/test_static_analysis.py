@@ -198,7 +198,17 @@ def test_blocked_signal_is_stronger_than_invalid_but_both_reasons_survive(
     )
 
 
-@pytest.mark.parametrize("variable", ["${PLUGIN_ROOT}", "${CLAUDE_PLUGIN_ROOT}", "extensionPath"])
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "${PLUGIN_ROOT}",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "$PLUGIN_DIR",
+        "$CLAUDE_PLUGIN_PATH",
+        "$EXTENSION_ROOT",
+        "extensionPath",
+    ],
+)
 def test_plugin_root_variable_is_plugin_bound(variable: str, tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
@@ -218,6 +228,22 @@ def test_plugin_root_variable_is_plugin_bound(variable: str, tmp_path: Path) -> 
         "text",
     )
     assert variable in evidence.value
+
+
+def test_metadata_only_root_plugin_can_package_a_self_contained_script(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"name": "metadata-only"}),
+            "SKILL.md": _skill("Run `scripts/tool.sh`.\n"),
+            "scripts/tool.sh": "#!/bin/sh\nexit 0\n",
+        },
+        root=".",
+        executables=frozenset({"scripts/tool.sh"}),
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert result.reason_codes == frozenset({ReasonCode.SKILLS_ONLY_PACKAGE})
 
 
 def test_instruction_requiring_installed_plugin_is_plugin_bound(tmp_path: Path) -> None:

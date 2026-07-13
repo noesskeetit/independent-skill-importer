@@ -69,7 +69,10 @@ def discover_candidates(
     entrypoints_by_root: dict[str, dict[str, str]] = {}
     for entry in inventory.entries:
         name = PurePosixPath(entry.path).name
-        if entry.kind != "file" or name not in _ENTRYPOINT_NAMES:
+        # A named symlink is still a candidate. Validation and static analysis must
+        # surface it as invalid/blocked instead of silently hiding it. Directories with
+        # this name are ordinary containers and remain outside discovery.
+        if entry.kind not in {"file", "symlink"} or name not in _ENTRYPOINT_NAMES:
             continue
         root = PurePosixPath(entry.path).parent.as_posix()
         entrypoints_by_root.setdefault(root, {})[name] = entry.path
