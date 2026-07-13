@@ -7,10 +7,44 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 from skill_importer.source import SubprocessGitRunner
 
 SKILL_TEXT = "---\nname: x\ndescription: x\n---\n"
+
+
+class ScandirLimiter:
+    """Count real DirEntry reads and fail if enumeration crosses a test ceiling."""
+
+    def __init__(self, max_yields: int) -> None:
+        self.max_yields = max_yields
+        self.yielded = 0
+        self._real_scandir = os.scandir
+
+    def __call__(self, path: Any) -> "ScandirLimiter._Iterator":
+        return self._Iterator(self, self._real_scandir(path))
+
+    class _Iterator:
+        def __init__(self, owner: "ScandirLimiter", inner: Any) -> None:
+            self.owner = owner
+            self.inner = inner
+
+        def __enter__(self) -> "ScandirLimiter._Iterator":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.inner.close()
+
+        def __iter__(self) -> "ScandirLimiter._Iterator":
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            entry = next(self.inner)
+            self.owner.yielded += 1
+            if self.owner.yielded > self.owner.max_yields:
+                raise AssertionError("scandir consumed beyond the bounded entry window")
+            return entry
 
 
 def write_tree(root: Path, files: Mapping[str, str | bytes]) -> None:

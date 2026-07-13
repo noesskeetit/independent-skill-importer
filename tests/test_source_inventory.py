@@ -5,6 +5,7 @@ import pytest
 from fixture_factory import (
     SKILL_TEXT,
     LocalMirrorGitRunner,
+    ScandirLimiter,
     StaticArchiveGitRunner,
     TarEntry,
     create_git_repository,
@@ -13,6 +14,8 @@ from fixture_factory import (
     write_tree,
 )
 
+import skill_importer.inventory as inventory_module
+import skill_importer.source as source_module
 from skill_importer.errors import ImporterError
 from skill_importer.inventory import build_inventory
 from skill_importer.limits import Limits
@@ -39,6 +42,11 @@ from skill_importer.source import (
 def test_production_git_parser_rejects_unsafe_remote(value: str) -> None:
     with pytest.raises(ImporterError, match="unsafe Git URL"):
         parse_source_spec(value, ref=None, subpath=None)
+
+
+def test_parser_maps_malformed_url_to_bounded_error() -> None:
+    with pytest.raises(ImporterError, match="unsafe Git URL"):
+        parse_source_spec("https://[invalid/repo.git", ref=None, subpath=None)
 
 
 def test_inventory_never_follows_symlink(tmp_path: Path) -> None:
@@ -114,6 +122,41 @@ def test_snapshot_rejects_entry_count_over_limit(tmp_path: Path) -> None:
         snapshot_local(source, tmp_path / "workspace", limits)
 
 
+def test_local_snapshot_bounds_directory_enumeration_before_sorting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {f"file-{index}": "x" for index in range(20)})
+    limits = replace(Limits(), max_entries=2)
+    scandir = ScandirLimiter(max_yields=limits.max_entries + 1)
+    monkeypatch.setattr(source_module.os, "scandir", scandir)
+
+    with pytest.raises(ImporterError, match="entry count limit"):
+        snapshot_local(source, tmp_path / "workspace", limits)
+
+    assert scandir.yielded == limits.max_entries + 1
+
+
+def test_inventory_bounds_directory_enumeration_before_sorting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {f"file-{index}": "x" for index in range(20)})
+    resolved = snapshot_local(source, tmp_path / "workspace", Limits())
+    limits = replace(Limits(), max_entries=2)
+    scandir = ScandirLimiter(max_yields=limits.max_entries + 1)
+    monkeypatch.setattr(inventory_module.os, "scandir", scandir)
+
+    with pytest.raises(ImporterError, match="entry count limit"):
+        build_inventory(resolved, limits)
+
+    assert scandir.yielded == limits.max_entries + 1
+
+
 def test_snapshot_rejects_path_over_depth_limit(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -141,6 +184,53 @@ def test_local_snapshot_reports_unsafe_platform_path_as_bounded_error(tmp_path: 
 
     with pytest.raises(ImporterError, match="unsafe source path"):
         snapshot_local(source, tmp_path / "workspace", Limits())
+
+
+def test_local_snapshot_maps_root_open_failure_to_bounded_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    real_open = source_module.os.open
+
+    def deny_source_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == source.resolve() and dir_fd is None:
+            raise PermissionError("denied by test")
+        return real_open(path, flags, mode, dir_fd=dir_fd)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(source_module.os, "open", deny_source_open)
+
+    with pytest.raises(ImporterError, match="local source directory is not readable"):
+        snapshot_local(source, tmp_path / "workspace", Limits())
+
+
+def test_local_snapshot_maps_workspace_setup_failure_to_bounded_error(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(ImporterError, match="source workspace could not be created"):
+        snapshot_local(source, workspace, Limits())
+
+
+def test_git_resolver_maps_workspace_setup_failure_to_bounded_error(tmp_path: Path) -> None:
+    archive = tmp_path / "archive.tar"
+    create_tar(archive, [TarEntry("SKILL.md", content=SKILL_TEXT.encode())])
+    workspace = tmp_path / "workspace"
+    workspace.write_text("not a directory", encoding="utf-8")
+    resolver = SourceResolver(limits=Limits(), git_runner=StaticArchiveGitRunner(archive))
+    spec = SourceSpec(kind=SourceKind.GIT, value="https://example.com/acme/repo.git")
+
+    with pytest.raises(ImporterError, match="source workspace could not be created"):
+        resolver.resolve(spec, workspace)
 
 
 def test_dirty_local_repository_changes_snapshot_revision(tmp_path: Path) -> None:
@@ -212,6 +302,20 @@ def test_git_runner_ignores_hostile_ambient_git_config(
     )
 
     assert configured == b"never\n"
+
+
+def test_git_runner_bounds_large_capture_output_during_execution(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_git_repository(repository, {"SKILL.md": SKILL_TEXT})
+    for index in range(5):
+        run_git(repository, ["branch", f"remote-like-{index}"])
+    runner = SubprocessGitRunner(allow_file_transport=True, max_capture_bytes=128)
+
+    with pytest.raises(ImporterError, match="Git command output exceeds the byte limit"):
+        runner.run_capture(
+            ["ls-remote", "--heads", "--", repository.resolve().as_uri()],
+            timeout=5,
+        )
 
 
 def test_real_local_git_fixture_resolves_full_sha_and_whole_inventory(tmp_path: Path) -> None:

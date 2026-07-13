@@ -18,7 +18,7 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from .errors import ImporterError
-from .inventory import build_inventory
+from .inventory import _bounded_sorted_children, build_inventory
 from .limits import Limits
 from .models import ResolvedSource, SourceKind, SourceSpec
 
@@ -26,6 +26,7 @@ _GIT_SCHEMES = frozenset({"https", "ssh", "git"})
 _GIT_SCP_RE = re.compile(r"(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9.-]+):(?P<path>[^\s]+)")
 _VCS_DIRECTORIES = frozenset({".git", ".hg", ".svn"})
 _READ_CHUNK_SIZE = 64 * 1024
+_MAX_GIT_CAPTURE_BYTES = 1024 * 1024
 _GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:")
 
@@ -45,27 +46,33 @@ def _validate_remote_url(value: str, *, allow_file_transport: bool = False) -> S
             raise _unsafe_git_url()
         return SourceKind.GITHUB if host.casefold() == "github.com" else SourceKind.GIT
 
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        password = parsed.password
+        username = parsed.username
+    except ValueError as exc:
+        raise _unsafe_git_url() from exc
     if parsed.scheme == "file":
         if allow_file_transport and parsed.netloc in {"", "localhost"} and parsed.path:
             return SourceKind.GIT
         raise _unsafe_git_url()
     if parsed.scheme not in _GIT_SCHEMES:
         raise _unsafe_git_url()
-    if not parsed.hostname or parsed.password is not None or parsed.query or parsed.fragment:
+    if not hostname or password is not None or parsed.query or parsed.fragment:
         raise _unsafe_git_url()
-    if parsed.scheme in {"https", "git"} and parsed.username is not None:
+    if parsed.scheme in {"https", "git"} and username is not None:
         raise _unsafe_git_url()
     if (
         not parsed.path
         or "\\" in parsed.path
         or any(
             part.startswith("-")
-            for part in (*parsed.hostname.split("."), *parsed.path.split("/"))
+            for part in (*hostname.split("."), *parsed.path.split("/"))
         )
     ):
         raise _unsafe_git_url()
-    return SourceKind.GITHUB if parsed.hostname.casefold() == "github.com" else SourceKind.GIT
+    return SourceKind.GITHUB if hostname.casefold() == "github.com" else SourceKind.GIT
 
 
 def parse_source_spec(value: str, ref: str | None, subpath: str | None) -> SourceSpec:
@@ -118,8 +125,16 @@ class GitRunner(Protocol):
 class SubprocessGitRunner:
     """Run Git with argv-only subprocesses and isolated configuration."""
 
-    def __init__(self, *, allow_file_transport: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        allow_file_transport: bool = False,
+        max_capture_bytes: int = _MAX_GIT_CAPTURE_BYTES,
+    ) -> None:
+        if max_capture_bytes <= 0:
+            raise ValueError("Git capture byte limit must be positive")
         self.allow_file_transport = allow_file_transport
+        self.max_capture_bytes = max_capture_bytes
 
     def run_capture(
         self,
@@ -130,20 +145,74 @@ class SubprocessGitRunner:
     ) -> bytes:
         with tempfile.TemporaryDirectory(prefix="skill-importer-git-home-") as home:
             try:
-                completed = subprocess.run(
+                process = subprocess.Popen(
                     ["git", *arguments],
-                    check=False,
-                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     cwd=cwd,
                     env=self._environment(Path(home)),
                     shell=False,
+                )
+            except OSError as exc:
+                raise ImporterError("GIT_COMMAND_FAILED", "Git command failed safely") from exc
+
+            try:
+                return self._capture_process(
+                    process,
+                    max_bytes=self.max_capture_bytes,
                     timeout=timeout,
                 )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise ImporterError("GIT_COMMAND_FAILED", "Git command failed safely") from exc
-        if completed.returncode != 0:
-            raise ImporterError("GIT_COMMAND_FAILED", "Git command failed safely")
-        return completed.stdout
+            except BaseException:
+                self._terminate(process)
+                raise
+
+    @staticmethod
+    def _capture_process(
+        process: subprocess.Popen[bytes],
+        *,
+        max_bytes: int,
+        timeout: int,
+    ) -> bytes:
+        if process.stdout is None or process.stderr is None:  # pragma: no cover - fixed by Popen
+            raise ImporterError("GIT_COMMAND_FAILED", "Git command output streams are unavailable")
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        deadline = time.monotonic() + timeout
+        total = 0
+        stdout_chunks: list[bytes] = []
+        try:
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                events = selector.select(remaining) if remaining > 0 else []
+                if not events:
+                    raise ImporterError("GIT_TIMEOUT", "Git command timed out")
+                for key, _ in events:
+                    chunk = os.read(key.fd, min(_READ_CHUNK_SIZE, max_bytes - total + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ImporterError(
+                            "GIT_OUTPUT_LIMIT",
+                            "Git command output exceeds the byte limit",
+                        )
+                    if key.data == "stdout":
+                        stdout_chunks.append(chunk)
+            remaining = max(0.001, deadline - time.monotonic())
+            try:
+                return_code = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired as exc:
+                raise ImporterError("GIT_TIMEOUT", "Git command timed out") from exc
+            if return_code != 0:
+                raise ImporterError("GIT_COMMAND_FAILED", "Git command failed safely")
+            return b"".join(stdout_chunks)
+        finally:
+            selector.close()
+            process.stdout.close()
+            process.stderr.close()
 
     def run_archive(
         self,
@@ -256,17 +325,20 @@ class SubprocessGitRunner:
 
 def _copy_local_tree(source: Path, destination: Path, limits: Limits) -> None:
     root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    root_fd = os.open(source, root_flags)
+    try:
+        root_fd = os.open(source, root_flags)
+    except OSError as exc:
+        raise ImporterError(
+            "SOURCE_UNAVAILABLE", "local source directory is not readable"
+        ) from exc
     entry_count = 0
     total_bytes = 0
 
     def copy_directory(source_fd: int, target: Path, parent_parts: tuple[str, ...]) -> None:
         nonlocal entry_count, total_bytes
-        with os.scandir(source_fd) as iterator:
-            children = sorted(iterator, key=lambda item: item.name)
+        children = _bounded_sorted_children(source_fd, limits.max_entries - entry_count)
+        entry_count += len(children)
         for child in children:
-            if child.name in _VCS_DIRECTORIES:
-                continue
             parts = (*parent_parts, child.name)
             relative_path = PurePosixPath(*parts).as_posix()
             if (
@@ -277,9 +349,6 @@ def _copy_local_tree(source: Path, destination: Path, limits: Limits) -> None:
                 raise ImporterError("PATH_TRAVERSAL", "source contains an unsafe source path")
             if len(parts) > limits.max_depth:
                 raise ImporterError("SCAN_LIMIT_EXCEEDED", "source exceeds the path depth limit")
-            entry_count += 1
-            if entry_count > limits.max_entries:
-                raise ImporterError("SCAN_LIMIT_EXCEEDED", "source exceeds the entry count limit")
             child_stat = child.stat(follow_symlinks=False)
             child_target = target / child.name
             if stat.S_ISLNK(child_stat.st_mode):
@@ -390,6 +459,16 @@ def _validate_discovery_scope(root: Path, scope: str) -> None:
         raise ImporterError("INVALID_SUBPATH", "source subpath must select a directory")
 
 
+def _create_temporary_root(workspace: Path, prefix: str) -> Path:
+    try:
+        workspace.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=workspace)).resolve()
+    except (OSError, ValueError) as exc:
+        raise ImporterError(
+            "SOURCE_SETUP_FAILED", "source workspace could not be created"
+        ) from exc
+
+
 def snapshot_local(
     source: Path,
     workspace: Path,
@@ -401,7 +480,7 @@ def snapshot_local(
     """Copy a local directory into a bounded immutable working snapshot."""
     try:
         canonical_source = source.expanduser().resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ImporterError("SOURCE_UNAVAILABLE", "local source directory is unavailable") from exc
     if not canonical_source.is_dir():
         raise ImporterError("SOURCE_UNAVAILABLE", "local source must be a directory")
@@ -410,8 +489,7 @@ def snapshot_local(
     if spec.kind is not SourceKind.LOCAL:
         raise ImporterError("INVALID_SOURCE", "local snapshot requires a local source")
 
-    workspace.mkdir(parents=True, exist_ok=True)
-    snapshot_root = Path(tempfile.mkdtemp(prefix="snapshot-", dir=workspace)).resolve()
+    snapshot_root = _create_temporary_root(workspace, "snapshot-")
     _copy_local_tree(canonical_source, snapshot_root, limits)
     discovery_scope = spec.subpath or "."
     _validate_discovery_scope(snapshot_root, discovery_scope)
@@ -440,7 +518,10 @@ def _github_location(value: str) -> _GitHubLocation:
     if scp_match is not None:
         path_parts = tuple(part for part in scp_match.group("path").split("/") if part)
     else:
-        parsed = urlsplit(value)
+        try:
+            parsed = urlsplit(value)
+        except ValueError as exc:
+            raise _unsafe_git_url() from exc
         path_parts = tuple(part for part in parsed.path.split("/") if part)
     if len(path_parts) < 2 or any(part in {".", ".."} for part in path_parts):
         raise _unsafe_git_url()
@@ -688,12 +769,16 @@ class SourceResolver:
             requested_ref = spec.ref
             discovery_scope = spec.subpath or "."
 
-        workspace.mkdir(parents=True, exist_ok=True)
-        operation_root = Path(tempfile.mkdtemp(prefix="git-source-", dir=workspace)).resolve()
+        operation_root = _create_temporary_root(workspace, "git-source-")
         bare_repository = operation_root / "repository.git"
-        bare_repository.mkdir(mode=0o700)
         snapshot_root = operation_root / "snapshot"
-        snapshot_root.mkdir(mode=0o700)
+        try:
+            bare_repository.mkdir(mode=0o700)
+            snapshot_root.mkdir(mode=0o700)
+        except OSError as exc:
+            raise ImporterError(
+                "SOURCE_SETUP_FAILED", "source workspace could not be created"
+            ) from exc
         archive = operation_root / "source.tar"
 
         timeout = self.limits.git_timeout_seconds

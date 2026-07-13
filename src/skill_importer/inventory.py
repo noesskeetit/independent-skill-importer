@@ -20,6 +20,19 @@ def _collision_key(path: str) -> str:
     return unicodedata.normalize("NFC", path).casefold()
 
 
+def _bounded_sorted_children(directory_fd: int, remaining_entries: int) -> list[os.DirEntry[str]]:
+    children: list[os.DirEntry[str]] = []
+    with os.scandir(directory_fd) as iterator:
+        for child in iterator:
+            if child.name in _VCS_DIRECTORIES:
+                continue
+            if len(children) >= remaining_entries:
+                raise ImporterError("SCAN_LIMIT_EXCEEDED", "source exceeds the entry count limit")
+            children.append(child)
+    children.sort(key=lambda item: item.name)
+    return children
+
+
 def _check_path_limits(path: str, limits: Limits, seen: dict[str, str]) -> None:
     normalized = PurePosixPath(path)
     if (
@@ -87,19 +100,16 @@ def build_inventory(resolved: ResolvedSource, limits: Limits) -> Inventory:
     entries: list[InventoryEntry] = []
     seen: dict[str, str] = {}
     total_bytes = 0
+    entry_count = 0
 
     def visit(directory_fd: int, parent_parts: tuple[str, ...]) -> None:
-        nonlocal total_bytes
-        with os.scandir(directory_fd) as iterator:
-            children = sorted(iterator, key=lambda item: item.name)
+        nonlocal entry_count, total_bytes
+        children = _bounded_sorted_children(directory_fd, limits.max_entries - entry_count)
+        entry_count += len(children)
         for child in children:
-            if child.name in _VCS_DIRECTORIES:
-                continue
             parts = (*parent_parts, child.name)
             relative_path = PurePosixPath(*parts).as_posix()
             _check_path_limits(relative_path, limits, seen)
-            if len(entries) >= limits.max_entries:
-                raise ImporterError("SCAN_LIMIT_EXCEEDED", "source exceeds the entry count limit")
 
             entry_stat = child.stat(follow_symlinks=False)
             mode = entry_stat.st_mode
