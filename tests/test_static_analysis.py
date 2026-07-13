@@ -285,6 +285,64 @@ def test_explicit_host_or_encoded_traversal_reference_is_blocked(
     assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
 
 
+@pytest.mark.parametrize("shebang", ["#!/bin/sh", "#! /usr/bin/env sh"])
+def test_first_line_shebang_interpreter_is_not_a_resource_path(
+    shebang: str,
+    tmp_path: Path,
+) -> None:
+    script_path = "skills/alpha/scripts/never-run.sh"
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            script_path: f"{shebang}\nexit 97\n",
+        },
+        executables=frozenset({script_path}),
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "#!/bin/sh\ncat /etc/passwd\n",
+        "#!/usr/bin/env /etc/passwd\n",
+    ],
+)
+def test_non_interpreter_host_path_in_script_remains_blocked(
+    script: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/unsafe.sh": script,
+        },
+    )
+
+    assert result.classification is Classification.BLOCKED
+    assert any(
+        evidence.value == "/etc/passwd"
+        for evidence in _reason(result, ReasonCode.PATH_TRAVERSAL).evidence
+    )
+
+
+def test_plugin_root_variable_in_shebang_remains_plugin_bound(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/plugin-tool": "#!${PLUGIN_ROOT}/scripts/tool\n",
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+
+
 @pytest.mark.parametrize(
     "body",
     [

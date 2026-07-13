@@ -465,6 +465,15 @@ def _looks_explicit_path(value: str) -> bool:
     return bool(path.parts) and _normalized_component(path.parts[0]) in _EXPLICIT_LOCAL_DIRECTORIES
 
 
+def _is_first_line_shebang_interpreter(content: str, match: re.Match[str]) -> bool:
+    start = match.start()
+    return (
+        match.group("posix") is not None
+        and content.startswith("#!")
+        and all(character in " \t" for character in content[2:start])
+    )
+
+
 def _path_references(content: str) -> Iterable[tuple[str, int]]:
     for match in _MARKDOWN_DESTINATION_RE.finditer(content):
         value = match.group("angle") or match.group("plain")
@@ -474,6 +483,8 @@ def _path_references(content: str) -> Iterable[tuple[str, int]]:
         if _looks_explicit_path(value):
             yield value, match.start("path")
     for match in _HOST_PATH_TOKEN_RE.finditer(content):
+        if _is_first_line_shebang_interpreter(content, match):
+            continue
         value = next(item for item in match.groups() if item is not None)
         yield _clean_reference(value), match.start()
     for match in _BACKSLASH_PATH_TOKEN_RE.finditer(content):
