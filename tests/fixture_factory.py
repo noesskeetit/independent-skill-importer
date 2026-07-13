@@ -96,6 +96,25 @@ def create_git_repository(root: Path, files: Mapping[str, str | bytes]) -> str:
     return run_git(root, ["rev-parse", "HEAD"])
 
 
+def create_bare_repository(source: Path, destination: Path) -> Path:
+    """Clone a known test repository as a real bare remote without using ambient config."""
+    environment = {
+        **os.environ,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    subprocess.run(
+        ["git", "clone", "--bare", "--no-local", str(source), str(destination)],
+        check=True,
+        capture_output=True,
+        env=environment,
+        shell=False,
+        text=True,
+    )
+    return destination
+
+
 @dataclass(frozen=True, slots=True)
 class TarEntry:
     """One explicit tar member, including hostile types Git cannot create."""

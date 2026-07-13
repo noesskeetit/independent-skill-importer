@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from skill_importer.importer import ImportResult, SkillImporter
 from skill_importer.models import (
     AnalyzedSkill,
     Classification,
@@ -40,6 +41,15 @@ def _scan_source_without_llm(source: Path) -> ScanReport:
 
 def _scan_fixture_without_llm(name: str) -> ScanReport:
     return _scan_source_without_llm(_fixture_source(name))
+
+
+def _import_fixture_without_llm(name: str, out: Path) -> ImportResult:
+    pipeline = SkillImporterPipeline(api_key_provider=_forbid_api_key_read)
+    return SkillImporter(pipeline=pipeline).import_source(
+        SourceSpec.local(_fixture_source(name)),
+        out,
+        ScanOptions(use_llm=False),
+    )
 
 
 def _only_skill(report: ScanReport) -> AnalyzedSkill:
@@ -319,6 +329,73 @@ def test_identical_layouts_form_duplicate_and_name_conflict_groups() -> None:
     assert all(
         skill.name_conflict_group == report.name_conflicts[0].group_id for skill in report.skills
     )
+
+
+def test_same_name_fixture_imports_two_distinct_payloads_without_clobber(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+
+    result = _import_fixture_without_llm("11_name_conflict", out)
+    manifest = json.loads((out / "import-manifest.json").read_text(encoding="utf-8"))
+    payload_directories = sorted(path for path in out.iterdir() if path.is_dir())
+
+    assert len(result.imported) == 2
+    assert {record.name for record in result.imported} == {"collision"}
+    assert len({record.content_hash for record in result.imported}) == 2
+    assert len({record.destination.casefold() for record in result.imported}) == 2
+    assert all(record.destination.startswith("collision--") for record in result.imported)
+    assert len(payload_directories) == 2
+    assert {
+        (payload / "assets/payload.txt").read_text(encoding="utf-8")
+        for payload in payload_directories
+    } == {"first distinct payload\n", "second distinct payload\n"}
+    assert len(manifest["imported"]) == 2
+    assert len({record["destination"].casefold() for record in manifest["imported"]}) == 2
+    assert {
+        item["originalRoot"] for record in manifest["imported"] for item in record["provenance"]
+    } == {
+        "one",
+        "two",
+    }
+
+
+def test_duplicate_fixture_imports_one_payload_with_complete_provenance(
+    tmp_path: Path,
+) -> None:
+    source = _fixture_source("12_duplicate_layouts")
+    out = tmp_path / "out"
+
+    result = _import_fixture_without_llm("12_duplicate_layouts", out)
+    raw_manifest = (out / "import-manifest.json").read_bytes()
+    manifest = json.loads(raw_manifest)
+    payload_directories = [path for path in out.iterdir() if path.is_dir()]
+
+    assert len(result.imported) == 1
+    assert len(result.imported[0].candidate_ids) == 2
+    assert len(payload_directories) == 1
+    assert (payload_directories[0] / "assets/payload.txt").read_text(encoding="utf-8") == (
+        "identical payload\n"
+    )
+    assert len(manifest["imported"]) == 1
+    imported = manifest["imported"][0]
+    assert imported["candidateIds"] == list(result.imported[0].candidate_ids)
+    assert len(imported["provenance"]) == 2
+    assert all(
+        set(provenance) == {"candidateId", "originalRoot", "entrypoint"}
+        for provenance in imported["provenance"]
+    )
+    assert {provenance["originalRoot"] for provenance in imported["provenance"]} == {
+        "layout-a/tool",
+        "marketplace/packages/tool",
+    }
+    assert {provenance["entrypoint"] for provenance in imported["provenance"]} == {
+        "layout-a/tool/SKILL.md",
+        "marketplace/packages/tool/SKILL.md",
+    }
+    canonical_url = source.resolve().as_uri()
+    assert manifest["source"]["canonicalSourceUrl"] == canonical_url
+    assert raw_manifest.count(canonical_url.encode()) == 1
 
 
 def test_github_blob_fixture_seeds_repository_context_for_later_e2e() -> None:
