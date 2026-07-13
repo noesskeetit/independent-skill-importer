@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from pathlib import PurePosixPath
 
 import yaml
+from yaml.nodes import MappingNode
 
 from .models import (
     DecisionReason,
@@ -30,6 +31,15 @@ class _FrontmatterError(ValueError):
         super().__init__(message)
         self.field = field
         self.value = value
+
+
+class _NoMergeSafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects YAML merge expansion before construction."""
+
+    def flatten_mapping(self, node: MappingNode) -> None:
+        if any(key_node.tag == "tag:yaml.org,2002:merge" for key_node, _ in node.value):
+            raise _FrontmatterError("YAML merge keys are not allowed in skill frontmatter")
+        super().flatten_mapping(node)
 
 
 def _is_within(path: str, root: str) -> bool:
@@ -173,8 +183,10 @@ def _extract_frontmatter(content: str) -> object:
     document = "\n".join(lines[1:closing_line])
     _preflight_yaml(document)
     try:
-        return yaml.safe_load(document)
-    except (yaml.YAMLError, RecursionError) as exc:
+        return yaml.load(document, Loader=_NoMergeSafeLoader)
+    except _FrontmatterError:
+        raise
+    except (yaml.YAMLError, RecursionError, ValueError, OverflowError) as exc:
         raise _FrontmatterError("SKILL.md contains malformed YAML frontmatter") from exc
 
 
@@ -230,7 +242,7 @@ def _normalize_json(
 def _field_line(content: str, field: str) -> int:
     prefix = f"{field}:"
     for number, line in enumerate(content.splitlines(), start=1):
-        if line.lstrip().startswith(prefix):
+        if line.startswith(prefix):
             return number
     return 1
 

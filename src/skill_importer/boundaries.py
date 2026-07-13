@@ -40,6 +40,50 @@ _METADATA_DIRECTORIES = frozenset(
     {".plugin", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".github"}
 )
 _MARKETPLACE_NAMES = frozenset({"marketplace.json", "marketplace.yaml", "marketplace.yml"})
+_RUNTIME_DECLARATION_KEYS = frozenset(
+    {
+        "agent",
+        "agents",
+        "bin",
+        "command",
+        "commands",
+        "entrypoint",
+        "executable",
+        "executables",
+        "extensionpath",
+        "hook",
+        "hooks",
+        "main",
+        "mcp",
+        "mcpserver",
+        "mcpservers",
+        "provider",
+        "providers",
+        "runtime",
+        "script",
+        "scripts",
+        "server",
+        "servers",
+        "source",
+        "src",
+    }
+)
+_RUNTIME_DIRECTORY_NAMES = frozenset(
+    {
+        "agents",
+        "bin",
+        "commands",
+        "hooks",
+        "mcp",
+        "mcpservers",
+        "providers",
+        "runtime",
+        "scripts",
+        "servers",
+        "src",
+    }
+)
+_MAX_MANIFEST_NODES = 4096
 
 
 def _root_before_suffix(parts: tuple[str, ...], suffix: tuple[str, ...]) -> str:
@@ -47,26 +91,62 @@ def _root_before_suffix(parts: tuple[str, ...], suffix: tuple[str, ...]) -> str:
     return PurePosixPath(*root_parts).as_posix() if root_parts else "."
 
 
-def _package_json_has_plugin_marker(entry: InventoryEntry) -> bool:
-    if entry.content is None:
-        return False
+def _load_manifest_mapping(entry: InventoryEntry) -> Mapping[object, object] | None:
+    if entry.kind != "file" or entry.content is None:
+        return None
     try:
         parsed: object = json.loads(entry.content)
-    except (json.JSONDecodeError, RecursionError):
-        return False
+    except (ValueError, OverflowError, RecursionError):
+        return None
     if not isinstance(parsed, Mapping):
+        return None
+    return parsed
+
+
+def _package_json_has_plugin_marker(entry: InventoryEntry) -> bool:
+    parsed = _load_manifest_mapping(entry)
+    if parsed is None:
         return False
     if any(marker in parsed for marker in _PACKAGE_MARKERS):
         return True
-    return any(
-        isinstance(parsed.get(platform), Mapping) and "extensions" in parsed.get(platform, {})
-        for platform in _PLATFORM_CONTAINERS
-    )
+    for platform in _PLATFORM_CONTAINERS:
+        platform_config = parsed.get(platform)
+        if isinstance(platform_config, Mapping) and "extensions" in platform_config:
+            return True
+    return False
+
+
+def _normalized_component_name(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
+
+
+def _manifest_is_invalid_or_runtime(entry: InventoryEntry) -> bool:
+    parsed = _load_manifest_mapping(entry)
+    if parsed is None:
+        return True
+
+    pending: list[object] = [parsed]
+    visited = 0
+    while pending:
+        value = pending.pop()
+        visited += 1
+        if visited > _MAX_MANIFEST_NODES:
+            return True
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    return True
+                if _normalized_component_name(key) in _RUNTIME_DECLARATION_KEYS:
+                    return True
+                pending.append(item)
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+        elif value is not None and not isinstance(value, (str, bool, int, float)):
+            return True
+    return False
 
 
 def _manifest_descriptor(entry: InventoryEntry) -> tuple[str, str] | None:
-    if entry.kind != "file":
-        return None
     parts = PurePosixPath(entry.path).parts
     for suffix, kind in _METADATA_MANIFESTS.items():
         if len(parts) >= len(suffix) and parts[-len(suffix) :] == suffix:
@@ -76,7 +156,7 @@ def _manifest_descriptor(entry: InventoryEntry) -> tuple[str, str] | None:
     if name in _ROOT_MANIFESTS:
         root = PurePosixPath(*parts[:-1]).as_posix() if len(parts) > 1 else "."
         return root, _ROOT_MANIFESTS[name]
-    if name == "package.json" and _package_json_has_plugin_marker(entry):
+    if entry.kind == "file" and name == "package.json" and _package_json_has_plugin_marker(entry):
         root = PurePosixPath(*parts[:-1]).as_posix() if len(parts) > 1 else "."
         return root, "package_json"
     return None
@@ -114,6 +194,13 @@ def _is_documentation_or_marketplace(path: str, root: str) -> bool:
     )
 
 
+def _is_known_runtime_directory(path: str, root: str) -> bool:
+    relative = PurePosixPath(_relative_to(path, root))
+    return any(
+        _normalized_component_name(part) in _RUNTIME_DIRECTORY_NAMES for part in relative.parts
+    )
+
+
 def _classify_package(
     root: str,
     inventory: Inventory,
@@ -122,11 +209,19 @@ def _classify_package(
 ) -> str:
     enclosed_skill_roots = tuple(item for item in skill_roots if _is_within(item, root))
     for entry in inventory.entries:
-        if entry.kind == "directory" or not _is_within(entry.path, root):
+        if not _is_within(entry.path, root):
             continue
         if any(_is_within(entry.path, skill_root) for skill_root in enclosed_skill_roots):
             continue
-        if entry.path in manifest_paths or _is_documentation_or_marketplace(entry.path, root):
+        if _is_documentation_or_marketplace(entry.path, root):
+            continue
+        if entry.path in manifest_paths:
+            if _manifest_is_invalid_or_runtime(entry):
+                return "mixed"
+            continue
+        if entry.kind == "directory":
+            if _is_known_runtime_directory(entry.path, root):
+                return "mixed"
             continue
         return "mixed"
     return "skills_only"

@@ -37,6 +37,30 @@ def _file(path: str, content: str) -> InventoryEntry:
     )
 
 
+def _unreadable_file(path: str) -> InventoryEntry:
+    content = b"\xff"
+    return InventoryEntry(
+        path=path,
+        kind="file",
+        size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        content=None,
+    )
+
+
+def _directory(path: str) -> InventoryEntry:
+    return InventoryEntry(path=path, kind="directory", size=0)
+
+
+def _symlink(path: str, target: str = "outside") -> InventoryEntry:
+    return InventoryEntry(
+        path=path,
+        kind="symlink",
+        size=len(target.encode()),
+        symlink_target=target,
+    )
+
+
 def _inventory(files: Mapping[str, str]) -> Inventory:
     return Inventory(entries=tuple(_file(path, content) for path, content in sorted(files.items())))
 
@@ -188,6 +212,210 @@ def test_package_kind_distinguishes_skills_only_from_mixed(
 
     assert skills_only[0].package_kind == "skills_only"
     assert mixed[0].package_kind == "mixed"
+
+
+@pytest.mark.parametrize(
+    "runtime_key",
+    [
+        "mcp",
+        "mcpServers",
+        "hooks",
+        "commands",
+        "agents",
+        "providers",
+        "provider",
+        "main",
+        "bin",
+        "runtime",
+        "scripts",
+        "server",
+        "servers",
+        "src",
+        "entrypoint",
+        "extensionPath",
+    ],
+)
+@pytest.mark.parametrize(
+    ("manifest_path", "base_manifest"),
+    [
+        ("plugin.json", {"name": "plugin", "skills": ["skills/x"]}),
+        ("package.json", {"name": "plugin", "plugin": {"skills": ["skills/x"]}}),
+    ],
+)
+def test_runtime_declaration_in_manifest_makes_package_mixed(
+    runtime_key: str,
+    manifest_path: str,
+    base_manifest: Mapping[str, object],
+) -> None:
+    manifest = dict(base_manifest)
+    manifest[runtime_key] = {}
+    inventory = _inventory(
+        {
+            manifest_path: json.dumps(manifest),
+            "skills/x/SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    boundaries = detect_boundaries(inventory)
+
+    assert len(boundaries) == 1
+    assert boundaries[0].package_kind == "mixed"
+
+
+def test_nested_runtime_declaration_in_manifest_makes_package_mixed() -> None:
+    inventory = _inventory(
+        {
+            "plugin.json": json.dumps(
+                {
+                    "name": "plugin",
+                    "description": "metadata",
+                    "skills": ["skills/x"],
+                    "metadata": {"mcpServers": {}},
+                }
+            ),
+            "skills/x/SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
+def test_skills_only_manifest_declarations_remain_skills_only() -> None:
+    inventory = _inventory(
+        {
+            "plugin.json": json.dumps(
+                {
+                    "name": "plugin",
+                    "description": "skills only",
+                    "version": "1.0.0",
+                    "skills": ["skills/x"],
+                }
+            ),
+            "skills/x/SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "skills_only"
+
+
+@pytest.mark.parametrize(
+    "manifest_path",
+    [
+        ".plugin/plugin.json",
+        ".claude-plugin/plugin.json",
+        ".codex-plugin/plugin.json",
+        ".cursor-plugin/plugin.json",
+        ".github/plugin/plugin.json",
+        "plugin.json",
+        "gemini-extension.json",
+        "openclaw.plugin.json",
+    ],
+)
+def test_malformed_recognized_manifest_makes_package_mixed(manifest_path: str) -> None:
+    inventory = _inventory(
+        {
+            manifest_path: "{broken",
+            "skills/x/SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    boundaries = detect_boundaries(inventory)
+
+    assert len(boundaries) == 1
+    assert boundaries[0].package_kind == "mixed"
+
+
+def test_unreadable_recognized_manifest_makes_package_mixed() -> None:
+    inventory = Inventory(
+        entries=(
+            _unreadable_file(".claude-plugin/plugin.json"),
+            _file("skills/x/SKILL.md", "---\nname: x\ndescription: x\n---\n"),
+        )
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
+@pytest.mark.parametrize(
+    "manifest_path",
+    [
+        ".plugin/plugin.json",
+        ".claude-plugin/plugin.json",
+        ".codex-plugin/plugin.json",
+        ".cursor-plugin/plugin.json",
+        ".github/plugin/plugin.json",
+        "plugin.json",
+        "gemini-extension.json",
+        "openclaw.plugin.json",
+    ],
+)
+def test_symlink_recognized_manifest_keeps_fail_closed_boundary(
+    manifest_path: str,
+    tmp_path: Path,
+) -> None:
+    inventory = Inventory(
+        entries=(
+            _symlink(manifest_path),
+            _file("skills/x/SKILL.md", "---\nname: x\ndescription: x\n---\n"),
+        )
+    )
+
+    boundaries = detect_boundaries(inventory)
+    candidates = discover_candidates(_resolved(tmp_path), inventory, boundaries)
+
+    assert len(boundaries) == 1
+    assert boundaries[0].package_kind == "mixed"
+    assert candidates[0].enclosing_boundary == boundaries[0]
+
+
+def test_symlink_package_json_does_not_create_name_only_boundary() -> None:
+    inventory = Inventory(entries=(_symlink("package.json"),))
+
+    assert detect_boundaries(inventory) == ()
+
+
+@pytest.mark.parametrize(
+    "component_directory",
+    [
+        "mcp",
+        "mcp-servers",
+        "mcp_servers",
+        "hooks",
+        "commands",
+        "agents",
+        "src",
+        "runtime",
+        "scripts",
+        "providers",
+        "servers",
+        "bin",
+    ],
+)
+def test_known_empty_component_directory_makes_package_mixed(
+    component_directory: str,
+) -> None:
+    inventory = Inventory(
+        entries=(
+            _file("plugin.json", "{}"),
+            _directory(component_directory),
+            _file("skills/x/SKILL.md", "---\nname: x\ndescription: x\n---\n"),
+        )
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
+def test_runtime_named_directory_below_docs_remains_documentation() -> None:
+    inventory = Inventory(
+        entries=(
+            _file("plugin.json", "{}"),
+            _directory("docs"),
+            _directory("docs/hooks"),
+            _file("skills/x/SKILL.md", "---\nname: x\ndescription: x\n---\n"),
+        )
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "skills_only"
 
 
 def test_discovery_recurses_outside_conventional_skills_directory(
@@ -371,6 +599,59 @@ def test_recursive_yaml_alias_is_invalid_without_recursing_forever(tmp_path: Pat
     assert validation.reasons[0].code is ReasonCode.INVALID_FRONTMATTER
 
 
+def test_yaml_merge_chain_is_rejected_before_constructor_expansion(tmp_path: Path) -> None:
+    merge_chain = "\n".join(
+        [
+            "base: &base {one: 1, two: 2}",
+            "level1: &level1 {<<: [*base, *base]}",
+            "level2: &level2 {<<: [*level1, *level1]}",
+            "level3: {<<: [*level2, *level2]}",
+        ]
+    )
+    inventory = _inventory(
+        {
+            "00-merge/SKILL.md": (
+                "---\nname: merge\ndescription: merge\n" + merge_chain + "\n---\n"
+            ),
+            "10-valid/SKILL.md": "---\nname: valid\ndescription: valid\n---\n",
+        }
+    )
+    candidates = discover_candidates(_resolved(tmp_path), inventory, ())
+
+    validations = [validate_candidate(candidate, inventory) for candidate in candidates]
+
+    assert [item.valid for item in validations] == [False, True]
+    assert "merge" in validations[0].reasons[0].message.lower()
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        "2026-99-99",
+        "0001-01-01 00:00:00+23:59",
+        "9" * 5000,
+    ],
+)
+def test_yaml_constructor_exception_isolated_from_valid_sibling(
+    unsafe_value: str,
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(
+        {
+            "00-invalid/SKILL.md": (
+                f"---\nname: invalid\ndescription: invalid\nmetadata: {unsafe_value}\n---\n"
+            ),
+            "10-valid/SKILL.md": "---\nname: valid\ndescription: valid\n---\n",
+        }
+    )
+    candidates = discover_candidates(_resolved(tmp_path), inventory, ())
+
+    validations = [validate_candidate(candidate, inventory) for candidate in candidates]
+
+    assert [item.valid for item in validations] == [False, True]
+    assert validations[0].reasons[0].code is ReasonCode.INVALID_FRONTMATTER
+
+
 def test_markdown_body_after_frontmatter_does_not_create_second_yaml_document(
     tmp_path: Path,
 ) -> None:
@@ -389,6 +670,19 @@ def test_markdown_body_after_frontmatter_does_not_create_second_yaml_document(
 
     assert validation.valid is True
     assert validation.name == "valid"
+
+
+def test_missing_top_level_name_evidence_does_not_point_to_nested_name(tmp_path: Path) -> None:
+    inventory = _inventory(
+        {"SKILL.md": ("---\nmetadata:\n  name: nested-only\ndescription: valid\n---\n")}
+    )
+    candidate = discover_candidates(_resolved(tmp_path), inventory, ())[0]
+
+    validation = validate_candidate(candidate, inventory)
+
+    assert validation.valid is False
+    assert validation.reasons[0].evidence[0].field == "name"
+    assert validation.reasons[0].evidence[0].line == 1
 
 
 def test_valid_frontmatter_is_safe_mapping_with_required_strings(
