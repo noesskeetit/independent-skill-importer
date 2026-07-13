@@ -1350,6 +1350,37 @@ def test_direct_explicit_runtime_outside_package_boundary_is_owned(tmp_path: Pat
     assert reason.evidence[0].path == "shared/worker.py"
 
 
+def test_direct_runtime_outside_boundary_is_retained_for_fm_review(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "packages/a/plugin.json": json.dumps({"runtime": "../../shared/worker.py"}),
+            "shared/worker.py": "def activate():\n    return None\n",
+            "packages/a/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/a/skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert "shared/worker.py" in result.review_paths
+
+
+def test_nested_symlink_runtime_target_is_retained_for_fm_review(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "alias.py"}),
+            "vendor/plugin.json": json.dumps({}),
+            "vendor/worker.py": "def activate():\n    return None\n",
+            "skills/alpha/SKILL.md": _skill(),
+        },
+        symlinks={"alias.py": "vendor/worker.py"},
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert {"alias.py", "vendor/worker.py"}.issubset(result.review_paths)
+
+
 def test_undeclared_sibling_plugin_symlink_is_not_outer_runtime(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,

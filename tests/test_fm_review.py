@@ -314,6 +314,137 @@ def test_review_envelope_is_canonical_hash_bound_and_path_private(tmp_path: Path
     assert not first.truncated
 
 
+def test_outside_runtime_review_path_expands_to_snapshot_scope(tmp_path: Path) -> None:
+    context = _nested_boundary_context(tmp_path)
+    retained_entries = tuple(
+        entry for entry in context.inventory.entries if entry.path != "outside/replay-proof.txt"
+    )
+    context = replace(
+        context,
+        static_result=replace(
+            context.static_result,
+            review_paths=("shared/worker.py",),
+        ),
+        inventory=Inventory(
+            entries=(
+                *retained_entries,
+                _file("shared/worker.py", "def activate():\n    return helper()\n"),
+                _file("outside/helper.py", "def helper():\n    return None\n"),
+            )
+        ),
+    )
+
+    envelope = build_review_envelope(context, Limits())
+    payload = json.loads(envelope.canonical_json)
+    paths = {record["path"] for record in payload["files"]}
+
+    assert "shared/worker.py" in paths
+    assert "outside/helper.py" in paths
+
+
+def test_nested_runtime_review_path_expands_target_package_only(tmp_path: Path) -> None:
+    context = _nested_boundary_context(tmp_path)
+    target_boundary = PackageBoundary(
+        root="plugins/acme/vendor",
+        manifest_path="plugins/acme/vendor/plugin.json",
+        manifest_kind="plugin",
+        package_kind="mixed",
+    )
+    context = replace(
+        context,
+        static_result=replace(
+            context.static_result,
+            review_paths=("plugins/acme/vendor/worker.py",),
+        ),
+        inventory=Inventory(
+            entries=(
+                *context.inventory.entries,
+                _file(target_boundary.manifest_path, '{"runtime":"worker.py"}'),
+                _file("plugins/acme/vendor/worker.py", "from helper import activate\n"),
+                _file("plugins/acme/vendor/helper.py", "def activate():\n    return None\n"),
+            )
+        ),
+        boundaries=(*context.boundaries, target_boundary),
+    )
+
+    envelope = build_review_envelope(context, Limits())
+    payload = json.loads(envelope.canonical_json)
+    paths = {record["path"] for record in payload["files"]}
+
+    assert {
+        target_boundary.manifest_path,
+        "plugins/acme/vendor/worker.py",
+        "plugins/acme/vendor/helper.py",
+    }.issubset(paths)
+    assert "outside/replay-proof.txt" not in paths
+
+
+def test_in_boundary_review_path_does_not_expand_snapshot_scope(tmp_path: Path) -> None:
+    context = _nested_boundary_context(tmp_path)
+    context = replace(
+        context,
+        static_result=replace(
+            context.static_result,
+            review_paths=("plugins/acme/runtime.py",),
+        ),
+    )
+
+    envelope = build_review_envelope(context, Limits())
+
+    assert "plugins/acme/runtime.py" in envelope.canonical_json
+    assert "outside/replay-proof.txt" not in envelope.canonical_json
+
+
+def test_same_scope_review_paths_do_not_rescan_every_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enclosing = PackageBoundary(
+        root="plugins/acme",
+        manifest_path="plugins/acme/plugin.json",
+        manifest_kind="plugin",
+        package_kind="mixed",
+    )
+    nested_roots: list[str] = []
+    current = enclosing.root
+    for index in range(64):
+        current = f"{current}/p{index}"
+        nested_roots.append(current)
+    boundaries = (
+        enclosing,
+        *(
+            PackageBoundary(
+                root=root,
+                manifest_path=f"{root}/plugin-{manifest_index}.json",
+                manifest_kind="plugin",
+                package_kind="mixed",
+            )
+            for root in nested_roots
+            for manifest_index in range(2)
+        ),
+    )
+    deepest = nested_roots[-1]
+    review_paths = frozenset(f"{deepest}/runtime/file-{index}.py" for index in range(1000))
+    calls = 0
+    original = fm_review_module._is_within
+
+    def count_calls(path: str, root: str) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(path, root)
+
+    monkeypatch.setattr(fm_review_module, "_is_within", count_calls)
+
+    roots = fm_review_module._expanded_review_roots(
+        review_paths,
+        enclosing.root,
+        enclosing,
+        boundaries,
+    )
+
+    assert roots == frozenset({deepest})
+    assert calls < 5000
+
+
 def test_high_confidence_portable_with_real_evidence_promotes(tmp_path: Path) -> None:
     transport = FakeTransport()
     reviewer = _reviewer(transport)
@@ -324,6 +455,87 @@ def test_high_confidence_portable_with_real_evidence_promotes(tmp_path: Path) ->
     assert result.reason.code is ReasonCode.FM_PORTABLE_VERIFIED
     assert result.confidence == 0.97
     assert result.reason.evidence[0].path == "skills/alpha/SKILL.md"
+
+
+def test_truncated_expanded_runtime_scope_cannot_promote(tmp_path: Path) -> None:
+    context = _nested_boundary_context(tmp_path)
+    retained_entries = tuple(
+        entry for entry in context.inventory.entries if entry.path != "outside/replay-proof.txt"
+    )
+    context = replace(
+        context,
+        static_result=replace(
+            context.static_result,
+            review_paths=("shared/worker.py",),
+        ),
+        inventory=Inventory(
+            entries=(
+                *retained_entries,
+                _file("shared/worker.py", "x = 1\n" * 5000),
+            )
+        ),
+    )
+    limits = replace(Limits(), max_fm_context_chars=1800)
+    evidence = [
+        {
+            "path": context.candidate.entrypoint,
+            "line": 5,
+            "value": "No plugin runtime required.",
+        }
+    ]
+    transport = FakeTransport(lambda request: json.dumps(_fm_payload(request, evidence=evidence)))
+
+    envelope = build_review_envelope(context, limits)
+    result = _reviewer(transport, limits=limits).review(context)
+
+    assert envelope.truncated
+    assert result.classification is Classification.AMBIGUOUS
+    assert result.reason.code is ReasonCode.FM_CONTEXT_TRUNCATED
+
+
+@pytest.mark.parametrize("hazard", ["sensitive", "binary"])
+def test_redacted_expanded_runtime_scope_cannot_promote(
+    hazard: str,
+    tmp_path: Path,
+) -> None:
+    context = _nested_boundary_context(tmp_path)
+    retained_entries = tuple(
+        entry for entry in context.inventory.entries if entry.path != "outside/replay-proof.txt"
+    )
+    hazard_entry = (
+        _file("outside/.env", "API_TOKEN=secret")
+        if hazard == "sensitive"
+        else _file("outside/tool.bin", b"\x00\x01\x02")
+    )
+    context = replace(
+        context,
+        static_result=replace(
+            context.static_result,
+            review_paths=("shared/worker.py",),
+        ),
+        inventory=Inventory(
+            entries=(
+                *retained_entries,
+                _file("shared/worker.py", "def activate():\n    return None\n"),
+                hazard_entry,
+            )
+        ),
+    )
+    evidence = [
+        {
+            "path": context.candidate.entrypoint,
+            "line": 5,
+            "value": "No plugin runtime required.",
+        }
+    ]
+    transport = FakeTransport(lambda request: json.dumps(_fm_payload(request, evidence=evidence)))
+
+    envelope = build_review_envelope(context, Limits())
+    result = _reviewer(transport).review(context)
+
+    assert envelope.redacted
+    assert result.classification is Classification.AMBIGUOUS
+    assert result.reason.code is ReasonCode.FM_CONTEXT_REDACTED
 
 
 def test_exact_inventory_evidence_outside_sent_boundary_cannot_promote(tmp_path: Path) -> None:

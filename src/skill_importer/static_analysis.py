@@ -328,9 +328,11 @@ class StaticAnalysisResult:
     classification: Classification
     reasons: tuple[DecisionReason, ...]
     external_requirements: ExternalRequirements
+    review_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "reasons", tuple(self.reasons))
+        object.__setattr__(self, "review_paths", tuple(sorted(set(self.review_paths))))
         if not self.reasons:
             raise ValueError("static analysis must include at least one evidence-backed reason")
         if any(not reason.evidence for reason in self.reasons):
@@ -2283,4 +2285,5 @@ def analyze_static(
         classification=classification,
         reasons=reasons,
         external_requirements=_external_requirements(validation, candidate, inventory, owned),
+        review_paths=tuple(sorted(owned.runtime_paths)),
     )

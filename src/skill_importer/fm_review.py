@@ -518,6 +518,7 @@ def _entry_priority(
     entry: InventoryEntry,
     candidate: SkillCandidate,
     boundary: PackageBoundary | None,
+    review_paths: frozenset[str],
 ) -> tuple[int, str]:
     if entry.path == candidate.entrypoint:
         return 0, entry.path
@@ -525,6 +526,8 @@ def _entry_priority(
         return 1, entry.path
     if boundary is not None and entry.path == boundary.manifest_path:
         return 2, entry.path
+    if entry.path in review_paths:
+        return 3, entry.path
     parts = tuple(part.casefold() for part in PurePosixPath(entry.path).parts)
     if any(part in _RUNTIME_PATH_PARTS for part in parts):
         return 3, entry.path
@@ -559,6 +562,45 @@ def _inside_nested_boundary(
     )
 
 
+def _expanded_review_roots(
+    review_paths: frozenset[str],
+    relevant_root: str,
+    enclosing: PackageBoundary | None,
+    boundaries: tuple[PackageBoundary, ...],
+) -> frozenset[str]:
+    boundary_roots = tuple(
+        sorted(
+            {boundary.root for boundary in boundaries},
+            key=lambda root: (
+                -(0 if root == "." else len(PurePosixPath(root).parts)),
+                root,
+            ),
+        )
+    )
+    nested_roots = tuple(
+        root
+        for root in boundary_roots
+        if enclosing is not None and root != enclosing.root and _is_within(root, enclosing.root)
+    )
+    roots: set[str] = set()
+    for path in review_paths:
+        if any(_is_within(path, root) for root in roots):
+            continue
+        if _is_within(path, relevant_root) and not any(
+            _is_within(path, root) for root in nested_roots
+        ):
+            continue
+        chosen_root = next(
+            (root for root in boundary_roots if _is_within(path, root)),
+            ".",
+        )
+        if chosen_root == ".":
+            return frozenset({"."})
+        roots = {root for root in roots if not _is_within(root, chosen_root)}
+        roots.add(chosen_root)
+    return frozenset(roots)
+
+
 def build_review_envelope(context: ReviewContext, limits: Limits) -> ReviewEnvelope:
     """Build bounded canonical input without exposing the private snapshot filesystem path."""
     sensitive_filter = SensitiveDataFilter()
@@ -567,6 +609,13 @@ def build_review_envelope(context: ReviewContext, limits: Limits) -> ReviewEnvel
     candidate = context.candidate
     boundary = candidate.enclosing_boundary
     relevant_root = boundary.root if boundary is not None else candidate.root
+    review_paths = frozenset(context.static_result.review_paths)
+    expanded_review_roots = _expanded_review_roots(
+        review_paths,
+        relevant_root,
+        boundary,
+        context.boundaries,
+    )
 
     candidate_payload = {
         "candidateId": _filtered_value(
@@ -626,11 +675,12 @@ def build_review_envelope(context: ReviewContext, limits: Limits) -> ReviewEnvel
     omitted_sensitive_files = 0
     omitted_binary_files = 0
     for entry in context.inventory.entries:
-        if not _is_within(entry.path, relevant_root) or _inside_nested_boundary(
+        normally_in_scope = _is_within(
             entry.path,
-            boundary,
-            context.boundaries,
-        ):
+            relevant_root,
+        ) and not _inside_nested_boundary(entry.path, boundary, context.boundaries)
+        expanded_in_scope = any(_is_within(entry.path, root) for root in expanded_review_roots)
+        if not normally_in_scope and not expanded_in_scope:
             continue
         if sensitive_filter.is_sensitive_path(entry.path):
             omitted_sensitive_files += 1
@@ -640,7 +690,9 @@ def build_review_envelope(context: ReviewContext, limits: Limits) -> ReviewEnvel
             redaction_types.add("BINARY_FILE")
         else:
             eligible_entries.append(entry)
-    eligible_entries.sort(key=lambda entry: _entry_priority(entry, candidate, boundary))
+    eligible_entries.sort(
+        key=lambda entry: _entry_priority(entry, candidate, boundary, review_paths)
+    )
 
     files: list[dict[str, object]] = []
     scoped_lines: list[tuple[str, int, str]] = []
