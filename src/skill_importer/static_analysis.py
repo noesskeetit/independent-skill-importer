@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -350,12 +351,40 @@ class _OwnedComponents:
     providers: set[str]
     binaries: set[str]
     runtime_paths: set[str]
+    explicit_runtime_paths: set[str]
+    manifest_runtime_paths: set[str]
+    runtime_symlink_paths: set[str]
+    recursive_runtime_symlink_paths: set[str]
     declared_runtime_roots: set[str]
     runtime_modules: set[str]
 
     @classmethod
     def empty(cls) -> _OwnedComponents:
-        return cls(set(), set(), set(), set(), set(), set(), set(), set(), set())
+        return cls(
+            mcp=set(),
+            commands=set(),
+            agents=set(),
+            hooks=set(),
+            providers=set(),
+            binaries=set(),
+            runtime_paths=set(),
+            explicit_runtime_paths=set(),
+            manifest_runtime_paths=set(),
+            runtime_symlink_paths=set(),
+            recursive_runtime_symlink_paths=set(),
+            declared_runtime_roots=set(),
+            runtime_modules=set(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _SymlinkResolution:
+    terminal: InventoryEntry | None
+    symlink_paths: tuple[str, ...] = ()
+    issue_path: str | None = None
+    code: ReasonCode | None = None
+    value: str = ""
+    detector: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -615,7 +644,7 @@ def _component_symbols(value: object) -> set[str]:
     return {item.casefold() for item in symbols if item}
 
 
-def _path_if_owned(value: str, boundary: PackageBoundary, inventory: Inventory) -> str | None:
+def _manifest_runtime_path(value: str, boundary: PackageBoundary) -> str | None:
     literal = value.strip().strip("`'\"<>")
     cleaned = literal if literal in {".", "./"} else _clean_reference(value)
     if not cleaned or _URL_SCHEME_RE.match(cleaned) is not None:
@@ -623,7 +652,137 @@ def _path_if_owned(value: str, boundary: PackageBoundary, inventory: Inventory) 
     candidate, escaped = _collapse_path(PurePosixPath(boundary.root), cleaned)
     if escaped or candidate is None:
         return None
-    return candidate if candidate == boundary.root or candidate in inventory.by_path else None
+    return candidate
+
+
+def _resolve_inventory_path(
+    path: str,
+    by_path: Mapping[str, InventoryEntry],
+    *,
+    allowed_root: str | None = None,
+) -> _SymlinkResolution:
+    current_path = path
+    visited: set[tuple[str, str]] = set()
+    symlink_paths: list[str] = []
+    last_target = path
+    while True:
+        parts = PurePosixPath(current_path).parts
+        matched: InventoryEntry | None = None
+        suffix: tuple[str, ...] = ()
+        for index in range(1, len(parts) + 1):
+            prefix = PurePosixPath(*parts[:index]).as_posix()
+            entry = by_path.get(prefix)
+            if entry is not None and entry.kind == "symlink":
+                matched = entry
+                suffix = parts[index:]
+                break
+        if matched is None:
+            terminal = by_path.get(current_path)
+            if terminal is not None:
+                return _SymlinkResolution(
+                    terminal=terminal,
+                    symlink_paths=tuple(symlink_paths),
+                )
+            return _SymlinkResolution(
+                terminal=None,
+                symlink_paths=tuple(symlink_paths),
+                issue_path=symlink_paths[0] if symlink_paths else None,
+                code=ReasonCode.MISSING_LOCAL_RESOURCE,
+                value=f"{last_target} -> {current_path}",
+                detector="static.symlink.dangling",
+            )
+
+        state = (current_path, matched.path)
+        if len(symlink_paths) >= _MAX_SYMLINK_CHAIN:
+            return _SymlinkResolution(
+                terminal=None,
+                symlink_paths=tuple(symlink_paths),
+                issue_path=symlink_paths[0] if symlink_paths else matched.path,
+                code=ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+                value=f"chain exceeds {_MAX_SYMLINK_CHAIN} links",
+                detector="static.symlink.chain_limit",
+            )
+        if state in visited:
+            return _SymlinkResolution(
+                terminal=None,
+                symlink_paths=tuple(symlink_paths),
+                issue_path=symlink_paths[0] if symlink_paths else matched.path,
+                code=ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+                value=f"{matched.symlink_target} (cycle)",
+                detector="static.symlink.cycle",
+            )
+        visited.add(state)
+        symlink_paths.append(matched.path)
+        target = matched.symlink_target or ""
+        last_target = target
+        if _is_unsafe_host_reference(target):
+            return _SymlinkResolution(
+                terminal=None,
+                symlink_paths=tuple(symlink_paths),
+                issue_path=symlink_paths[0],
+                code=ReasonCode.SYMLINK_ESCAPE,
+                value=target,
+                detector="static.symlink.escape",
+            )
+        resolved, escaped = _collapse_path(PurePosixPath(matched.path).parent, target)
+        if (
+            escaped
+            or resolved is None
+            or (allowed_root is not None and not _is_within(resolved, allowed_root))
+        ):
+            return _SymlinkResolution(
+                terminal=None,
+                symlink_paths=tuple(symlink_paths),
+                issue_path=symlink_paths[0],
+                code=ReasonCode.SYMLINK_ESCAPE,
+                value=f"{target} -> {resolved or '<outside snapshot>'}",
+                detector="static.symlink.escape",
+            )
+        next_path, escaped = _collapse_path(
+            PurePosixPath(resolved),
+            PurePosixPath(*suffix).as_posix() if suffix else ".",
+        )
+        if (
+            escaped
+            or next_path is None
+            or (allowed_root is not None and not _is_within(next_path, allowed_root))
+        ):
+            return _SymlinkResolution(
+                terminal=None,
+                symlink_paths=tuple(symlink_paths),
+                issue_path=symlink_paths[0],
+                code=ReasonCode.SYMLINK_ESCAPE,
+                value=f"{target} -> {next_path or '<outside snapshot>'}",
+                detector="static.symlink.escape",
+            )
+        current_path = next_path
+
+
+def _resolve_inventory_symlink(
+    entry: InventoryEntry,
+    by_path: Mapping[str, InventoryEntry],
+    *,
+    allowed_root: str | None = None,
+) -> _SymlinkResolution:
+    return _resolve_inventory_path(
+        entry.path,
+        by_path,
+        allowed_root=allowed_root,
+    )
+
+
+def _path_if_owned(
+    value: str,
+    boundary: PackageBoundary,
+    by_path: Mapping[str, InventoryEntry],
+) -> str | None:
+    candidate = _manifest_runtime_path(value, boundary)
+    if candidate is None:
+        return None
+    if candidate == boundary.root:
+        return candidate
+    resolution = _resolve_inventory_path(candidate, by_path)
+    return resolution.terminal.path if resolution.terminal is not None else None
 
 
 def _is_declared_runtime_root_key(
@@ -687,7 +846,7 @@ def _is_known_runtime_component_path(path: str, boundary: PackageBoundary) -> bo
 def _collect_manifest_components(
     parsed: Mapping[str, object],
     boundary: PackageBoundary,
-    inventory: Inventory,
+    by_path: Mapping[str, InventoryEntry],
     owned: _OwnedComponents,
     manifest_path: str,
 ) -> None:
@@ -709,17 +868,40 @@ def _collect_manifest_components(
                 if category is not None and not (key == "command" and isinstance(value, str)):
                     getattr(owned, category).update(_component_symbols(value))
                 if key in _RUNTIME_MANIFEST_KEYS:
+                    recursive = _is_declared_runtime_root_key(
+                        key,
+                        depth=depth,
+                        parent_key=parent_key,
+                        manifest_path=manifest_path,
+                    )
                     for string in _iter_strings(value):
-                        path = _path_if_owned(string, boundary, inventory)
-                        if path is not None:
-                            owned.runtime_paths.add(path)
-                            if _is_declared_runtime_root_key(
-                                key,
-                                depth=depth,
-                                parent_key=parent_key,
-                                manifest_path=manifest_path,
-                            ):
-                                owned.declared_runtime_roots.add(path)
+                        lexical_path = _manifest_runtime_path(string, boundary)
+                        if lexical_path is None:
+                            continue
+                        if lexical_path == boundary.root:
+                            owned.manifest_runtime_paths.add(lexical_path)
+                            owned.runtime_paths.add(lexical_path)
+                            owned.explicit_runtime_paths.add(lexical_path)
+                            if recursive:
+                                owned.declared_runtime_roots.add(lexical_path)
+                            continue
+                        resolution = _resolve_inventory_path(lexical_path, by_path)
+                        if resolution.terminal is not None or resolution.symlink_paths:
+                            owned.manifest_runtime_paths.add(lexical_path)
+                        owned.runtime_symlink_paths.update(resolution.symlink_paths)
+                        if recursive:
+                            owned.recursive_runtime_symlink_paths.update(resolution.symlink_paths)
+                        lexical_entry = by_path.get(lexical_path)
+                        if lexical_entry is not None:
+                            owned.runtime_paths.add(lexical_path)
+                            owned.explicit_runtime_paths.add(lexical_path)
+                        if resolution.terminal is None:
+                            continue
+                        path = resolution.terminal.path
+                        owned.runtime_paths.add(path)
+                        owned.explicit_runtime_paths.add(path)
+                        if recursive and resolution.terminal.kind == "directory":
+                            owned.declared_runtime_roots.add(path)
                 pending.append((value, depth + 1, key))
         elif isinstance(current, (list, tuple)):
             remaining = _MAX_MANIFEST_NODES - visited - len(pending)
@@ -728,6 +910,102 @@ def _collect_manifest_components(
 
 def _boundary_depth(boundary: PackageBoundary) -> int:
     return 0 if boundary.root == "." else len(PurePosixPath(boundary.root).parts)
+
+
+def _inventory_symlink_paths(inventory: Inventory) -> tuple[str, ...]:
+    return tuple(sorted(entry.path for entry in inventory.entries if entry.kind == "symlink"))
+
+
+def _symlinks_at_or_below(symlink_paths: tuple[str, ...], root: str) -> tuple[str, ...]:
+    if root == ".":
+        return symlink_paths
+
+    matches: tuple[str, ...] = ()
+    exact_index = bisect_left(symlink_paths, root)
+    if exact_index < len(symlink_paths) and symlink_paths[exact_index] == root:
+        matches = (root,)
+
+    prefix = f"{root}/"
+    start = bisect_left(symlink_paths, prefix)
+    end = bisect_left(symlink_paths, f"{root}0")
+    return matches + symlink_paths[start:end]
+
+
+def _expand_owned_runtime_symlinks(
+    candidate: SkillCandidate,
+    inventory: Inventory,
+    by_path: Mapping[str, InventoryEntry],
+    boundary: PackageBoundary,
+    nested_roots: frozenset[str],
+    skill_roots: frozenset[str],
+    owned: _OwnedComponents,
+) -> None:
+    for entry in inventory.entries:
+        if (
+            entry.kind != "symlink"
+            or not _is_within(entry.path, boundary.root)
+            or _is_within(entry.path, candidate.root)
+            or _is_within_any(entry.path, nested_roots)
+            or _is_within_any(entry.path, skill_roots)
+            or _is_documentation(entry.path, boundary)
+            or not _is_known_runtime_component_path(entry.path, boundary)
+        ):
+            continue
+        owned.runtime_paths.add(entry.path)
+        owned.runtime_symlink_paths.add(entry.path)
+        owned.recursive_runtime_symlink_paths.add(entry.path)
+
+    symlink_paths: tuple[str, ...] | None = None
+    pending_roots = sorted(owned.declared_runtime_roots)
+    queued_roots = set(pending_roots)
+    root_index = 0
+    pending_links: list[tuple[str, bool]] = []
+    queued_links: set[tuple[str, bool]] = set()
+    link_index = 0
+
+    def queue_link(path: str, recursive: bool) -> None:
+        state = (path, recursive)
+        if state not in queued_links:
+            queued_links.add(state)
+            pending_links.append(state)
+
+    for path in sorted(owned.runtime_symlink_paths):
+        queue_link(path, path in owned.recursive_runtime_symlink_paths)
+
+    while root_index < len(pending_roots) or link_index < len(pending_links):
+        while root_index < len(pending_roots):
+            root = pending_roots[root_index]
+            root_index += 1
+            if symlink_paths is None:
+                symlink_paths = _inventory_symlink_paths(inventory)
+            for path in _symlinks_at_or_below(symlink_paths, root):
+                owned.runtime_paths.add(path)
+                owned.runtime_symlink_paths.add(path)
+                owned.recursive_runtime_symlink_paths.add(path)
+                queue_link(path, True)
+
+        if link_index >= len(pending_links):
+            continue
+        path, recursive = pending_links[link_index]
+        link_index += 1
+        link_entry = by_path.get(path)
+        if link_entry is None or link_entry.kind != "symlink":
+            continue
+        resolution = _resolve_inventory_symlink(link_entry, by_path)
+        owned.runtime_symlink_paths.update(resolution.symlink_paths)
+        owned.runtime_paths.update(resolution.symlink_paths)
+        if recursive:
+            owned.recursive_runtime_symlink_paths.update(resolution.symlink_paths)
+        if resolution.terminal is None:
+            continue
+        target = resolution.terminal
+        owned.runtime_paths.add(target.path)
+        owned.explicit_runtime_paths.add(target.path)
+        if target.kind == "directory" and recursive:
+            owned.declared_runtime_roots.add(target.path)
+            if target.path not in queued_roots:
+                queued_roots.add(target.path)
+                pending_roots.append(target.path)
 
 
 def _enclosing_boundaries(
@@ -753,6 +1031,7 @@ def _derive_boundary_owned_components(
     boundary: PackageBoundary,
 ) -> _OwnedComponents:
     owned = _OwnedComponents.empty()
+    by_path = inventory.by_path
     manifest_paths = {item.manifest_path for item in boundaries if item.root == boundary.root} | {
         boundary.manifest_path
     }
@@ -763,31 +1042,45 @@ def _derive_boundary_owned_components(
     )
     skill_roots = _excluded_skill_roots(candidate, inventory)
     for path in sorted(manifest_paths):
-        entry = inventory.by_path.get(path)
+        entry = by_path.get(path)
         if entry is None:
             continue
         parsed = _manifest_json(entry)
         if parsed is not None:
-            _collect_manifest_components(parsed, boundary, inventory, owned, path)
+            _collect_manifest_components(parsed, boundary, by_path, owned, path)
+
+    _expand_owned_runtime_symlinks(
+        candidate,
+        inventory,
+        by_path,
+        boundary,
+        nested_roots,
+        skill_roots,
+        owned,
+    )
 
     declared_runtime_roots = frozenset(owned.declared_runtime_roots)
     for entry in inventory.entries:
         if (
-            not _is_within(entry.path, boundary.root)
+            (
+                not _is_within(entry.path, boundary.root)
+                and entry.path not in owned.explicit_runtime_paths
+                and not _is_within_any(entry.path, declared_runtime_roots)
+            )
             or _is_within(entry.path, candidate.root)
             or (
                 _is_within_any(entry.path, nested_roots)
-                and entry.path not in owned.runtime_paths
+                and entry.path not in owned.explicit_runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or (
                 _is_within_any(entry.path, skill_roots)
-                and entry.path not in owned.runtime_paths
+                and entry.path not in owned.explicit_runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or (
                 _is_documentation(entry.path, boundary)
-                and entry.path not in owned.runtime_paths
+                and entry.path not in owned.explicit_runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
         ):
@@ -811,6 +1104,7 @@ def _derive_boundary_owned_components(
         proven_runtime = (
             entry.executable
             or _is_known_runtime_component_path(entry.path, boundary)
+            or entry.path in owned.explicit_runtime_paths
             or _is_within_any(entry.path, declared_runtime_roots)
         )
         if proven_runtime:
@@ -872,6 +1166,12 @@ def _aggregate_owned_components(
         aggregate.providers.update(ownership.components.providers)
         aggregate.binaries.update(ownership.components.binaries)
         aggregate.runtime_paths.update(ownership.components.runtime_paths)
+        aggregate.explicit_runtime_paths.update(ownership.components.explicit_runtime_paths)
+        aggregate.manifest_runtime_paths.update(ownership.components.manifest_runtime_paths)
+        aggregate.runtime_symlink_paths.update(ownership.components.runtime_symlink_paths)
+        aggregate.recursive_runtime_symlink_paths.update(
+            ownership.components.recursive_runtime_symlink_paths
+        )
         aggregate.declared_runtime_roots.update(ownership.components.declared_runtime_roots)
         aggregate.runtime_modules.update(ownership.components.runtime_modules)
     return aggregate
@@ -1297,82 +1597,133 @@ def _analyze_symlinks(
     for entry in inventory.entries:
         if entry.kind != "symlink" or not _is_within(entry.path, candidate.root):
             continue
-        assert entry.symlink_target is not None
-        current = entry
-        visited: set[str] = set()
-        steps = 0
-        while current.kind == "symlink":
-            steps += 1
-            if steps > _MAX_SYMLINK_CHAIN:
-                if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
+        resolution = _resolve_inventory_symlink(
+            entry,
+            by_path,
+            allowed_root=candidate.root,
+        )
+        if resolution.code is None or not collector.has_capacity(resolution.code):
+            continue
+        collector.add(
+            resolution.code,
+            Evidence(
+                path=entry.path,
+                line=None,
+                field="symlinkTarget",
+                value=resolution.value,
+                detector=resolution.detector,
+            ),
+        )
+
+
+def _analyze_owned_runtime_symlinks(
+    candidate: SkillCandidate,
+    ownerships: tuple[_BoundaryOwnership, ...],
+    inventory: Inventory,
+    collector: _ReasonCollector,
+) -> None:
+    by_path = inventory.by_path
+    for ownership in ownerships:
+        paths = (
+            ownership.components.manifest_runtime_paths | ownership.components.runtime_symlink_paths
+        )
+        for path in sorted(paths):
+            if path == ownership.boundary.root:
+                continue
+            resolution = _resolve_inventory_path(path, by_path)
+            if (
+                resolution.code is not None
+                and resolution.issue_path is not None
+                and collector.has_capacity(resolution.code)
+            ):
+                collector.add(
+                    resolution.code,
+                    Evidence(
+                        path=resolution.issue_path,
+                        line=None,
+                        field="symlinkTarget",
+                        value=resolution.value,
+                        detector=resolution.detector,
+                    ),
+                )
+            terminal = resolution.terminal
+            if terminal is None:
+                continue
+            terminal_overlaps_candidate = _is_within(terminal.path, candidate.root) or (
+                terminal.kind == "directory" and _is_within(candidate.root, terminal.path)
+            )
+            if (
+                not resolution.symlink_paths
+                or not terminal_overlaps_candidate
+                or not collector.has_capacity(ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+            ):
+                continue
+            collector.add(
+                ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME,
+                Evidence(
+                    path=resolution.symlink_paths[0],
+                    line=None,
+                    field="symlinkTarget",
+                    value=f"{path} -> {terminal.path}",
+                    detector="static.reverse.runtime_path_contains_skill",
+                ),
+            )
+
+
+def _analyze_unresolved_boundary_manifests(
+    candidate: SkillCandidate,
+    inventory: Inventory,
+    boundaries: tuple[PackageBoundary, ...],
+    collector: _ReasonCollector,
+) -> None:
+    by_path = inventory.by_path
+    seen: set[str] = set()
+    for boundary in sorted(boundaries, key=lambda item: item.manifest_path):
+        path = boundary.manifest_path
+        if path in seen or not _is_within(candidate.root, boundary.root):
+            continue
+        seen.add(path)
+        entry = by_path.get(path)
+        if entry is not None and entry.kind == "file" and _manifest_json(entry) is not None:
+            continue
+
+        value = "missing manifest entry"
+        line: int | None = None
+        if entry is not None:
+            value = f"{entry.kind} plugin manifest"
+            line = 1 if entry.kind == "file" else None
+            if entry.kind == "file":
+                value = "unparseable plugin manifest mapping"
+            elif entry.kind == "symlink":
+                resolution = _resolve_inventory_symlink(entry, by_path)
+                terminal = resolution.terminal
+                value = (
+                    f"symlink plugin manifest -> {terminal.path}"
+                    if terminal is not None
+                    else "unresolved symlink plugin manifest"
+                )
+                if resolution.code is not None and collector.has_capacity(resolution.code):
                     collector.add(
-                        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+                        resolution.code,
                         Evidence(
-                            path=entry.path,
+                            path=resolution.issue_path or path,
                             line=None,
                             field="symlinkTarget",
-                            value=f"chain exceeds {_MAX_SYMLINK_CHAIN} links",
-                            detector="static.symlink.chain_limit",
+                            value=resolution.value,
+                            detector=resolution.detector,
                         ),
                     )
-                break
-            if current.path in visited:
-                if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
-                    collector.add(
-                        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-                        Evidence(
-                            path=entry.path,
-                            line=None,
-                            field="symlinkTarget",
-                            value=f"{entry.symlink_target} (cycle)",
-                            detector="static.symlink.cycle",
-                        ),
-                    )
-                break
-            visited.add(current.path)
-            target = current.symlink_target or ""
-            if _is_unsafe_host_reference(target):
-                if collector.has_capacity(ReasonCode.SYMLINK_ESCAPE):
-                    collector.add(
-                        ReasonCode.SYMLINK_ESCAPE,
-                        Evidence(
-                            path=entry.path,
-                            line=None,
-                            field="symlinkTarget",
-                            value=target,
-                            detector="static.symlink.escape",
-                        ),
-                    )
-                break
-            resolved, escaped = _collapse_path(PurePosixPath(current.path).parent, target)
-            if escaped or resolved is None or not _is_within(resolved, candidate.root):
-                if collector.has_capacity(ReasonCode.SYMLINK_ESCAPE):
-                    collector.add(
-                        ReasonCode.SYMLINK_ESCAPE,
-                        Evidence(
-                            path=entry.path,
-                            line=None,
-                            field="symlinkTarget",
-                            value=f"{target} -> {resolved or '<outside snapshot>'}",
-                            detector="static.symlink.escape",
-                        ),
-                    )
-                break
-            next_entry = by_path.get(resolved)
-            if next_entry is None:
-                if collector.has_capacity(ReasonCode.MISSING_LOCAL_RESOURCE):
-                    collector.add(
-                        ReasonCode.MISSING_LOCAL_RESOURCE,
-                        Evidence(
-                            path=entry.path,
-                            line=None,
-                            field="symlinkTarget",
-                            value=f"{target} -> {resolved}",
-                            detector="static.symlink.dangling",
-                        ),
-                    )
-                break
-            current = next_entry
+        if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
+            collector.add(
+                ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+                Evidence(
+                    path=path,
+                    line=line,
+                    field="manifest",
+                    value=value,
+                    detector="static.boundary.unresolved_manifest",
+                ),
+            )
 
 
 def _is_documentation(path: str, boundary: PackageBoundary) -> bool:
@@ -1565,6 +1916,7 @@ def _analyze_boundary_reverse_dependencies(
 ) -> None:
     if validation.name is None:
         return
+    by_path = inventory.by_path
     manifest_paths = {item.manifest_path for item in boundaries if item.root == boundary.root} | {
         boundary.manifest_path
     }
@@ -1579,21 +1931,25 @@ def _analyze_boundary_reverse_dependencies(
         if (
             entry.kind != "file"
             or entry.content is None
-            or not _is_within(entry.path, boundary.root)
+            or (
+                not _is_within(entry.path, boundary.root)
+                and entry.path not in owned.explicit_runtime_paths
+                and not _is_within_any(entry.path, declared_runtime_roots)
+            )
             or _is_within(entry.path, candidate.root)
             or (
                 _is_within_any(entry.path, nested_roots)
-                and entry.path not in owned.runtime_paths
+                and entry.path not in owned.explicit_runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or (
                 _is_within_any(entry.path, skill_roots)
-                and entry.path not in owned.runtime_paths
+                and entry.path not in owned.explicit_runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or (
                 _is_documentation(entry.path, boundary)
-                and entry.path not in owned.runtime_paths
+                and entry.path not in owned.explicit_runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or not (
@@ -1609,7 +1965,7 @@ def _analyze_boundary_reverse_dependencies(
         declared_root_contains_candidate = False
         if entry.path in manifest_paths and parsed is not None:
             for field, raw_value in _iter_declared_runtime_values(parsed, entry.path):
-                declared_root = _path_if_owned(raw_value, boundary, inventory)
+                declared_root = _path_if_owned(raw_value, boundary, by_path)
                 if declared_root is None or not _is_within(candidate.root, declared_root):
                     continue
                 if collector.has_capacity(ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME):
@@ -1900,6 +2256,7 @@ def analyze_static(
                 ),
             )
 
+    _analyze_unresolved_boundary_manifests(candidate, inventory, boundaries, collector)
     ownerships = _derive_boundary_ownerships(candidate, inventory, boundaries)
     owned = _aggregate_owned_components(ownerships)
     _analyze_symlinks(candidate, inventory, collector)
@@ -1913,6 +2270,7 @@ def analyze_static(
         ownerships,
         collector,
     )
+    _analyze_owned_runtime_symlinks(candidate, ownerships, inventory, collector)
 
     reasons = collector.build()
     reason_codes = frozenset(reason.code for reason in reasons)

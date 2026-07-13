@@ -168,6 +168,75 @@ def test_package_json_plugin_skill_registration_is_packaging_only(tmp_path: Path
     assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
 
 
+@pytest.mark.parametrize("manifest", ["{", "[]"])
+def test_unparseable_enclosing_manifest_is_nonportable(
+    manifest: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": manifest,
+            "skills/alpha/SKILL.md": _skill(),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    evidence = _reason(result, ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED).evidence[0]
+    assert evidence.path == "plugin.json"
+    assert evidence.field == "manifest"
+    assert evidence.detector == "static.boundary.unresolved_manifest"
+
+
+def test_unparseable_outer_manifest_binds_nested_skills_only_candidate(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": "{",
+            "packages/b/plugin.json": json.dumps({"skills": ["skills/x"]}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    evidence = _reason(result, ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED).evidence[0]
+    assert evidence.path == "plugin.json"
+
+
+def test_symlink_enclosing_manifest_is_nonportable_even_when_target_is_valid(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "actual-plugin.json": json.dumps({}),
+            "skills/alpha/SKILL.md": _skill(),
+        },
+        symlinks={"plugin.json": "actual-plugin.json"},
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    evidence = _reason(result, ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED).evidence[0]
+    assert evidence.path == "plugin.json"
+    assert evidence.field == "manifest"
+
+
+def test_unparseable_unrelated_manifest_does_not_bind_candidate(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "packages/a/plugin.json": "{",
+            "packages/b/plugin.json": json.dumps({"skills": ["skills/x"]}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED not in result.reason_codes
+
+
 def test_mixed_plugin_without_proven_autonomy_is_ambiguous(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
@@ -1119,6 +1188,360 @@ def test_package_top_level_source_directory_does_not_own_descendants(
 
     assert result.classification is Classification.PORTABLE
     assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
+@pytest.mark.parametrize("field", ["source", "src"])
+def test_package_exact_source_symlink_resolves_owned_runtime_file(
+    field: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {
+                    field: "docs/runtime-link.py",
+                    "plugin": {"skills": ["packages/b/skills/x"]},
+                }
+            ),
+            "docs/actual.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        symlinks={"docs/runtime-link.py": "actual.py"},
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "docs/actual.py"
+
+
+def test_declared_runtime_symlink_resolves_owned_runtime_directory(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "docs/runtime-link"}),
+            "docs/actual/tool.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        symlinks={"docs/runtime-link": "actual"},
+        directories=frozenset({"docs/actual"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "docs/actual/tool.py"
+
+
+def test_package_source_symlink_to_directory_does_not_own_descendants(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {
+                    "source": "docs/runtime-link",
+                    "plugin": {"skills": ["packages/b/skills/x"]},
+                }
+            ),
+            "docs/actual/tool.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        symlinks={"docs/runtime-link": "actual"},
+        directories=frozenset({"docs/actual"}),
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
+def test_manifest_runtime_path_resolves_symlinked_prefix(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "alias/tool.py"}),
+            "examples/runtime/tool.py": 'open("skills/alpha/SKILL.md")',
+            "skills/alpha/SKILL.md": _skill(),
+        },
+        symlinks={"alias": "examples/runtime"},
+        directories=frozenset({"examples/runtime"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "examples/runtime/tool.py"
+
+
+def test_declared_runtime_directory_resolves_owned_symlink_descendant(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "runtime"}),
+            "examples/worker.py": 'open("skills/alpha/SKILL.md")',
+            "skills/alpha/SKILL.md": _skill(),
+        },
+        symlinks={"runtime/alias.py": "../examples/worker.py"},
+        directories=frozenset({"runtime"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "examples/worker.py"
+
+
+def test_explicit_runtime_symlink_target_inside_nested_plugin_is_owned(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "alias.py"}),
+            "vendor/plugin.json": json.dumps({}),
+            "vendor/worker.py": 'open("skills/alpha/SKILL.md")',
+            "skills/alpha/SKILL.md": _skill(),
+        },
+        symlinks={"alias.py": "vendor/worker.py"},
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "vendor/worker.py"
+
+
+def test_conventional_runtime_symlink_target_is_owned(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({}),
+            "examples/worker.py": 'open("skills/alpha/SKILL.md")',
+            "skills/alpha/SKILL.md": _skill(),
+        },
+        symlinks={"runtime/alias.py": "../examples/worker.py"},
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "examples/worker.py"
+
+
+def test_direct_explicit_runtime_outside_package_boundary_is_owned(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "packages/a/plugin.json": json.dumps({"runtime": "../../shared/worker.py"}),
+            "shared/worker.py": 'open("packages/a/skills/x/SKILL.md")',
+            "packages/a/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/a/skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "shared/worker.py"
+
+
+def test_undeclared_sibling_plugin_symlink_is_not_outer_runtime(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "src/runtime.py"}),
+            "src/runtime.py": "pass",
+            "packages/a/plugin.json": json.dumps({}),
+            "packages/a/worker.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        symlinks={"packages/a/runtime/alias.py": "../worker.py"},
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
+def test_exact_source_symlink_target_outside_package_boundary_is_owned(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "packages/b/package.json": json.dumps(
+                {
+                    "source": "docs/runtime-link.py",
+                    "plugin": {"skills": ["skills/x"]},
+                }
+            ),
+            "shared/actual.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        symlinks={"packages/b/docs/runtime-link.py": "../../../shared/actual.py"},
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "shared/actual.py"
+
+
+def test_exact_runtime_symlink_terminal_inside_candidate_binds_skill(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {
+                    "source": "docs/runtime-link.py",
+                    "plugin": {"skills": ["packages/b/skills/x"]},
+                }
+            ),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+            "packages/b/skills/x/runtime.py": "pass",
+        },
+        root="packages/b/skills/x",
+        symlinks={
+            "docs/runtime-link.py": "../packages/b/skills/x/runtime.py",
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    evidence = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME).evidence[0]
+    assert evidence.path == "docs/runtime-link.py"
+    assert evidence.field == "symlinkTarget"
+    assert "packages/b/skills/x/runtime.py" in evidence.value
+
+
+def test_exact_runtime_symlink_directory_containing_candidate_binds_skill(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {
+                    "source": "docs/runtime-link",
+                    "plugin": {"skills": ["packages/b/skills/x"]},
+                }
+            ),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        symlinks={"docs/runtime-link": "../packages/b"},
+        directories=frozenset({"packages/b"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    evidence = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME).evidence[0]
+    assert evidence.path == "docs/runtime-link"
+    assert evidence.field == "symlinkTarget"
+    assert evidence.value.endswith("-> packages/b")
+
+
+def test_undeclared_documentation_symlink_is_not_plugin_runtime(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps({"plugin": {"skills": ["packages/b/skills/x"]}}),
+            "docs/actual.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        symlinks={"docs/runtime-link.py": "actual.py"},
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("symlinks", "classification", "reason_code"),
+    [
+        pytest.param(
+            {"docs/runtime-link.py": "missing.py"},
+            Classification.PLUGIN_BOUND,
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            id="dangling",
+        ),
+        pytest.param(
+            {
+                "docs/runtime-link.py": "runtime-next.py",
+                "docs/runtime-next.py": "runtime-link.py",
+            },
+            Classification.PLUGIN_BOUND,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            id="cycle",
+        ),
+        pytest.param(
+            {"docs/runtime-link.py": "/etc/passwd"},
+            Classification.BLOCKED,
+            ReasonCode.SYMLINK_ESCAPE,
+            id="host_escape",
+        ),
+        pytest.param(
+            {"docs/runtime-link.py": "../../outside.py"},
+            Classification.BLOCKED,
+            ReasonCode.SYMLINK_ESCAPE,
+            id="snapshot_escape",
+        ),
+    ],
+)
+def test_explicit_runtime_symlink_failure_is_nonportable(
+    symlinks: Mapping[str, str],
+    classification: Classification,
+    reason_code: ReasonCode,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {
+                    "source": "docs/runtime-link.py",
+                    "plugin": {"skills": ["packages/b/skills/x"]},
+                }
+            ),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        symlinks=symlinks,
+    )
+
+    assert result.classification is classification
+    evidence = _reason(result, reason_code).evidence[0]
+    assert evidence.path == "docs/runtime-link.py"
+    assert evidence.field == "symlinkTarget"
+
+
+def test_manifest_runtime_symlink_prefix_with_missing_suffix_is_nonportable(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "alias/missing.py"}),
+            "skills/alpha/SKILL.md": _skill(),
+        },
+        symlinks={"alias": "docs"},
+        directories=frozenset({"docs"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    evidence = _reason(result, ReasonCode.MISSING_LOCAL_RESOURCE).evidence[0]
+    assert evidence.path == "alias"
+    assert evidence.field == "symlinkTarget"
+    assert evidence.value.endswith("-> docs/missing.py")
 
 
 def test_reverse_structured_skill_name_is_plugin_bound(tmp_path: Path) -> None:
