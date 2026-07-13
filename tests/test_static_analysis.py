@@ -206,6 +206,9 @@ def test_blocked_signal_is_stronger_than_invalid_but_both_reasons_survive(
         "$PLUGIN_DIR",
         "$CLAUDE_PLUGIN_PATH",
         "$EXTENSION_ROOT",
+        "${PLUGIN_ROOT:?plugin required}",
+        "${CLAUDE_PLUGIN_ROOT:-}",
+        "${PLUGIN_ROOT%/}",
         "extensionPath",
     ],
 )
@@ -229,7 +232,7 @@ def test_plugin_root_variable_is_plugin_bound(variable: str, tmp_path: Path) -> 
         5,
         "text",
     )
-    assert variable in evidence.value
+    assert evidence.value == variable
 
 
 @pytest.mark.parametrize(
@@ -238,6 +241,12 @@ def test_plugin_root_variable_is_plugin_bound(variable: str, tmp_path: Path) -> 
         ("process.env.PLUGIN_ROOT", "process.env.PLUGIN_ROOT"),
         ('Path(os.environ["CLAUDE_PLUGIN_ROOT"])', 'os.environ["CLAUDE_PLUGIN_ROOT"]'),
         ('env.get("CODEX_PLUGIN_DIR")', 'env.get("CODEX_PLUGIN_DIR")'),
+        ("$env:CURSOR_PLUGIN_PATH", "$env:CURSOR_PLUGIN_PATH"),
+        ("%EXTENSION_ROOT%", "%EXTENSION_ROOT%"),
+        ('std::env::var("GEMINI_PLUGIN_DIR")', 'std::env::var("GEMINI_PLUGIN_DIR")'),
+        ('System.getenv("OPENCLAW_PLUGIN_ROOT")', 'System.getenv("OPENCLAW_PLUGIN_ROOT")'),
+        ('getenv("PLUGIN_PATH")', 'getenv("PLUGIN_PATH")'),
+        ('ENV["CLAUDE_PLUGIN_DIR"]', 'ENV["CLAUDE_PLUGIN_DIR"]'),
     ],
 )
 def test_plugin_root_environment_access_is_plugin_bound(
@@ -252,6 +261,7 @@ def test_plugin_root_environment_access_is_plugin_bound(
 
     assert result.classification is Classification.PLUGIN_BOUND
     reason = _reason(result, ReasonCode.PLUGIN_ROOT_VARIABLE)
+    assert len(reason.evidence) == 1
     assert reason.evidence[0].path == "skills/alpha/SKILL.md"
     assert reason.evidence[0].line == 5
     assert reason.evidence[0].value == evidence_value
@@ -300,6 +310,10 @@ def test_metadata_only_root_plugin_can_package_a_self_contained_script(tmp_path:
         "The plugin must be enabled.",
         "You must install the plugin.",
         "You must enable the plugin.",
+        "Do not proceed without installing the plugin.",
+        "Never use this skill without enabling the plugin.",
+        "This skill cannot run without the plugin installed.",
+        "Not only does this skill require the plugin to be installed, it also needs setup.",
     ],
 )
 def test_affirmative_plugin_install_instruction_is_plugin_bound(
@@ -842,6 +856,26 @@ def test_outer_plugin_runtime_reference_reaches_nested_skill_package(tmp_path: P
     assert "packages/b/skills/x/SKILL.md" in reason.evidence[0].value
 
 
+def test_outer_manifest_declared_runtime_inside_nested_boundary_references_skill(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "packages/b/lib/tool.py"}),
+            "packages/b/plugin.json": json.dumps({}),
+            "packages/b/lib/tool.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "packages/b/lib/tool.py"
+    assert "packages/b/skills/x/SKILL.md" in reason.evidence[0].value
+
+
 def test_reverse_structured_skill_name_is_plugin_bound(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
@@ -1124,6 +1158,26 @@ def test_sibling_nested_plugin_runtime_is_not_outer_reverse_dependency(
             "src/runtime.py": "pass",
             "packages/a/plugin.json": json.dumps({"runtime": "runtime.py"}),
             "packages/a/runtime.py": 'open("packages/b/skills/x/SKILL.md")',
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
+def test_outer_boundary_does_not_claim_undeclared_conventional_nested_runtime(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "src/runtime.py"}),
+            "src/runtime.py": "pass",
+            "packages/a/plugin.json": json.dumps({}),
+            "packages/a/runtime/tool.py": 'open("packages/b/skills/x/SKILL.md")',
             "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
             "packages/b/skills/x/SKILL.md": _skill(),
         },

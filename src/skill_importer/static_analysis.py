@@ -33,16 +33,22 @@ _PLUGIN_ENV_NAME_PATTERN = (
     r"|EXTENSION_(?:ROOT|DIR|PATH))"
 )
 _PLUGIN_VARIABLE_RE = re.compile(
-    r"\$\{(?:(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)"
-    r"|EXTENSION_(?:ROOT|DIR|PATH))\}"
+    rf"\$\{{{_PLUGIN_ENV_NAME_PATTERN}"
+    r"(?:(?::[-=?+]?|[#%]{1,2})[^}\r\n]{0,256})?\}"
     r"|\$(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)\b"
     r"|\$EXTENSION_(?:ROOT|DIR|PATH)\b"
+    rf"|\$env:{_PLUGIN_ENV_NAME_PATTERN}\b"
+    rf"|%{_PLUGIN_ENV_NAME_PATTERN}%"
     rf"|\b(?:process|Deno|Bun)\.env\.{_PLUGIN_ENV_NAME_PATTERN}\b"
     rf"|\b(?:process|Deno|Bun)\.env\[\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\]"
     rf"|\bos\.environ\[\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\]"
+    rf"|\bstd::env::var\(\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\)"
+    rf"|\bSystem\.getenv\(\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\)"
     rf"|\b(?:os\.(?:getenv|environ\.get)|(?:env|environment)\.get|"
     rf"(?:process|Deno|Bun)\.env\.get)\(\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']"
     r"\s*(?:,[^)\r\n]{0,256})?\)"
+    rf"|\bgetenv\(\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\)"
+    rf"|\b(?-i:ENV)\[\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\]"
     r"|\bextensionPath\b",
     re.IGNORECASE,
 )
@@ -101,7 +107,14 @@ _RUNTIME_FILENAME_RE = re.compile(
 _PLUGIN_INSTALL_RE = re.compile(
     r"(?:requires?|needs?)\b[^\n]{0,80}\bplugin\b[^\n]{0,80}\b(?:installed|enabled)\b"
     r"|\b(?:install|enable)\b[^\n]{0,80}\bplugin\b"
-    r"|\bplugin\b[^\n]{0,80}\bmust\s+be\s+(?:installed|enabled)\b",
+    r"|\bplugin\b[^\n]{0,80}\bmust\s+be\s+(?:installed|enabled)\b"
+    r"|\bwithout\b[^\n]{0,80}\b(?:installing|enabling)\b[^\n]{0,80}\bplugin\b"
+    r"|\bwithout\b[^\n]{0,80}\bplugin\b[^\n]{0,80}\b(?:installed|enabled)\b",
+    re.IGNORECASE,
+)
+_PROVEN_PLUGIN_INDEPENDENCE_RE = re.compile(
+    r"\b(?:do|does|did)\s+not\s+(?:require|need)\b"
+    r"|\bneed\s+not\s+(?:to\s+)?(?:install|enable)\b",
     re.IGNORECASE,
 )
 _URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
@@ -987,25 +1000,15 @@ def _command_binary(line: str) -> str | None:
     return match.group("binary") if match is not None else None
 
 
-def _contains_negation(words: list[str]) -> bool:
-    for index, word in enumerate(words):
-        if word == "not" and index + 1 < len(words) and words[index + 1] == "only":
-            continue
-        if word in {"no", "not", "never", "without"}:
-            return True
-    return False
-
-
-def _plugin_install_match_is_negated(content: str, match: re.Match[str]) -> bool:
+def _plugin_install_match_proves_independence(content: str, match: re.Match[str]) -> bool:
     window_start = max(0, match.start() - _PLUGIN_NEGATION_CONTEXT_CHARS)
     prefix = content[window_start : match.start()]
     clause_start = max(
         (prefix.rfind(delimiter) for delimiter in "\n.!?;,:"),
         default=-1,
     )
-    prefix_words = re.findall(r"[A-Za-z]+", prefix[clause_start + 1 :].casefold())
-    match_words = re.findall(r"[A-Za-z]+", match.group(0).casefold())
-    return _contains_negation(prefix_words[-6:]) or _contains_negation(match_words)
+    clause = f"{prefix[clause_start + 1 :]}{match.group(0)}"
+    return _PROVEN_PLUGIN_INDEPENDENCE_RE.search(clause) is not None
 
 
 def _is_owned_runtime_path(
@@ -1049,7 +1052,7 @@ def _analyze_forward_paths(
         for match in _PLUGIN_INSTALL_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
                 break
-            if _plugin_install_match_is_negated(content, match):
+            if _plugin_install_match_proves_independence(content, match):
                 continue
             collector.add(
                 ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
@@ -1491,7 +1494,7 @@ def _analyze_boundary_reverse_dependencies(
             or entry.content is None
             or not _is_within(entry.path, boundary.root)
             or _is_within(entry.path, candidate.root)
-            or _is_within_any(entry.path, nested_roots)
+            or (_is_within_any(entry.path, nested_roots) and entry.path not in owned.runtime_paths)
             or _is_within_any(entry.path, skill_roots)
             or _is_documentation(entry.path, boundary)
             or not (
