@@ -541,6 +541,7 @@ class AnalyzedSkill:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "reasons", tuple(self.reasons))
+        self._validate_validation_classification()
         if self.content_hash is not None:
             _validate_sha256(self.content_hash, "content_hash")
         if self.analysis_method not in {"static", "static+fm"}:
@@ -557,6 +558,13 @@ class AnalyzedSkill:
             raise ValueError("FM review is allowed only for ambiguous static classification")
         if self.classification is Classification.PORTABLE:
             self._validate_portable_for_import()
+
+    def _validate_validation_classification(self) -> None:
+        fail_closed = {Classification.INVALID, Classification.BLOCKED}
+        if not self.validation.valid and (
+            self.static_classification not in fail_closed or self.classification not in fail_closed
+        ):
+            raise ValueError("invalid validation requires invalid or blocked classification")
 
     def _validate_ambiguous_transition(self) -> None:
         if self.fm_review is None:
@@ -577,6 +585,7 @@ class AnalyzedSkill:
                 raise ValueError("portable FM promotion requires a verified reason with evidence")
 
     def _validate_portable_for_import(self) -> None:
+        self._validate_validation_classification()
         if self.classification is not Classification.PORTABLE:
             raise ValueError("import plan may select only portable skills")
         if self.static_classification is Classification.PORTABLE:

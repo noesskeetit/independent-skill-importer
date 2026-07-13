@@ -88,6 +88,16 @@ def _analyzed_skill(snapshot_root: Path) -> AnalyzedSkill:
     )
 
 
+def _invalid_validation() -> ValidationResult:
+    return ValidationResult(
+        valid=False,
+        name=None,
+        description=None,
+        frontmatter={},
+        reasons=(_reason(ReasonCode.INVALID_FRONTMATTER),),
+    )
+
+
 def test_reason_serializes_machine_readable_evidence() -> None:
     reason = DecisionReason(
         code=ReasonCode.PLUGIN_ROOT_VARIABLE,
@@ -446,6 +456,50 @@ def test_import_plan_defensively_revalidates_portable_fm_promotion(tmp_path: Pat
 
     with pytest.raises(ValueError, match="unredacted context"):
         ImportPlan(selected=(promoted,), rejected=(), records=())
+
+
+@pytest.mark.parametrize(
+    "classification",
+    [Classification.PORTABLE, Classification.PLUGIN_BOUND, Classification.AMBIGUOUS],
+)
+def test_broken_validation_rejects_non_fail_closed_classification(
+    classification: Classification,
+    tmp_path: Path,
+) -> None:
+    skill = _analyzed_skill(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid validation requires"):
+        replace(
+            skill,
+            validation=_invalid_validation(),
+            static_classification=classification,
+            classification=classification,
+            reasons=(_reason(ReasonCode.INVALID_FRONTMATTER),),
+        )
+
+
+def test_import_plan_rejects_portable_skill_with_broken_validation(tmp_path: Path) -> None:
+    skill = _analyzed_skill(tmp_path)
+    object.__setattr__(skill, "validation", _invalid_validation())
+
+    with pytest.raises(ValueError, match="invalid validation requires"):
+        ImportPlan(selected=(skill,), rejected=(), records=())
+
+
+@pytest.mark.parametrize("classification", [Classification.INVALID, Classification.BLOCKED])
+def test_broken_validation_allows_fail_closed_results(
+    classification: Classification,
+    tmp_path: Path,
+) -> None:
+    skill = replace(
+        _analyzed_skill(tmp_path),
+        validation=_invalid_validation(),
+        static_classification=classification,
+        classification=classification,
+        reasons=(_reason(ReasonCode.INVALID_FRONTMATTER),),
+    )
+
+    assert skill.classification is classification
 
 
 def test_frontmatter_is_recursively_immutable_and_detached() -> None:
