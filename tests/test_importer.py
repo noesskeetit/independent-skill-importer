@@ -1500,7 +1500,7 @@ def test_prepare_output_maps_expanduser_runtime_error(
 
 
 @pytest.mark.parametrize("failure_point", ["lstat", "fstat", "fchmod"])
-def test_create_staging_closes_fd_and_removes_owned_directory_on_failure(
+def test_create_staging_handles_post_mkdir_failure_without_fd_leak(
     failure_point: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1557,4 +1557,66 @@ def test_create_staging_closes_fd_and_removes_owned_directory_on_failure(
         with pytest.raises(OSError) as error:
             original_fstat(captured_fd)
         assert error.value.errno == errno.EBADF
-    assert not list(tmp_path.glob(".out.skill-importer-*"))
+    orphans = list(tmp_path.glob(".out.skill-importer-*"))
+    if failure_point == "lstat":
+        assert len(orphans) == 1
+        assert stat.S_IMODE(orphans[0].stat().st_mode) == 0o700
+        shutil.rmtree(orphans[0])
+    else:
+        assert not orphans
+
+
+def test_first_staging_lstat_failure_never_adopts_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = importer_module._prepare_output(tmp_path / "out")
+    original_open = importer_module.os.open
+    original_lstat_at = importer_module._lstat_at
+    captured_fds: list[int] = []
+    competitor_path: Path | None = None
+    competitor_identity: tuple[int, int] | None = None
+    marker = tmp_path / "competitor-marker"
+    replaced = False
+
+    def capturing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        file_fd = original_open(path, flags, *args, **kwargs)
+        if isinstance(path, str) and ".skill-importer-" in path:
+            captured_fds.append(file_fd)
+        return file_fd
+
+    def replace_then_fail(directory_fd: int, name: str) -> os.stat_result | None:
+        nonlocal competitor_path, competitor_identity, replaced
+        if not replaced and ".skill-importer-" in name:
+            replaced = True
+            os.rmdir(name, dir_fd=directory_fd)
+            os.mkdir(name, 0o700, dir_fd=directory_fd)
+            competitor_path = tmp_path / name
+            current = original_lstat_at(directory_fd, name)
+            assert current is not None
+            competitor_identity = (current.st_dev, current.st_ino)
+            marker.write_text("keep")
+            raise OSError(errno.EIO, "injected first lstat failure")
+        return original_lstat_at(directory_fd, name)
+
+    monkeypatch.setattr(importer_module.os, "open", capturing_open)
+    monkeypatch.setattr(importer_module, "_lstat_at", replace_then_fail)
+    try:
+        with pytest.raises(ImporterError, match="STAGING_CREATE_FAILED"):
+            importer_module._create_staging(output)
+
+        assert replaced
+        assert competitor_path is not None
+        assert competitor_identity is not None
+        assert competitor_path.is_dir()
+        assert (competitor_path.stat().st_dev, competitor_path.stat().st_ino) == competitor_identity
+        assert marker.read_text() == "keep"
+        assert not os.path.lexists(tmp_path / "out")
+        assert captured_fds == []
+    finally:
+        monkeypatch.setattr(importer_module.os, "open", original_open)
+        monkeypatch.setattr(importer_module, "_lstat_at", original_lstat_at)
+        if competitor_path is not None:
+            shutil.rmtree(competitor_path, ignore_errors=True)
+        marker.unlink(missing_ok=True)
+        os.close(output.parent_fd)

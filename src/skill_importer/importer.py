@@ -782,17 +782,6 @@ def _remove_empty_owned_directory(
                     os.close(file_fd)
 
 
-def _recover_created_directory_identity(parent_fd: int, name: str) -> tuple[int, int] | None:
-    """Recover an identity only when a one-shot post-mkdir observation failed."""
-    try:
-        current = _lstat_at(parent_fd, name)
-    except OSError:
-        return None
-    if current is None or not stat.S_ISDIR(current.st_mode):
-        return None
-    return current.st_dev, current.st_ino
-
-
 def _create_staging(output: _OutputHandle) -> _StagingHandle:
     prefix = f".{output.output_name[:48]}.skill-importer-"
     for _ in range(64):
@@ -830,9 +819,8 @@ def _create_staging(output: _OutputHandle) -> _StagingHandle:
             if file_fd >= 0:
                 with suppress(OSError):
                     os.close(file_fd)
-            if owned_identity is None:
-                owned_identity = _recover_created_directory_identity(output.parent_fd, name)
-            _remove_empty_owned_directory(output.parent_fd, name, owned_identity)
+            if owned_identity is not None:
+                _remove_empty_owned_directory(output.parent_fd, name, owned_identity)
             if isinstance(exc, ImporterError):
                 raise
             if isinstance(exc, OSError):
