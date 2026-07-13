@@ -3,6 +3,7 @@
 import os
 import subprocess
 import tarfile
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
@@ -12,6 +13,20 @@ from typing import Any
 from skill_importer.source import SubprocessGitRunner
 
 SKILL_TEXT = "---\nname: x\ndescription: x\n---\n"
+_GIT_CONFIGURATION = (
+    "-c",
+    "user.name=Skill Importer Test",
+    "-c",
+    "user.email=skill-importer@example.invalid",
+    "-c",
+    f"core.hooksPath={os.devnull}",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "protocol.file.allow=always",
+)
 
 
 class ScandirLimiter:
@@ -58,31 +73,36 @@ def write_tree(root: Path, files: Mapping[str, str | bytes]) -> None:
             destination.write_text(content, encoding="utf-8")
 
 
+def _isolated_git_environment(home: Path) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+        and key not in {"HOME", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "XDG_CONFIG_HOME"}
+    }
+    environment.update(
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
 def run_git(repository: Path, args: Sequence[str]) -> str:
     """Run real Git with deterministic identity and no ambient user config."""
-    environment = {
-        **os.environ,
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_TERMINAL_PROMPT": "0",
-    }
-    completed = subprocess.run(
-        [
-            "git",
-            "-c",
-            "user.name=Skill Importer Test",
-            "-c",
-            "user.email=skill-importer@example.invalid",
-            "-C",
-            str(repository),
-            *args,
-        ],
-        check=True,
-        capture_output=True,
-        env=environment,
-        shell=False,
-        text=True,
-    )
+    with tempfile.TemporaryDirectory(prefix="skill-importer-test-git-home-") as home:
+        completed = subprocess.run(
+            ["git", *_GIT_CONFIGURATION, "-C", str(repository), *args],
+            check=True,
+            capture_output=True,
+            env=_isolated_git_environment(Path(home)),
+            shell=False,
+            text=True,
+        )
     return completed.stdout.strip()
 
 
@@ -98,20 +118,23 @@ def create_git_repository(root: Path, files: Mapping[str, str | bytes]) -> str:
 
 def create_bare_repository(source: Path, destination: Path) -> Path:
     """Clone a known test repository as a real bare remote without using ambient config."""
-    environment = {
-        **os.environ,
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_TERMINAL_PROMPT": "0",
-    }
-    subprocess.run(
-        ["git", "clone", "--bare", "--no-local", str(source), str(destination)],
-        check=True,
-        capture_output=True,
-        env=environment,
-        shell=False,
-        text=True,
-    )
+    with tempfile.TemporaryDirectory(prefix="skill-importer-test-git-home-") as home:
+        subprocess.run(
+            [
+                "git",
+                *_GIT_CONFIGURATION,
+                "clone",
+                "--bare",
+                "--no-local",
+                str(source),
+                str(destination),
+            ],
+            check=True,
+            capture_output=True,
+            env=_isolated_git_environment(Path(home)),
+            shell=False,
+            text=True,
+        )
     return destination
 
 

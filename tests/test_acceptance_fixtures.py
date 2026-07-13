@@ -365,6 +365,15 @@ def test_duplicate_fixture_imports_one_payload_with_complete_provenance(
 ) -> None:
     source = _fixture_source("12_duplicate_layouts")
     out = tmp_path / "out"
+    preview = _scan_fixture_without_llm("12_duplicate_layouts")
+    expected_provenance = {
+        (
+            skill.candidate_id,
+            skill.candidate.root,
+            skill.candidate.entrypoint,
+        )
+        for skill in preview.skills
+    }
 
     result = _import_fixture_without_llm("12_duplicate_layouts", out)
     raw_manifest = (out / "import-manifest.json").read_bytes()
@@ -385,13 +394,26 @@ def test_duplicate_fixture_imports_one_payload_with_complete_provenance(
         set(provenance) == {"candidateId", "originalRoot", "entrypoint"}
         for provenance in imported["provenance"]
     )
-    assert {provenance["originalRoot"] for provenance in imported["provenance"]} == {
-        "layout-a/tool",
-        "marketplace/packages/tool",
-    }
-    assert {provenance["entrypoint"] for provenance in imported["provenance"]} == {
-        "layout-a/tool/SKILL.md",
-        "marketplace/packages/tool/SKILL.md",
+    actual_provenance = [
+        (
+            provenance["candidateId"],
+            provenance["originalRoot"],
+            provenance["entrypoint"],
+        )
+        for provenance in imported["provenance"]
+    ]
+    assert len(actual_provenance) == len(expected_provenance)
+    assert len(set(actual_provenance)) == len(actual_provenance)
+    assert set(actual_provenance) == expected_provenance
+    assert {candidate_id for candidate_id, _, _ in expected_provenance} == set(
+        imported["candidateIds"]
+    )
+    assert {(root, entrypoint) for _, root, entrypoint in expected_provenance} == {
+        ("layout-a/tool", "layout-a/tool/SKILL.md"),
+        (
+            "marketplace/packages/tool",
+            "marketplace/packages/tool/SKILL.md",
+        ),
     }
     canonical_url = source.resolve().as_uri()
     assert manifest["source"]["canonicalSourceUrl"] == canonical_url

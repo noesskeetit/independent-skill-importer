@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from collections.abc import Mapping
@@ -163,6 +164,42 @@ def test_local_bare_git_named_ref_scan_then_import_preserves_exact_sha(
     assert manifest["source"]["canonicalSourceUrl"] == remote_url
     assert manifest["source"]["resolvedCommitSha"] == release_sha
     assert manifest["imported"][0]["provenance"][0]["originalRoot"] == "tool"
+
+
+def test_git_fixture_helpers_ignore_poisoned_ambient_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "ambient-hook-executed"
+    hooks = tmp_path / "ambient-hooks"
+    hooks.mkdir()
+    post_commit = hooks / "post-commit"
+    post_commit.write_text(
+        f"#!/bin/sh\nprintf poisoned > {sentinel}\nexit 93\n",
+        encoding="utf-8",
+    )
+    post_commit.chmod(0o755)
+    poison_home = tmp_path / "ambient-home"
+    poison_home.mkdir()
+    (poison_home / ".gitconfig").write_text(
+        f'[core]\n\thooksPath = {hooks}\n[protocol "file"]\n\tallow = never\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(poison_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(poison_home))
+    monkeypatch.setenv("GIT_DIR", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(hooks))
+    monkeypatch.setenv("GIT_CONFIG_KEY_1", "protocol.file.allow")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_1", "never")
+
+    worktree = tmp_path / "isolated-worktree"
+    head = create_git_repository(worktree, {"SKILL.md": _skill("isolated")})
+    bare = create_bare_repository(worktree, tmp_path / "isolated.git")
+
+    assert run_git(bare, ["rev-parse", "refs/heads/main"]) == head
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize(
