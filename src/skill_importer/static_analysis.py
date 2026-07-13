@@ -27,11 +27,22 @@ _MAX_EVIDENCE_PER_REASON = 64
 _MAX_MANIFEST_NODES = 4096
 _MAX_MANIFEST_DEPTH = 64
 _MAX_SYMLINK_CHAIN = 64
+_PLUGIN_NEGATION_CONTEXT_CHARS = 256
+_PLUGIN_ENV_NAME_PATTERN = (
+    r"(?:(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)"
+    r"|EXTENSION_(?:ROOT|DIR|PATH))"
+)
 _PLUGIN_VARIABLE_RE = re.compile(
     r"\$\{(?:(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)"
     r"|EXTENSION_(?:ROOT|DIR|PATH))\}"
     r"|\$(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)\b"
     r"|\$EXTENSION_(?:ROOT|DIR|PATH)\b"
+    rf"|\b(?:process|Deno|Bun)\.env\.{_PLUGIN_ENV_NAME_PATTERN}\b"
+    rf"|\b(?:process|Deno|Bun)\.env\[\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\]"
+    rf"|\bos\.environ\[\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']\s*\]"
+    rf"|\b(?:os\.(?:getenv|environ\.get)|(?:env|environment)\.get|"
+    rf"(?:process|Deno|Bun)\.env\.get)\(\s*[\"']{_PLUGIN_ENV_NAME_PATTERN}[\"']"
+    r"\s*(?:,[^)\r\n]{0,256})?\)"
     r"|\bextensionPath\b",
     re.IGNORECASE,
 )
@@ -326,6 +337,12 @@ class _OwnedComponents:
     @classmethod
     def empty(cls) -> _OwnedComponents:
         return cls(set(), set(), set(), set(), set(), set(), set(), set())
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundaryOwnership:
+    boundary: PackageBoundary
+    components: _OwnedComponents
 
 
 class _ReasonCollector:
@@ -631,16 +648,33 @@ def _collect_manifest_components(
             pending.extend(current[:remaining])
 
 
-def _derive_owned_components(
+def _boundary_depth(boundary: PackageBoundary) -> int:
+    return 0 if boundary.root == "." else len(PurePosixPath(boundary.root).parts)
+
+
+def _enclosing_boundaries(
+    candidate: SkillCandidate,
+    boundaries: tuple[PackageBoundary, ...],
+) -> tuple[PackageBoundary, ...]:
+    by_root: dict[str, PackageBoundary] = {}
+    for boundary in sorted(boundaries, key=lambda item: item.manifest_path):
+        if _is_within(candidate.root, boundary.root):
+            by_root.setdefault(boundary.root, boundary)
+    return tuple(
+        sorted(
+            by_root.values(),
+            key=lambda item: (-_boundary_depth(item), item.root, item.manifest_path),
+        )
+    )
+
+
+def _derive_boundary_owned_components(
     candidate: SkillCandidate,
     inventory: Inventory,
     boundaries: tuple[PackageBoundary, ...],
+    boundary: PackageBoundary,
 ) -> _OwnedComponents:
-    boundary = candidate.enclosing_boundary
     owned = _OwnedComponents.empty()
-    if boundary is None:
-        return owned
-
     manifest_paths = {item.manifest_path for item in boundaries if item.root == boundary.root} | {
         boundary.manifest_path
     }
@@ -715,6 +749,41 @@ def _derive_owned_components(
                     module_parts[-1] = PurePosixPath(module_parts[-1]).stem
                     owned.runtime_modules.add(".".join(module_parts).casefold())
     return owned
+
+
+def _derive_boundary_ownerships(
+    candidate: SkillCandidate,
+    inventory: Inventory,
+    boundaries: tuple[PackageBoundary, ...],
+) -> tuple[_BoundaryOwnership, ...]:
+    return tuple(
+        _BoundaryOwnership(
+            boundary=boundary,
+            components=_derive_boundary_owned_components(
+                candidate,
+                inventory,
+                boundaries,
+                boundary,
+            ),
+        )
+        for boundary in _enclosing_boundaries(candidate, boundaries)
+    )
+
+
+def _aggregate_owned_components(
+    ownerships: tuple[_BoundaryOwnership, ...],
+) -> _OwnedComponents:
+    aggregate = _OwnedComponents.empty()
+    for ownership in ownerships:
+        aggregate.mcp.update(ownership.components.mcp)
+        aggregate.commands.update(ownership.components.commands)
+        aggregate.agents.update(ownership.components.agents)
+        aggregate.hooks.update(ownership.components.hooks)
+        aggregate.providers.update(ownership.components.providers)
+        aggregate.binaries.update(ownership.components.binaries)
+        aggregate.runtime_paths.update(ownership.components.runtime_paths)
+        aggregate.runtime_modules.update(ownership.components.runtime_modules)
+    return aggregate
 
 
 def _add_plugin_symbol_references(
@@ -918,20 +987,44 @@ def _command_binary(line: str) -> str | None:
     return match.group("binary") if match is not None else None
 
 
-def _is_runtime_path(path: str, boundary: PackageBoundary, owned: _OwnedComponents) -> bool:
-    if path in owned.runtime_paths:
-        return True
-    return _is_known_runtime_component_path(path, boundary)
+def _contains_negation(words: list[str]) -> bool:
+    for index, word in enumerate(words):
+        if word == "not" and index + 1 < len(words) and words[index + 1] == "only":
+            continue
+        if word in {"no", "not", "never", "without"}:
+            return True
+    return False
+
+
+def _plugin_install_match_is_negated(content: str, match: re.Match[str]) -> bool:
+    window_start = max(0, match.start() - _PLUGIN_NEGATION_CONTEXT_CHARS)
+    prefix = content[window_start : match.start()]
+    clause_start = max(
+        (prefix.rfind(delimiter) for delimiter in "\n.!?;,:"),
+        default=-1,
+    )
+    prefix_words = re.findall(r"[A-Za-z]+", prefix[clause_start + 1 :].casefold())
+    match_words = re.findall(r"[A-Za-z]+", match.group(0).casefold())
+    return _contains_negation(prefix_words[-6:]) or _contains_negation(match_words)
+
+
+def _is_owned_runtime_path(
+    path: str,
+    ownerships: tuple[_BoundaryOwnership, ...],
+) -> bool:
+    return any(
+        _is_within(path, ownership.boundary.root) and path in ownership.components.runtime_paths
+        for ownership in ownerships
+    )
 
 
 def _analyze_forward_paths(
     candidate: SkillCandidate,
     inventory: Inventory,
-    owned: _OwnedComponents,
+    ownerships: tuple[_BoundaryOwnership, ...],
     collector: _ReasonCollector,
 ) -> None:
     by_path = inventory.by_path
-    boundary = candidate.enclosing_boundary
     for entry in inventory.entries:
         if (
             entry.kind != "file"
@@ -956,6 +1049,8 @@ def _analyze_forward_paths(
         for match in _PLUGIN_INSTALL_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
                 break
+            if _plugin_install_match_is_negated(content, match):
+                continue
             collector.add(
                 ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
                 _text_evidence(
@@ -1035,11 +1130,8 @@ def _analyze_forward_paths(
                                 field="path",
                             ),
                         )
-                    if (
-                        boundary is not None
-                        and _is_within(resolved, boundary.root)
-                        and _is_runtime_path(resolved, boundary, owned)
-                        and collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE)
+                    if _is_owned_runtime_path(resolved, ownerships) and collector.has_capacity(
+                        ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE
                     ):
                         collector.add(
                             ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
@@ -1054,40 +1146,44 @@ def _analyze_forward_paths(
                         )
                 continue
 
-            boundary_target: str | None = None
-            if boundary is not None and not raw.startswith((".", "..")):
-                candidate_at_boundary = raw if boundary.root == "." else f"{boundary.root}/{raw}"
-                if candidate_at_boundary in by_path:
-                    boundary_target = candidate_at_boundary
-            if boundary_target is not None:
-                if collector.has_capacity(ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT):
-                    collector.add(
-                        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-                        _text_evidence(
-                            entry.path,
-                            content,
-                            offset,
-                            f"{raw} -> {boundary_target}",
-                            "static.forward.outside_reference",
-                            field="path",
-                        ),
+            boundary_targets: list[tuple[str, _BoundaryOwnership]] = []
+            if not raw.startswith((".", "..")):
+                for ownership in ownerships:
+                    boundary = ownership.boundary
+                    candidate_at_boundary = (
+                        raw if boundary.root == "." else f"{boundary.root}/{raw}"
                     )
-                if (
-                    boundary is not None
-                    and _is_runtime_path(boundary_target, boundary, owned)
-                    and collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE)
-                ):
-                    collector.add(
-                        ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
-                        _text_evidence(
-                            entry.path,
-                            content,
-                            offset,
-                            f"{raw} -> {boundary_target}",
-                            "static.forward.plugin_runtime_path",
-                            field="path",
-                        ),
-                    )
+                    if candidate_at_boundary in by_path:
+                        boundary_targets.append((candidate_at_boundary, ownership))
+            if boundary_targets:
+                for boundary_target, ownership in boundary_targets:
+                    if collector.has_capacity(ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT):
+                        collector.add(
+                            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+                            _text_evidence(
+                                entry.path,
+                                content,
+                                offset,
+                                f"{raw} -> {boundary_target}",
+                                "static.forward.outside_reference",
+                                field="path",
+                            ),
+                        )
+                    if (
+                        boundary_target in ownership.components.runtime_paths
+                        and collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE)
+                    ):
+                        collector.add(
+                            ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
+                            _text_evidence(
+                                entry.path,
+                                content,
+                                offset,
+                                f"{raw} -> {boundary_target}",
+                                "static.forward.plugin_runtime_path",
+                                field="path",
+                            ),
+                        )
             else:
                 if collector.has_capacity(ReasonCode.MISSING_LOCAL_RESOURCE):
                     collector.add(
@@ -1369,16 +1465,16 @@ def _matches_skill_identity(value: str, candidate: SkillCandidate, skill_name: s
     )
 
 
-def _analyze_reverse_dependencies(
+def _analyze_boundary_reverse_dependencies(
     candidate: SkillCandidate,
     validation: ValidationResult,
     inventory: Inventory,
     boundaries: tuple[PackageBoundary, ...],
+    boundary: PackageBoundary,
     owned: _OwnedComponents,
     collector: _ReasonCollector,
 ) -> None:
-    boundary = candidate.enclosing_boundary
-    if boundary is None or validation.name is None:
+    if validation.name is None:
         return
     manifest_paths = {item.manifest_path for item in boundaries if item.root == boundary.root} | {
         boundary.manifest_path
@@ -1514,6 +1610,26 @@ def _analyze_reverse_dependencies(
                             field="orchestration",
                         ),
                     )
+
+
+def _analyze_reverse_dependencies(
+    candidate: SkillCandidate,
+    validation: ValidationResult,
+    inventory: Inventory,
+    boundaries: tuple[PackageBoundary, ...],
+    ownerships: tuple[_BoundaryOwnership, ...],
+    collector: _ReasonCollector,
+) -> None:
+    for ownership in ownerships:
+        _analyze_boundary_reverse_dependencies(
+            candidate,
+            validation,
+            inventory,
+            boundaries,
+            ownership.boundary,
+            ownership.components,
+            collector,
+        )
 
 
 def _sequence_of_strings(value: object) -> Iterable[str]:
@@ -1660,11 +1776,19 @@ def analyze_static(
                 ),
             )
 
-    owned = _derive_owned_components(candidate, inventory, boundaries)
+    ownerships = _derive_boundary_ownerships(candidate, inventory, boundaries)
+    owned = _aggregate_owned_components(ownerships)
     _analyze_symlinks(candidate, inventory, collector)
-    _analyze_forward_paths(candidate, inventory, owned, collector)
+    _analyze_forward_paths(candidate, inventory, ownerships, collector)
     _add_plugin_symbol_references(candidate, validation, inventory, owned, collector)
-    _analyze_reverse_dependencies(candidate, validation, inventory, boundaries, owned, collector)
+    _analyze_reverse_dependencies(
+        candidate,
+        validation,
+        inventory,
+        boundaries,
+        ownerships,
+        collector,
+    )
 
     reasons = collector.build()
     reason_codes = frozenset(reason.code for reason in reasons)
