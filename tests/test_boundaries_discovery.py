@@ -368,27 +368,61 @@ def test_symlink_recognized_manifest_keeps_fail_closed_boundary(
     assert candidates[0].enclosing_boundary == boundaries[0]
 
 
-def test_symlink_package_json_does_not_create_name_only_boundary() -> None:
-    inventory = Inventory(entries=(_symlink("package.json"),))
+@pytest.mark.parametrize("entry_kind", ["symlink", "directory"])
+def test_non_regular_package_json_creates_unknown_mixed_boundary(
+    entry_kind: str,
+    tmp_path: Path,
+) -> None:
+    package_entry = (
+        _symlink("package.json") if entry_kind == "symlink" else _directory("package.json")
+    )
+    inventory = Inventory(
+        entries=(
+            package_entry,
+            _file("skills/x/SKILL.md", "---\nname: x\ndescription: x\n---\n"),
+        )
+    )
 
-    assert detect_boundaries(inventory) == ()
+    boundaries = detect_boundaries(inventory)
+    candidates = discover_candidates(_resolved(tmp_path), inventory, boundaries)
+
+    assert len(boundaries) == 1
+    assert boundaries[0].manifest_kind == "package_json"
+    assert boundaries[0].package_kind == "mixed"
+    assert candidates[0].enclosing_boundary == boundaries[0]
 
 
 @pytest.mark.parametrize(
     "component_directory",
     [
         "mcp",
+        "mcp-server",
         "mcp-servers",
+        "mcp.server",
+        "mcp_server",
         "mcp_servers",
+        "mcpserver",
+        "mcpservers",
+        "hook",
         "hooks",
+        "command",
         "commands",
+        "agent",
         "agents",
+        "source",
         "src",
-        "runtime",
-        "scripts",
-        "providers",
+        "server",
         "servers",
+        "runtime",
+        "script",
+        "scripts",
+        "provider",
+        "providers",
         "bin",
+        "executable",
+        "executables",
+        "entrypoint",
+        "entry-point",
     ],
 )
 def test_known_empty_component_directory_makes_package_mixed(

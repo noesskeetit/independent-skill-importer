@@ -70,16 +70,27 @@ _RUNTIME_DECLARATION_KEYS = frozenset(
 )
 _RUNTIME_DIRECTORY_NAMES = frozenset(
     {
+        "agent",
         "agents",
         "bin",
+        "command",
         "commands",
+        "entrypoint",
+        "executable",
+        "executables",
+        "hook",
         "hooks",
         "mcp",
+        "mcpserver",
         "mcpservers",
+        "provider",
         "providers",
         "runtime",
+        "script",
         "scripts",
+        "server",
         "servers",
+        "source",
         "src",
     }
 )
@@ -156,9 +167,10 @@ def _manifest_descriptor(entry: InventoryEntry) -> tuple[str, str] | None:
     if name in _ROOT_MANIFESTS:
         root = PurePosixPath(*parts[:-1]).as_posix() if len(parts) > 1 else "."
         return root, _ROOT_MANIFESTS[name]
-    if entry.kind == "file" and name == "package.json" and _package_json_has_plugin_marker(entry):
+    if name == "package.json":
         root = PurePosixPath(*parts[:-1]).as_posix() if len(parts) > 1 else "."
-        return root, "package_json"
+        if entry.kind != "file" or _package_json_has_plugin_marker(entry):
+            return root, "package_json"
     return None
 
 
