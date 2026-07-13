@@ -26,6 +26,7 @@ _EVIDENCE_VALUE_LIMIT = 256
 _MAX_EVIDENCE_PER_REASON = 64
 _MAX_MANIFEST_NODES = 4096
 _MAX_MANIFEST_DEPTH = 64
+_MAX_SYMLINK_CHAIN = 64
 _PLUGIN_VARIABLE_RE = re.compile(
     r"\$\{(?:(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)"
     r"|EXTENSION_(?:ROOT|DIR|PATH))\}"
@@ -44,11 +45,12 @@ _PATH_TOKEN_RE = re.compile(
 )
 _HOST_PATH_TOKEN_RE = re.compile(
     r"(?P<file>file://[^\s`'\"<>]+)"
-    r"|(?P<windows>[A-Za-z]:[\\/][^\s`'\"<>]+)"
+    r"|(?P<windows>(?<![A-Za-z0-9])[A-Za-z]:(?:\\|/(?!/))[^\s`'\"<>]+)"
     r"|(?P<posix>(?<![\w:/.$}])/(?!/)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)"
     r"|(?P<encoded>(?<![A-Za-z0-9:/])(?:%2e|%2f|%5c)[^\s`'\"<>]+)",
     re.IGNORECASE,
 )
+_BACKSLASH_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?P<path>(?:\.\.\\|\.\\|~\\)[^\s`'\"<>]+)")
 _MCP_TOOL_RE = re.compile(r"\bmcp__(?P<server>[A-Za-z0-9_.-]+)__(?P<tool>[A-Za-z0-9_.-]+)\b")
 _COMMAND_REFERENCE_RE = re.compile(
     r"(?<![\w-])/(?P<slash>[A-Za-z0-9_.-]+)\b"
@@ -82,6 +84,13 @@ _WINDOWS_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _STRUCTURED_SKILL_KEY_RE = re.compile(
     r"\b(?:skill|skill[_-]?(?:name|id|path|root))\s*[:=]\s*[\"']?(?P<value>[^\s,}\]\"']+)",
     re.IGNORECASE,
+)
+_STRUCTURED_SKILLS_LIST_RE = re.compile(
+    r"\bskills\s*[:=]\s*\[(?P<values>[^\]\r\n]{0,2048})\]",
+    re.IGNORECASE,
+)
+_CONFIG_LIST_VALUE_RE = re.compile(
+    r"[\"'](?P<quoted>[^\"']{1,256})[\"']|(?P<bare>[A-Za-z0-9_.-]{1,256})"
 )
 _ORCHESTRATION_CALL_RE = re.compile(
     r"\b(?:runSkill|loadSkill|load_skill|invokeSkill|invoke_skill|skills?\.get)"
@@ -147,6 +156,28 @@ _RUNTIME_DIRECTORIES = frozenset(
         "servers",
         "source",
         "src",
+        "config",
+        "configs",
+        "orchestration",
+        "workflow",
+        "workflows",
+    }
+)
+_RUNTIME_FILE_STEMS = frozenset(
+    {
+        "agent",
+        "agents",
+        "command",
+        "commands",
+        "config",
+        "hook",
+        "hooks",
+        "orchestration",
+        "provider",
+        "providers",
+        "runtime",
+        "server",
+        "workflow",
     }
 )
 _MANIFEST_COMPONENT_KEYS = {
@@ -282,6 +313,7 @@ class _OwnedComponents:
 class _ReasonCollector:
     def __init__(self) -> None:
         self._items: dict[ReasonCode, tuple[str, list[Evidence]]] = {}
+        self._attempts: dict[ReasonCode, int] = {}
 
     def add(
         self,
@@ -290,6 +322,10 @@ class _ReasonCollector:
         *,
         message: str | None = None,
     ) -> None:
+        attempts = self._attempts.get(code, 0)
+        if attempts >= _MAX_EVIDENCE_PER_REASON:
+            return
+        self._attempts[code] = attempts + 1
         bounded = Evidence(
             path=evidence.path,
             line=evidence.line,
@@ -302,6 +338,9 @@ class _ReasonCollector:
         values = self._items[code][1]
         if bounded not in values and len(values) < _MAX_EVIDENCE_PER_REASON:
             values.append(bounded)
+
+    def has_capacity(self, code: ReasonCode) -> bool:
+        return self._attempts.get(code, 0) < _MAX_EVIDENCE_PER_REASON
 
     def add_reason(self, reason: DecisionReason) -> None:
         for evidence in reason.evidence:
@@ -420,6 +459,8 @@ def _path_references(content: str) -> Iterable[tuple[str, int]]:
     for match in _HOST_PATH_TOKEN_RE.finditer(content):
         value = next(item for item in match.groups() if item is not None)
         yield _clean_reference(value), match.start()
+    for match in _BACKSLASH_PATH_TOKEN_RE.finditer(content):
+        yield _clean_reference(match.group("path")), match.start("path")
 
 
 def _decode_reference(value: str) -> str:
@@ -511,6 +552,15 @@ def _path_if_owned(value: str, boundary: PackageBoundary, inventory: Inventory) 
     return candidate if candidate in inventory.by_path else None
 
 
+def _is_known_runtime_component_path(path: str, boundary: PackageBoundary) -> bool:
+    relative = PurePosixPath(_relative_to(path, boundary.root))
+    if not relative.parts:
+        return False
+    if _normalized_component(relative.parts[0]) in _RUNTIME_DIRECTORIES:
+        return True
+    return len(relative.parts) == 1 and _normalized_component(relative.stem) in _RUNTIME_FILE_STEMS
+
+
 def _collect_manifest_components(
     parsed: Mapping[str, object],
     boundary: PackageBoundary,
@@ -572,6 +622,7 @@ def _derive_owned_components(
         if parsed is not None:
             _collect_manifest_components(parsed, boundary, inventory, owned)
 
+    declared_runtime_roots = frozenset(owned.runtime_paths)
     for entry in inventory.entries:
         if (
             not _is_within(entry.path, boundary.root)
@@ -597,19 +648,29 @@ def _derive_owned_components(
             owned.providers.add(symbol)
         elif component in {"mcp", "mcpserver", "mcpservers"} and len(parts) > 1:
             owned.mcp.add(parts[1].casefold())
-        if component in _RUNTIME_DIRECTORIES or entry.executable:
+        proven_runtime = (
+            entry.executable
+            or _is_known_runtime_component_path(entry.path, boundary)
+            or _is_within_any(entry.path, declared_runtime_roots)
+        )
+        if proven_runtime:
             owned.runtime_paths.add(entry.path)
         if entry.executable:
             owned.binaries.update({PurePosixPath(entry.path).name.casefold(), symbol})
-        if entry.kind == "file" and PurePosixPath(entry.path).suffix.casefold() in {
-            ".py",
-            ".js",
-            ".ts",
-            ".mjs",
-            ".cjs",
-            ".mts",
-            ".cts",
-        }:
+        if (
+            proven_runtime
+            and entry.kind == "file"
+            and PurePosixPath(entry.path).suffix.casefold()
+            in {
+                ".py",
+                ".js",
+                ".ts",
+                ".mjs",
+                ".cjs",
+                ".mts",
+                ".cts",
+            }
+        ):
             owned.runtime_modules.add(symbol)
             if "src" in parts:
                 index = parts.index("src")
@@ -640,6 +701,8 @@ def _add_plugin_symbol_references(
             for binary in _sequence_of_strings(requires.get(key)):
                 if binary.casefold() not in owned.binaries:
                     continue
+                if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
+                    break
                 offset = content.find(binary)
                 collector.add(
                     ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
@@ -661,6 +724,8 @@ def _add_plugin_symbol_references(
             continue
         content = entry.content
         for match in _MCP_TOOL_RE.finditer(content):
+            if not collector.has_capacity(ReasonCode.PLUGIN_OWNED_MCP_TOOL):
+                break
             if match.group("server").casefold() in owned.mcp:
                 collector.add(
                     ReasonCode.PLUGIN_OWNED_MCP_TOOL,
@@ -675,6 +740,8 @@ def _add_plugin_symbol_references(
                 )
 
         for match in _COMMAND_REFERENCE_RE.finditer(content):
+            if not collector.has_capacity(ReasonCode.PLUGIN_COMMAND_REFERENCE):
+                break
             symbol = next(value for value in match.groups() if value is not None).casefold()
             if symbol in owned.commands:
                 collector.add(
@@ -690,6 +757,8 @@ def _add_plugin_symbol_references(
                 )
 
         for match in _COMPONENT_REFERENCE_RE.finditer(content):
+            if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
+                break
             kind = (match.group("kind") or match.group("directory") or "").casefold()
             category = f"{kind}s" if not kind.endswith("s") else kind
             symbol = (match.group("structured") or match.group("path") or "").casefold()
@@ -707,6 +776,8 @@ def _add_plugin_symbol_references(
                 )
 
         for match in _JS_MODULE_RE.finditer(content):
+            if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
+                break
             module = next(value for value in match.groups() if value is not None)
             if _module_is_owned(module, owned.runtime_modules):
                 collector.add(
@@ -722,6 +793,8 @@ def _add_plugin_symbol_references(
                 )
 
         for match in _RUNTIME_FILENAME_RE.finditer(content):
+            if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
+                break
             runtime_name = match.group("name")
             candidate_local = (
                 runtime_name if candidate.root == "." else f"{candidate.root}/{runtime_name}"
@@ -746,7 +819,9 @@ def _add_plugin_symbol_references(
             import_match = _IMPORT_RE.match(line)
             if import_match is not None:
                 module = import_match.group("module")
-                if _module_is_owned(module, owned.runtime_modules):
+                if collector.has_capacity(
+                    ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE
+                ) and _module_is_owned(module, owned.runtime_modules):
                     collector.add(
                         ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
                         _text_evidence(
@@ -760,7 +835,11 @@ def _add_plugin_symbol_references(
                     )
 
             command = _command_binary(line)
-            if command is not None and command.casefold() in owned.binaries:
+            if (
+                collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE)
+                and command is not None
+                and command.casefold() in owned.binaries
+            ):
                 position = line.find(command)
                 collector.add(
                     ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
@@ -806,8 +885,7 @@ def _command_binary(line: str) -> str | None:
 def _is_runtime_path(path: str, boundary: PackageBoundary, owned: _OwnedComponents) -> bool:
     if path in owned.runtime_paths:
         return True
-    relative = PurePosixPath(_relative_to(path, boundary.root))
-    return bool(relative.parts) and _normalized_component(relative.parts[0]) in _RUNTIME_DIRECTORIES
+    return _is_known_runtime_component_path(path, boundary)
 
 
 def _analyze_forward_paths(
@@ -827,6 +905,8 @@ def _analyze_forward_paths(
             continue
         content = entry.content
         for match in _PLUGIN_VARIABLE_RE.finditer(content):
+            if not collector.has_capacity(ReasonCode.PLUGIN_ROOT_VARIABLE):
+                break
             collector.add(
                 ReasonCode.PLUGIN_ROOT_VARIABLE,
                 _text_evidence(
@@ -838,6 +918,8 @@ def _analyze_forward_paths(
                 ),
             )
         for match in _PLUGIN_INSTALL_RE.finditer(content):
+            if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
+                break
             collector.add(
                 ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
                 _text_evidence(
@@ -854,69 +936,74 @@ def _analyze_forward_paths(
         for source_value, offset in _path_references(content):
             raw = _decode_reference(source_value)
             if _is_unsafe_host_reference(raw):
-                collector.add(
-                    ReasonCode.PATH_TRAVERSAL,
-                    _text_evidence(
-                        entry.path,
-                        content,
-                        offset,
-                        source_value,
-                        "static.forward.host_path",
-                        field="path",
-                    ),
-                )
+                if collector.has_capacity(ReasonCode.PATH_TRAVERSAL):
+                    collector.add(
+                        ReasonCode.PATH_TRAVERSAL,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            source_value,
+                            "static.forward.host_path",
+                            field="path",
+                        ),
+                    )
                 continue
             if not _is_candidate_local_reference(raw):
                 continue
             if _PLUGIN_VARIABLE_RE.search(raw) is not None:
                 continue
             if _DYNAMIC_RE.search(raw) is not None:
-                collector.add(
-                    ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-                    _text_evidence(
-                        entry.path,
-                        content,
-                        offset,
-                        raw,
-                        "static.forward.dynamic_reference",
-                        field="path",
-                    ),
-                )
+                if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
+                    collector.add(
+                        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            raw,
+                            "static.forward.dynamic_reference",
+                            field="path",
+                        ),
+                    )
                 continue
 
             resolved, escaped = _collapse_path(base, raw)
             if escaped or resolved is None:
-                collector.add(
-                    ReasonCode.PATH_TRAVERSAL,
-                    _text_evidence(
-                        entry.path,
-                        content,
-                        offset,
-                        raw,
-                        "static.forward.path_traversal",
-                        field="path",
-                    ),
-                )
+                if collector.has_capacity(ReasonCode.PATH_TRAVERSAL):
+                    collector.add(
+                        ReasonCode.PATH_TRAVERSAL,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            raw,
+                            "static.forward.path_traversal",
+                            field="path",
+                        ),
+                    )
                 continue
 
             target = by_path.get(resolved)
             if target is not None:
                 if not _is_within(resolved, candidate.root):
-                    collector.add(
-                        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-                        _text_evidence(
-                            entry.path,
-                            content,
-                            offset,
-                            f"{raw} -> {resolved}",
-                            "static.forward.outside_reference",
-                            field="path",
-                        ),
-                    )
+                    if collector.has_capacity(ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT):
+                        collector.add(
+                            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+                            _text_evidence(
+                                entry.path,
+                                content,
+                                offset,
+                                f"{raw} -> {resolved}",
+                                "static.forward.outside_reference",
+                                field="path",
+                            ),
+                        )
                     if (
                         boundary is not None
                         and _is_within(resolved, boundary.root)
                         and _is_runtime_path(resolved, boundary, owned)
+                        and collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE)
                     ):
                         collector.add(
                             ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
@@ -937,18 +1024,23 @@ def _analyze_forward_paths(
                 if candidate_at_boundary in by_path:
                     boundary_target = candidate_at_boundary
             if boundary_target is not None:
-                collector.add(
-                    ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-                    _text_evidence(
-                        entry.path,
-                        content,
-                        offset,
-                        f"{raw} -> {boundary_target}",
-                        "static.forward.outside_reference",
-                        field="path",
-                    ),
-                )
-                if boundary is not None and _is_runtime_path(boundary_target, boundary, owned):
+                if collector.has_capacity(ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT):
+                    collector.add(
+                        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            f"{raw} -> {boundary_target}",
+                            "static.forward.outside_reference",
+                            field="path",
+                        ),
+                    )
+                if (
+                    boundary is not None
+                    and _is_runtime_path(boundary_target, boundary, owned)
+                    and collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE)
+                ):
                     collector.add(
                         ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
                         _text_evidence(
@@ -961,17 +1053,18 @@ def _analyze_forward_paths(
                         ),
                     )
             else:
-                collector.add(
-                    ReasonCode.MISSING_LOCAL_RESOURCE,
-                    _text_evidence(
-                        entry.path,
-                        content,
-                        offset,
-                        f"{raw} -> {resolved}",
-                        "static.forward.missing_reference",
-                        field="path",
-                    ),
-                )
+                if collector.has_capacity(ReasonCode.MISSING_LOCAL_RESOURCE):
+                    collector.add(
+                        ReasonCode.MISSING_LOCAL_RESOURCE,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            f"{raw} -> {resolved}",
+                            "static.forward.missing_reference",
+                            field="path",
+                        ),
+                    )
 
 
 def _analyze_symlinks(
@@ -986,58 +1079,77 @@ def _analyze_symlinks(
         assert entry.symlink_target is not None
         current = entry
         visited: set[str] = set()
+        steps = 0
         while current.kind == "symlink":
+            steps += 1
+            if steps > _MAX_SYMLINK_CHAIN:
+                if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
+                    collector.add(
+                        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+                        Evidence(
+                            path=entry.path,
+                            line=None,
+                            field="symlinkTarget",
+                            value=f"chain exceeds {_MAX_SYMLINK_CHAIN} links",
+                            detector="static.symlink.chain_limit",
+                        ),
+                    )
+                break
             if current.path in visited:
-                collector.add(
-                    ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-                    Evidence(
-                        path=entry.path,
-                        line=None,
-                        field="symlinkTarget",
-                        value=f"{entry.symlink_target} (cycle)",
-                        detector="static.symlink.cycle",
-                    ),
-                )
+                if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
+                    collector.add(
+                        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+                        Evidence(
+                            path=entry.path,
+                            line=None,
+                            field="symlinkTarget",
+                            value=f"{entry.symlink_target} (cycle)",
+                            detector="static.symlink.cycle",
+                        ),
+                    )
                 break
             visited.add(current.path)
             target = current.symlink_target or ""
             if _is_unsafe_host_reference(target):
-                collector.add(
-                    ReasonCode.SYMLINK_ESCAPE,
-                    Evidence(
-                        path=entry.path,
-                        line=None,
-                        field="symlinkTarget",
-                        value=target,
-                        detector="static.symlink.escape",
-                    ),
-                )
+                if collector.has_capacity(ReasonCode.SYMLINK_ESCAPE):
+                    collector.add(
+                        ReasonCode.SYMLINK_ESCAPE,
+                        Evidence(
+                            path=entry.path,
+                            line=None,
+                            field="symlinkTarget",
+                            value=target,
+                            detector="static.symlink.escape",
+                        ),
+                    )
                 break
             resolved, escaped = _collapse_path(PurePosixPath(current.path).parent, target)
             if escaped or resolved is None or not _is_within(resolved, candidate.root):
-                collector.add(
-                    ReasonCode.SYMLINK_ESCAPE,
-                    Evidence(
-                        path=entry.path,
-                        line=None,
-                        field="symlinkTarget",
-                        value=f"{target} -> {resolved or '<outside snapshot>'}",
-                        detector="static.symlink.escape",
-                    ),
-                )
+                if collector.has_capacity(ReasonCode.SYMLINK_ESCAPE):
+                    collector.add(
+                        ReasonCode.SYMLINK_ESCAPE,
+                        Evidence(
+                            path=entry.path,
+                            line=None,
+                            field="symlinkTarget",
+                            value=f"{target} -> {resolved or '<outside snapshot>'}",
+                            detector="static.symlink.escape",
+                        ),
+                    )
                 break
             next_entry = by_path.get(resolved)
             if next_entry is None:
-                collector.add(
-                    ReasonCode.MISSING_LOCAL_RESOURCE,
-                    Evidence(
-                        path=entry.path,
-                        line=None,
-                        field="symlinkTarget",
-                        value=f"{target} -> {resolved}",
-                        detector="static.symlink.dangling",
-                    ),
-                )
+                if collector.has_capacity(ReasonCode.MISSING_LOCAL_RESOURCE):
+                    collector.add(
+                        ReasonCode.MISSING_LOCAL_RESOURCE,
+                        Evidence(
+                            path=entry.path,
+                            line=None,
+                            field="symlinkTarget",
+                            value=f"{target} -> {resolved}",
+                            detector="static.symlink.dangling",
+                        ),
+                    )
                 break
             current = next_entry
 
@@ -1199,6 +1311,7 @@ def _analyze_reverse_dependencies(
     validation: ValidationResult,
     inventory: Inventory,
     boundaries: tuple[PackageBoundary, ...],
+    owned: _OwnedComponents,
     collector: _ReasonCollector,
 ) -> None:
     boundary = candidate.enclosing_boundary
@@ -1222,6 +1335,12 @@ def _analyze_reverse_dependencies(
             or _is_within_any(entry.path, nested_roots)
             or _is_within_any(entry.path, skill_roots)
             or _is_documentation(entry.path, boundary)
+            or not (
+                entry.path in manifest_paths
+                or entry.executable
+                or entry.path in owned.runtime_paths
+                or _is_known_runtime_component_path(entry.path, boundary)
+            )
         ):
             continue
         content = entry.content
@@ -1235,7 +1354,9 @@ def _analyze_reverse_dependencies(
             rf"(?<![A-Za-z0-9_.-]){re.escape(candidate.root)}(?:/[A-Za-z0-9_./-]+)?",
             path_search_content,
         )
-        if exact_match is not None:
+        if exact_match is not None and collector.has_capacity(
+            ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME
+        ):
             matched_value = exact_match.group(0)
             original_offset = content.find(matched_value)
             collector.add(
@@ -1257,7 +1378,9 @@ def _analyze_reverse_dependencies(
                 validation.name,
                 manifest=entry.path in manifest_paths,
             )
-            if structured is not None:
+            if structured is not None and collector.has_capacity(
+                ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME
+            ):
                 source_value = structured.rsplit("=", 1)[-1]
                 offset = content.find(source_value)
                 collector.add(
@@ -1273,6 +1396,8 @@ def _analyze_reverse_dependencies(
                 )
         elif entry.path not in manifest_paths:
             for match in _STRUCTURED_SKILL_KEY_RE.finditer(content):
+                if not collector.has_capacity(ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME):
+                    break
                 if _matches_skill_identity(match.group("value"), candidate, validation.name):
                     collector.add(
                         ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME,
@@ -1285,7 +1410,35 @@ def _analyze_reverse_dependencies(
                             field="config",
                         ),
                     )
+            for match in _STRUCTURED_SKILLS_LIST_RE.finditer(content):
+                if not collector.has_capacity(ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME):
+                    break
+                list_matched_value: str | None = None
+                for index, value_match in enumerate(
+                    _CONFIG_LIST_VALUE_RE.finditer(match.group("values"))
+                ):
+                    if index >= 64:
+                        break
+                    value = value_match.group("quoted") or value_match.group("bare") or ""
+                    if _matches_skill_identity(value, candidate, validation.name):
+                        list_matched_value = value
+                        break
+                if list_matched_value is not None:
+                    value_offset = content.find(list_matched_value, match.start(), match.end())
+                    collector.add(
+                        ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            max(value_offset, match.start()),
+                            list_matched_value,
+                            "static.reverse.structured_skill_list",
+                            field="config.skills",
+                        ),
+                    )
             for match in _ORCHESTRATION_CALL_RE.finditer(content):
+                if not collector.has_capacity(ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME):
+                    break
                 if _matches_skill_identity(match.group("value"), candidate, validation.name):
                     collector.add(
                         ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME,
@@ -1313,6 +1466,7 @@ def _external_requirements(
     validation: ValidationResult,
     candidate: SkillCandidate,
     inventory: Inventory,
+    owned: _OwnedComponents,
 ) -> ExternalRequirements:
     binaries: set[str] = set()
     environment: set[str] = set()
@@ -1320,7 +1474,10 @@ def _external_requirements(
     if isinstance(requires, Mapping):
         for key in ("bins", "binaries"):
             for item in _sequence_of_strings(requires.get(key)):
-                if re.fullmatch(r"[A-Za-z0-9_.+-]+", item):
+                if (
+                    re.fullmatch(r"[A-Za-z0-9_.+-]+", item)
+                    and item.casefold() not in owned.binaries
+                ):
                     binaries.add(item)
         for key in ("env", "environment"):
             for item in _sequence_of_strings(requires.get(key)):
@@ -1336,7 +1493,7 @@ def _external_requirements(
             continue
         for _, line in _iter_lines_with_offsets(entry.content):
             binary = _command_binary(line)
-            if binary in _EXTERNAL_COMMANDS:
+            if binary in _EXTERNAL_COMMANDS and binary.casefold() not in owned.binaries:
                 binaries.add(binary)
     return ExternalRequirements(
         binaries=tuple(sorted(binaries)),
@@ -1358,8 +1515,6 @@ def _classification_for(
     boundary = candidate.enclosing_boundary
     if boundary is None:
         return Classification.PORTABLE
-    if candidate.root == boundary.root:
-        return Classification.AMBIGUOUS
     if boundary.package_kind == "skills_only":
         return Classification.PORTABLE
     return Classification.AMBIGUOUS
@@ -1394,18 +1549,13 @@ def _base_reason(
         )
     if classification is Classification.AMBIGUOUS and candidate.enclosing_boundary is not None:
         boundary = candidate.enclosing_boundary
-        value = (
-            "skill root equals enclosing plugin root"
-            if candidate.root == boundary.root
-            else boundary.package_kind
-        )
         return (
             ReasonCode.MIXED_PLUGIN_AUTONOMY_UNPROVEN,
             Evidence(
                 path=boundary.manifest_path,
                 line=1,
                 field="packageKind",
-                value=value,
+                value=boundary.package_kind,
                 detector="static.classification.mixed_unproven",
             ),
         )
@@ -1438,7 +1588,7 @@ def analyze_static(
     _analyze_symlinks(candidate, inventory, collector)
     _analyze_forward_paths(candidate, inventory, owned, collector)
     _add_plugin_symbol_references(candidate, validation, inventory, owned, collector)
-    _analyze_reverse_dependencies(candidate, validation, inventory, boundaries, collector)
+    _analyze_reverse_dependencies(candidate, validation, inventory, boundaries, owned, collector)
 
     reasons = collector.build()
     reason_codes = frozenset(reason.code for reason in reasons)
@@ -1450,5 +1600,5 @@ def analyze_static(
     return StaticAnalysisResult(
         classification=classification,
         reasons=reasons,
-        external_requirements=_external_requirements(validation, candidate, inventory),
+        external_requirements=_external_requirements(validation, candidate, inventory, owned),
     )

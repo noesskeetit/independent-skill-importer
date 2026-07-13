@@ -220,16 +220,19 @@ def _classify_package(
     manifest_paths: frozenset[str],
 ) -> str:
     enclosed_skill_roots = tuple(item for item in skill_roots if _is_within(item, root))
+    root_is_skill = root in enclosed_skill_roots
     for entry in inventory.entries:
         if not _is_within(entry.path, root):
-            continue
-        if any(_is_within(entry.path, skill_root) for skill_root in enclosed_skill_roots):
-            continue
-        if _is_documentation_or_marketplace(entry.path, root):
             continue
         if entry.path in manifest_paths:
             if _manifest_is_invalid_or_runtime(entry):
                 return "mixed"
+            continue
+        if root_is_skill and _is_known_runtime_directory(entry.path, root):
+            return "mixed"
+        if any(_is_within(entry.path, skill_root) for skill_root in enclosed_skill_roots):
+            continue
+        if _is_documentation_or_marketplace(entry.path, root):
             continue
         if entry.kind == "directory":
             if _is_known_runtime_directory(entry.path, root):

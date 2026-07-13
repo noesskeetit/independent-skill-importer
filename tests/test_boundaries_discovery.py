@@ -298,6 +298,41 @@ def test_skills_only_manifest_declarations_remain_skills_only() -> None:
     assert detect_boundaries(inventory)[0].package_kind == "skills_only"
 
 
+def test_root_skill_with_metadata_only_plugin_manifest_is_skills_only() -> None:
+    inventory = _inventory(
+        {
+            "plugin.json": "{}",
+            "SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "skills_only"
+
+
+def test_root_skill_manifest_runtime_declaration_keeps_package_mixed() -> None:
+    inventory = _inventory(
+        {
+            "plugin.json": json.dumps({"runtime": "runtime.py"}),
+            "runtime.py": "pass",
+            "SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
+def test_root_skill_known_runtime_directory_keeps_package_mixed() -> None:
+    inventory = _inventory(
+        {
+            "plugin.json": "{}",
+            "runtime/engine.py": "pass",
+            "SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
 @pytest.mark.parametrize(
     "manifest_path",
     [

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import skill_importer.static_analysis as static_analysis_module
 from skill_importer.boundaries import detect_boundaries
 from skill_importer.discovery import discover_candidates, validate_candidate
 from skill_importer.models import (
@@ -303,6 +304,35 @@ def test_host_paths_in_code_are_blocked(body: str, tmp_path: Path) -> None:
     assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Read `~/.ssh/id_rsa`.\n",
+        r'```python\nopen("..\shared\resource.txt")\n```\n',
+        "---ignored---",
+    ],
+)
+def test_home_and_backslash_host_paths_are_blocked(body: str, tmp_path: Path) -> None:
+    if body == "---ignored---":
+        skill = _skill(extra="config:\n  path: /etc/passwd\n")
+    else:
+        skill = _skill(body)
+    result = _analyze(tmp_path, {"skills/alpha/SKILL.md": skill})
+
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+
+
+def test_https_reference_remains_external_and_is_not_path_traversal(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill("Read [docs](https://example.com/a/b/c).\n")},
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
+
+
 def test_missing_local_reference_is_nonportable(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
@@ -400,6 +430,21 @@ def test_import_of_plugin_runtime_module_is_plugin_bound(tmp_path: Path) -> None
 
     assert result.classification is Classification.PLUGIN_BOUND
     assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE in result.reason_codes
+
+
+def test_arbitrary_test_module_is_not_plugin_owned_runtime(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "runtime/engine.py"}),
+            "runtime/engine.py": "pass",
+            "tests/json.py": "pass",
+            "skills/alpha/SKILL.md": _skill("```python\nimport json\n```\n"),
+        },
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE not in result.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -623,6 +668,50 @@ def test_documentation_reference_is_not_reverse_dependency(tmp_path: Path) -> No
     assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["tests/test_registration.py", "CONTRIBUTING.md", "ARCHITECTURE.md"],
+)
+def test_unproven_nonruntime_text_is_not_reverse_dependency(path: str, tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "runtime/engine.py"}),
+            "runtime/engine.py": "pass",
+            path: 'open("skills/alpha/SKILL.md")',
+            "skills/alpha/SKILL.md": _skill(),
+        },
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("config/workflow.yaml", "skills: [alpha]\n"),
+        ("config/workflow.toml", 'skills = ["alpha"]\n'),
+    ],
+)
+def test_plural_skill_list_in_runtime_config_is_reverse_dependency(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": path}),
+            path: content,
+            "skills/alpha/SKILL.md": _skill(),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME in result.reason_codes
+
+
 def test_bare_prose_name_in_runtime_is_not_reverse_dependency(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
@@ -656,7 +745,7 @@ def test_packaging_only_skill_registration_is_not_reverse_dependency(tmp_path: P
     assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
 
 
-def test_skill_root_equal_to_plugin_root_is_never_auto_portable(tmp_path: Path) -> None:
+def test_skill_root_equal_to_mixed_plugin_root_is_ambiguous(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
         {
@@ -669,6 +758,17 @@ def test_skill_root_equal_to_plugin_root_is_never_auto_portable(tmp_path: Path) 
 
     assert result.classification is Classification.AMBIGUOUS
     assert ReasonCode.MIXED_PLUGIN_AUTONOMY_UNPROVEN in result.reason_codes
+
+
+def test_skill_root_equal_to_truly_skills_only_plugin_root_is_portable(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {"plugin.json": "{}", "SKILL.md": _skill()},
+        root=".",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert result.reason_codes == frozenset({ReasonCode.SKILLS_ONLY_PACKAGE})
 
 
 def test_nested_plugin_components_are_not_owned_by_outer_boundary(tmp_path: Path) -> None:
@@ -767,6 +867,23 @@ def test_structured_and_clear_external_requirements_do_not_bind_plugin(tmp_path:
     assert result.external_requirements.environment == ("API_TOKEN", "REGION")
 
 
+def test_plugin_owned_binary_is_not_reported_as_external_requirement(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {"plugin": {"skills": ["skills/alpha"]}, "bin": {"acme-tool": "bin/tool.py"}}
+            ),
+            "bin/tool.py": "pass",
+            "skills/alpha/SKILL.md": _skill(extra="requires:\n  bins: [acme-tool]\n"),
+        },
+        executables=frozenset({"bin/tool.py"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert "acme-tool" not in result.external_requirements.binaries
+
+
 def test_reasons_and_evidence_are_deterministic_bounded_and_source_addressable(
     tmp_path: Path,
 ) -> None:
@@ -824,3 +941,40 @@ def test_repeated_evidence_is_bounded(tmp_path: Path) -> None:
 
     assert result.classification is Classification.PLUGIN_BOUND
     assert len(_reason(result, ReasonCode.PLUGIN_ROOT_VARIABLE).evidence) <= 64
+
+
+def test_evidence_builder_stops_after_reason_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = 0
+    original = static_analysis_module._text_evidence
+
+    def counting_evidence(*args: object, **kwargs: object):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(static_analysis_module, "_text_evidence", counting_evidence)
+    body = " ".join("`${PLUGIN_ROOT}/tool`" for _ in range(5000))
+
+    result = _analyze(tmp_path, {"skills/alpha/SKILL.md": _skill(body)})
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert calls <= 64
+
+
+def test_overlong_internal_symlink_chain_fails_closed(tmp_path: Path) -> None:
+    symlinks = {f"skills/alpha/link{index}": f"link{index + 1}" for index in range(80)}
+    symlinks["skills/alpha/link80"] = "target.txt"
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/target.txt": "target",
+        },
+        symlinks=symlinks,
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
