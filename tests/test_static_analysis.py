@@ -1069,13 +1069,17 @@ def test_package_plugin_wrapper_source_declares_runtime_inside_nested_docs(
     assert reason.evidence[0].path == "packages/b/examples/runtime/tool.ts"
 
 
-def test_package_top_level_source_is_not_plugin_runtime_declaration(tmp_path: Path) -> None:
+@pytest.mark.parametrize("field", ["source", "src"])
+def test_package_top_level_exact_source_file_is_plugin_runtime(
+    field: str,
+    tmp_path: Path,
+) -> None:
     result = _analyze(
         tmp_path,
         {
             "package.json": json.dumps(
                 {
-                    "source": "packages/b/examples/runtime/tool.ts",
+                    field: "packages/b/examples/runtime/tool.ts",
                     "plugin": {"skills": ["packages/b/skills/x"]},
                 }
             ),
@@ -1084,6 +1088,33 @@ def test_package_top_level_source_is_not_plugin_runtime_declaration(tmp_path: Pa
             "packages/b/skills/x/SKILL.md": _skill(),
         },
         root="packages/b/skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+    assert reason.evidence[0].path == "packages/b/examples/runtime/tool.ts"
+
+
+@pytest.mark.parametrize("field", ["source", "src"])
+def test_package_top_level_source_directory_does_not_own_descendants(
+    field: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "package.json": json.dumps(
+                {
+                    field: "packages/b/examples/runtime",
+                    "plugin": {"skills": ["packages/b/skills/x"]},
+                }
+            ),
+            "packages/b/examples/runtime/tool.ts": ('open("packages/b/skills/x/SKILL.md")'),
+            "packages/b/plugin.json": json.dumps({"name": "skill-pack"}),
+            "packages/b/skills/x/SKILL.md": _skill(),
+        },
+        root="packages/b/skills/x",
+        directories=frozenset({"packages/b/examples/runtime"}),
     )
 
     assert result.classification is Classification.PORTABLE

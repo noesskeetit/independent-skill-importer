@@ -777,14 +777,17 @@ def _derive_boundary_owned_components(
             or _is_within(entry.path, candidate.root)
             or (
                 _is_within_any(entry.path, nested_roots)
+                and entry.path not in owned.runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or (
                 _is_within_any(entry.path, skill_roots)
+                and entry.path not in owned.runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or (
                 _is_documentation(entry.path, boundary)
+                and entry.path not in owned.runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
         ):
@@ -1580,14 +1583,17 @@ def _analyze_boundary_reverse_dependencies(
             or _is_within(entry.path, candidate.root)
             or (
                 _is_within_any(entry.path, nested_roots)
+                and entry.path not in owned.runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or (
                 _is_within_any(entry.path, skill_roots)
+                and entry.path not in owned.runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or (
                 _is_documentation(entry.path, boundary)
+                and entry.path not in owned.runtime_paths
                 and not _is_within_any(entry.path, declared_runtime_roots)
             )
             or not (
