@@ -95,7 +95,9 @@ def build_inventory(resolved: ResolvedSource, limits: Limits) -> Inventory:
     try:
         root_fd = os.open(root, root_flags)
     except OSError as exc:
-        raise ImporterError("SOURCE_UNAVAILABLE", "source snapshot is not a readable directory") from exc
+        raise ImporterError(
+            "SOURCE_UNAVAILABLE", "source snapshot is not a readable directory"
+        ) from exc
 
     entries: list[InventoryEntry] = []
     seen: dict[str, str] = {}
@@ -125,11 +127,7 @@ def build_inventory(resolved: ResolvedSource, limits: Limits) -> Inventory:
                 )
             elif stat.S_ISDIR(mode):
                 entries.append(InventoryEntry(path=relative_path, kind="directory", size=0))
-                flags = (
-                    os.O_RDONLY
-                    | getattr(os, "O_DIRECTORY", 0)
-                    | getattr(os, "O_NOFOLLOW", 0)
-                )
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
                 child_fd = os.open(child.name, flags, dir_fd=directory_fd)
                 try:
                     visit(child_fd, parts)
@@ -151,7 +149,9 @@ def build_inventory(resolved: ResolvedSource, limits: Limits) -> Inventory:
                     )
                 )
             else:
-                raise ImporterError("UNSUPPORTED_ENTRY", "source contains an unsupported entry type")
+                raise ImporterError(
+                    "UNSUPPORTED_ENTRY", "source contains an unsupported entry type"
+                )
 
     try:
         visit(root_fd, ())

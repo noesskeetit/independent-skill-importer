@@ -66,10 +66,7 @@ def _validate_remote_url(value: str, *, allow_file_transport: bool = False) -> S
     if (
         not parsed.path
         or "\\" in parsed.path
-        or any(
-            part.startswith("-")
-            for part in (*hostname.split("."), *parsed.path.split("/"))
-        )
+        or any(part.startswith("-") for part in (*hostname.split("."), *parsed.path.split("/")))
     ):
         raise _unsafe_git_url()
     return SourceKind.GITHUB if hostname.casefold() == "github.com" else SourceKind.GIT
@@ -233,7 +230,9 @@ class SubprocessGitRunner:
                     shell=False,
                 )
             except OSError as exc:
-                raise ImporterError("GIT_COMMAND_FAILED", "Git archive command failed safely") from exc
+                raise ImporterError(
+                    "GIT_COMMAND_FAILED", "Git archive command failed safely"
+                ) from exc
 
             try:
                 self._stream_process(process, destination, max_bytes=max_bytes, timeout=timeout)
@@ -328,9 +327,7 @@ def _copy_local_tree(source: Path, destination: Path, limits: Limits) -> None:
     try:
         root_fd = os.open(source, root_flags)
     except OSError as exc:
-        raise ImporterError(
-            "SOURCE_UNAVAILABLE", "local source directory is not readable"
-        ) from exc
+        raise ImporterError("SOURCE_UNAVAILABLE", "local source directory is not readable") from exc
     entry_count = 0
     total_bytes = 0
 
@@ -355,11 +352,7 @@ def _copy_local_tree(source: Path, destination: Path, limits: Limits) -> None:
                 os.symlink(os.readlink(child.name, dir_fd=source_fd), child_target)
             elif stat.S_ISDIR(child_stat.st_mode):
                 child_target.mkdir(mode=0o700)
-                flags = (
-                    os.O_RDONLY
-                    | getattr(os, "O_DIRECTORY", 0)
-                    | getattr(os, "O_NOFOLLOW", 0)
-                )
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
                 child_fd = os.open(child.name, flags, dir_fd=source_fd)
                 try:
                     copy_directory(child_fd, child_target, parts)
@@ -397,7 +390,9 @@ def _copy_local_tree(source: Path, destination: Path, limits: Limits) -> None:
                 finally:
                     os.close(file_fd)
             else:
-                raise ImporterError("UNSUPPORTED_ENTRY", "source contains an unsupported entry type")
+                raise ImporterError(
+                    "UNSUPPORTED_ENTRY", "source contains an unsupported entry type"
+                )
 
     try:
         copy_directory(root_fd, destination, ())
@@ -464,9 +459,7 @@ def _create_temporary_root(workspace: Path, prefix: str) -> Path:
         workspace.mkdir(parents=True, exist_ok=True)
         return Path(tempfile.mkdtemp(prefix=prefix, dir=workspace)).resolve()
     except (OSError, ValueError) as exc:
-        raise ImporterError(
-            "SOURCE_SETUP_FAILED", "source workspace could not be created"
-        ) from exc
+        raise ImporterError("SOURCE_SETUP_FAILED", "source workspace could not be created") from exc
 
 
 def snapshot_local(
@@ -588,9 +581,7 @@ def _github_ref_and_scope(
             "GitHub tree or blob URL has an ambiguous ref; pass --ref",
         )
 
-    url_ref_parts = (
-        1 if matched_url_ref is None else len(PurePosixPath(matched_url_ref).parts)
-    )
+    url_ref_parts = 1 if matched_url_ref is None else len(PurePosixPath(matched_url_ref).parts)
     routed_path = location.route_tail[url_ref_parts:]
     requested_ref = spec.ref or matched_url_ref
 
@@ -646,7 +637,9 @@ def _extract_git_archive(archive: Path, snapshot_root: Path, limits: Limits) -> 
         key = _archive_collision_key(path)
         previous = normalized_paths.get(key)
         if previous is not None and previous != path:
-            raise ImporterError("PATH_COLLISION", "source contains a Unicode or case path collision")
+            raise ImporterError(
+                "PATH_COLLISION", "source contains a Unicode or case path collision"
+            )
         existing_kind = materialized.get(path)
         if existing_kind is not None:
             if existing_kind == kind == "directory":
@@ -663,9 +656,7 @@ def _extract_git_archive(archive: Path, snapshot_root: Path, limits: Limits) -> 
             parent = PurePosixPath(*parts[:index]).as_posix()
             kind = materialized.get(parent)
             if kind == "symlink":
-                raise ImporterError(
-                    "PATH_TRAVERSAL", "Git archive path has a symlink ancestor"
-                )
+                raise ImporterError("PATH_TRAVERSAL", "Git archive path has a symlink ancestor")
             if kind not in {None, "directory"}:
                 raise ImporterError("PATH_COLLISION", "source contains a parent path collision")
             if kind is None:
@@ -725,7 +716,9 @@ def _extract_git_archive(archive: Path, snapshot_root: Path, limits: Limits) -> 
                             )
                         output.write(chunk)
                 if copied != member.size:
-                    raise ImporterError("INVALID_ARCHIVE", "Git archive contains truncated file data")
+                    raise ImporterError(
+                        "INVALID_ARCHIVE", "Git archive contains truncated file data"
+                    )
                 os.chmod(destination, 0o700 if member.mode & 0o111 else 0o600)
     except (OSError, tarfile.TarError) as exc:
         raise ImporterError("INVALID_ARCHIVE", "Git archive is invalid or changed") from exc
