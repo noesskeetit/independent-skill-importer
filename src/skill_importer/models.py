@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -862,9 +863,14 @@ class ImportRecord:
             raise ValueError("import record name must not be empty")
         _validate_sha256(self.content_hash, "content_hash")
         _validate_relative_path(self.destination, "import destination")
-        object.__setattr__(self, "candidate_ids", tuple(self.candidate_ids))
+        if len(PurePosixPath(self.destination).parts) != 1:
+            raise ValueError("import destination must be one filesystem-safe basename")
+        candidate_ids = tuple(self.candidate_ids)
+        object.__setattr__(self, "candidate_ids", candidate_ids)
         if not self.candidate_ids or any(not item for item in self.candidate_ids):
             raise ValueError("import record requires candidate provenance")
+        if candidate_ids != tuple(sorted(set(candidate_ids))):
+            raise ValueError("import record candidate IDs must be sorted and unique")
 
     def to_dict(self) -> dict[str, object]:
         """Serialize import destination mapping and provenance."""
@@ -886,9 +892,14 @@ class ImportPlan:
     manifest_payload: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "selected", tuple(self.selected))
-        object.__setattr__(self, "rejected", tuple(self.rejected))
-        object.__setattr__(self, "records", tuple(self.records))
+        selected = tuple(sorted(self.selected, key=lambda skill: skill.candidate_id))
+        rejected = tuple(sorted(self.rejected, key=lambda skill: skill.candidate_id))
+        records = tuple(
+            sorted(self.records, key=lambda record: (record.destination, record.content_hash))
+        )
+        object.__setattr__(self, "selected", selected)
+        object.__setattr__(self, "rejected", rejected)
+        object.__setattr__(self, "records", records)
         frozen_manifest = _freeze_json(self.manifest_payload, "manifest payload")
         if not isinstance(frozen_manifest, Mapping):
             raise ValueError("manifest payload must be a JSON object")
@@ -899,6 +910,59 @@ class ImportPlan:
             skill._validate_portable_for_import()
         if any(skill.classification is Classification.PORTABLE for skill in self.rejected):
             raise ValueError("portable skills cannot appear in the rejected set")
+        selected_ids = tuple(skill.candidate_id for skill in self.selected)
+        rejected_ids = tuple(skill.candidate_id for skill in self.rejected)
+        if len(selected_ids) != len(set(selected_ids)) or len(rejected_ids) != len(
+            set(rejected_ids)
+        ):
+            raise ValueError("import plan candidate IDs must be unique within each partition")
+        if set(selected_ids).intersection(rejected_ids):
+            raise ValueError("import plan selected and rejected partitions must be disjoint")
+
+        selected_groups: dict[str, tuple[str, ...]] = {}
+        representative_names: dict[str, str] = {}
+        for content_hash in sorted(
+            {skill.content_hash for skill in self.selected if skill.content_hash is not None}
+        ):
+            members = tuple(
+                sorted(
+                    skill.candidate_id
+                    for skill in self.selected
+                    if skill.content_hash == content_hash
+                )
+            )
+            selected_groups[content_hash] = members
+            representative = min(
+                (skill for skill in self.selected if skill.content_hash == content_hash),
+                key=lambda skill: (skill.candidate.root, skill.candidate_id),
+            )
+            if representative.name is None or not representative.name.strip():
+                raise ValueError("selected skill requires a non-empty parsed name")
+            representative_names[content_hash] = representative.name
+        if any(skill.content_hash is None for skill in self.selected):
+            raise ValueError("selected skill requires a content hash")
+
+        records_by_hash: dict[str, ImportRecord] = {}
+        for record in self.records:
+            if record.content_hash in records_by_hash:
+                raise ValueError("import records must have unique content hashes")
+            records_by_hash[record.content_hash] = record
+        if set(records_by_hash) != set(selected_groups) or any(
+            records_by_hash[content_hash].candidate_ids != candidate_ids
+            for content_hash, candidate_ids in selected_groups.items()
+        ):
+            raise ValueError("import records must exactly cover selected content groups")
+        if any(
+            records_by_hash[content_hash].name != representative_names[content_hash]
+            for content_hash in selected_groups
+        ):
+            raise ValueError("import record names must match deterministic representatives")
+
+        destination_keys = [
+            unicodedata.normalize("NFC", record.destination).casefold() for record in self.records
+        ]
+        if len(destination_keys) != len(set(destination_keys)):
+            raise ValueError("import record destinations must be unique by NFC and case-fold")
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the plan without writing it."""

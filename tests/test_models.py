@@ -119,6 +119,17 @@ def _analyzed_skill_at(
     )
 
 
+def _import_record_for(skill: AnalyzedSkill) -> ImportRecord:
+    assert skill.name is not None
+    assert skill.content_hash is not None
+    return ImportRecord(
+        name=skill.name,
+        content_hash=skill.content_hash,
+        destination=f"{skill.name}--{skill.content_hash[:12]}",
+        candidate_ids=(skill.candidate_id,),
+    )
+
+
 def _invalid_validation() -> ValidationResult:
     return ValidationResult(
         valid=False,
@@ -430,7 +441,11 @@ def test_valid_fm_promotion_can_enter_import_plan(tmp_path: Path) -> None:
         reasons=(review.reason,),
     )
 
-    plan = ImportPlan(selected=(promoted,), rejected=(), records=())
+    plan = ImportPlan(
+        selected=(promoted,),
+        rejected=(),
+        records=(_import_record_for(promoted),),
+    )
 
     assert plan.selected == (promoted,)
 
@@ -561,7 +576,7 @@ def test_manifest_payload_is_recursively_immutable_and_detached(tmp_path: Path) 
     plan = ImportPlan(
         selected=(_analyzed_skill(tmp_path),),
         rejected=(),
-        records=(),
+        records=(_import_record_for(_analyzed_skill(tmp_path)),),
         manifest_payload=payload,
     )
 
@@ -612,7 +627,7 @@ def test_nested_domain_serializers_return_plain_json_values(tmp_path: Path) -> N
     plan = ImportPlan(
         selected=(_analyzed_skill(tmp_path),),
         rejected=(),
-        records=(),
+        records=(_import_record_for(_analyzed_skill(tmp_path)),),
         manifest_payload={"nested": {"items": [1, True, None]}},
     )
 
@@ -873,6 +888,83 @@ def test_import_plan_serializes_destination_mapping(tmp_path: Path) -> None:
 
     assert plan.to_dict()["records"][0]["contentHash"] == SHA256
     assert plan.to_dict()["records"][0]["destination"] == f"x--{SHA256[:12]}"
+
+
+def test_import_record_requires_sorted_unique_candidate_ids() -> None:
+    with pytest.raises(ValueError, match="sorted and unique"):
+        ImportRecord(
+            name="x",
+            content_hash=SHA256,
+            destination=f"x--{SHA256[:12]}",
+            candidate_ids=("candidate-b", "candidate-a", "candidate-a"),
+        )
+
+
+def test_import_plan_records_exactly_cover_selected_content_groups(tmp_path: Path) -> None:
+    first = _analyzed_skill_at(tmp_path, "skills/one", name="one", content_hash=SHA256)
+    second_hash = "b" * 64
+    second = _analyzed_skill_at(
+        tmp_path,
+        "skills/two",
+        name="two",
+        content_hash=second_hash,
+    )
+    only_first = ImportRecord(
+        name="one",
+        content_hash=SHA256,
+        destination=f"one--{SHA256[:12]}",
+        candidate_ids=(first.candidate_id,),
+    )
+
+    with pytest.raises(ValueError, match="exactly cover selected content groups"):
+        ImportPlan(selected=(first, second), rejected=(), records=(only_first,))
+
+
+def test_import_plan_rejects_overlapping_partition(tmp_path: Path) -> None:
+    skill = _analyzed_skill(tmp_path)
+    record = ImportRecord(
+        name="x",
+        content_hash=SHA256,
+        destination=f"x--{SHA256[:12]}",
+        candidate_ids=(skill.candidate_id,),
+    )
+    rejected = replace(
+        skill,
+        static_classification=Classification.AMBIGUOUS,
+        classification=Classification.AMBIGUOUS,
+    )
+    object.__setattr__(rejected.candidate, "candidate_id", skill.candidate_id)
+
+    with pytest.raises(ValueError, match="disjoint"):
+        ImportPlan(selected=(skill,), rejected=(rejected,), records=(record,))
+
+
+def test_import_plan_rejects_nfc_casefold_destination_collision(tmp_path: Path) -> None:
+    first = _analyzed_skill_at(tmp_path, "skills/one", name="one", content_hash=SHA256)
+    second_hash = "b" * 64
+    second = _analyzed_skill_at(
+        tmp_path,
+        "skills/two",
+        name="two",
+        content_hash=second_hash,
+    )
+    records = (
+        ImportRecord(
+            name="one",
+            content_hash=SHA256,
+            destination="Caf\u00e9--aaaaaaaaaaaa",
+            candidate_ids=(first.candidate_id,),
+        ),
+        ImportRecord(
+            name="two",
+            content_hash=second_hash,
+            destination="Cafe\u0301--AAAAAAAAAAAA",
+            candidate_ids=(second.candidate_id,),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="destinations must be unique"):
+        ImportPlan(selected=(first, second), rejected=(), records=records)
 
 
 def test_limits_are_immutable_and_match_approved_defaults() -> None:

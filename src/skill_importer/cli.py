@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import unicodedata
+from pathlib import Path
 
 import click
 
 from .errors import ImporterError
 from .fm_review import DEFAULT_FM_MODEL
+from .importer import ImportResult, SkillImporter
 from .models import ScanReport
 from .pipeline import ScanOptions, SkillImporterPipeline
 from .source import parse_source_spec
@@ -134,6 +136,24 @@ def _render_human(report: ScanReport) -> str:
     return "\n".join(lines)
 
 
+def _render_import_human(result: ImportResult) -> str:
+    lines = [
+        f"Imported {len(result.imported)} skill payload(s) into "
+        + _escape_terminal(result.output_path),
+    ]
+    for record in result.imported:
+        lines.append(
+            "  name="
+            + _escape_terminal(record.name)
+            + " destination="
+            + _escape_terminal(record.destination)
+            + " candidates="
+            + _render_values(record.candidate_ids)
+        )
+    lines.append(f"Skipped {len(result.skipped)} candidate(s)")
+    return "\n".join(lines)
+
+
 @click.group()
 def cli() -> None:
     """Safely discover standalone agent skills without executing repository code."""
@@ -182,3 +202,37 @@ def scan_command(
         )
     else:
         click.echo(_render_human(report))
+
+
+@cli.command("import")
+@click.argument("source", required=True)
+@click.option("--out", type=click.Path(path_type=Path), required=True, metavar="DIR")
+@click.option("--ref", "ref_value", metavar="REF", default=None)
+@click.option("--subpath", metavar="PATH", default=None)
+@click.option(
+    "--model",
+    default=DEFAULT_FM_MODEL,
+    show_default=True,
+    callback=_model_option,
+    help="Cloud.ru FM model used only for ambiguous candidates.",
+)
+@click.option("--no-llm", is_flag=True, help="Disable FM review and keep static ambiguity.")
+def import_command(
+    source: str,
+    out: Path,
+    ref_value: str | None,
+    subpath: str | None,
+    model: str,
+    no_llm: bool,
+) -> None:
+    """Freshly scan SOURCE and atomically import only portable skills."""
+    try:
+        spec = parse_source_spec(source, ref_value, subpath)
+        result = SkillImporter().import_source(
+            spec,
+            out,
+            ScanOptions(use_llm=not no_llm, model=model),
+        )
+    except ImporterError as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(_render_import_human(result))

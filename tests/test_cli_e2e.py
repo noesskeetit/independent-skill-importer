@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,7 +11,9 @@ import pytest
 from click.testing import CliRunner
 from fixture_factory import write_tree
 
+import skill_importer.cli as cli_module
 from skill_importer.cli import _render_human, cli
+from skill_importer.importer import ImportResult
 from skill_importer.models import ExternalRequirements, ScanReport, SourceSpec
 from skill_importer.pipeline import ScanOptions, SkillImporterPipeline
 
@@ -281,3 +284,145 @@ def test_subpath_and_model_options_are_reflected_in_same_report_pipeline(
     payload = json.loads(result.stdout)
     assert [skill["root"] for skill in payload["skills"]] == ["two"]
     assert payload["source"]["discoveryScope"] == "two"
+
+
+def test_import_cli_runs_fresh_scan_copies_payload_and_never_executes_script(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(
+        source,
+        {
+            "tool/SKILL.md": _skill("fresh"),
+            "tool/scripts/run.sh": "exit 99\n",
+        },
+    )
+    os.chmod(source / "tool/scripts/run.sh", 0o755)
+
+    preview = runner.invoke(cli, ["scan", str(source), "--no-llm", "--json"])
+    assert preview.exit_code == 0, preview.output
+    (source / "tool/assets").mkdir()
+    (source / "tool/assets/after-scan.txt").write_text("fresh scan")
+    out = tmp_path / "out"
+
+    imported = runner.invoke(
+        cli,
+        ["import", str(source), "--out", str(out), "--no-llm"],
+    )
+
+    assert imported.exit_code == 0, imported.output
+    payload_dirs = [path for path in out.iterdir() if path.is_dir()]
+    assert len(payload_dirs) == 1
+    assert (payload_dirs[0] / "assets/after-scan.txt").read_text() == "fresh scan"
+    assert (out / "import-manifest.json").is_file()
+    assert "Imported 1" in imported.stdout
+
+
+def test_import_cli_with_only_rejected_candidates_exits_zero(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    source = tmp_path / "invalid"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": "---\nname: [broken\n---\n"})
+    out = tmp_path / "out"
+
+    result = runner.invoke(
+        cli,
+        ["import", str(source), "--out", str(out), "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Imported 0" in result.stdout
+    assert json.loads((out / "import-manifest.json").read_text())["imported"] == []
+
+
+def test_import_cli_operational_error_is_safe_and_exits_one(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("existing")})
+    out = tmp_path / "out"
+    out.write_text("keep")
+
+    result = runner.invoke(
+        cli,
+        ["import", str(source), "--out", str(out), "--no-llm"],
+    )
+
+    assert result.exit_code == 1
+    assert "OUTPUT_EXISTS" in result.stderr
+    assert result.stdout == ""
+    assert out.read_text() == "keep"
+
+
+def test_import_cli_requires_out_and_uses_click_exit_two(runner: CliRunner) -> None:
+    result = runner.invoke(cli, ["import", ".", "--no-llm"])
+
+    assert result.exit_code == 2
+    assert "Missing option" in result.stderr
+
+
+def test_import_cli_propagates_ref_subpath_model_and_no_llm(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeImporter:
+        def import_source(
+            self,
+            spec: SourceSpec,
+            out: Path,
+            options: ScanOptions | None = None,
+        ) -> ImportResult:
+            captured.update(spec=spec, out=out, options=options)
+            return ImportResult(output_path=out, imported=(), skipped=())
+
+    monkeypatch.setattr(cli_module, "SkillImporter", FakeImporter)
+    out = tmp_path / "out"
+
+    result = runner.invoke(
+        cli,
+        [
+            "import",
+            "https://example.com/acme/repo.git",
+            "--out",
+            str(out),
+            "--ref",
+            "release",
+            "--subpath",
+            "nested/skill",
+            "--model",
+            "test/model",
+            "--no-llm",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    spec = captured["spec"]
+    options = captured["options"]
+    assert isinstance(spec, SourceSpec)
+    assert spec.ref == "release"
+    assert spec.subpath == "nested/skill"
+    assert isinstance(options, ScanOptions)
+    assert options.model == "test/model"
+    assert not options.use_llm
+
+
+def test_import_human_output_escapes_untrusted_controls(runner: CliRunner, tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill('"\\u001b[31mowned"')})
+    out = tmp_path / "out"
+
+    result = runner.invoke(
+        cli,
+        ["import", str(source), "--out", str(out), "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "\x1b" not in result.stdout
+    assert "\\u001b[31mowned" in result.stdout
