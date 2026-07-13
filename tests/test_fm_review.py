@@ -8,9 +8,11 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.request import OpenerDirector
 
 import pytest
 
@@ -598,6 +600,35 @@ def test_private_key_and_password_patterns_use_distinct_markers(tmp_path: Path) 
     assert "<REDACTED:PRIVATE_KEY>" in envelope.canonical_json
 
 
+def test_oversized_metadata_is_omitted_before_partial_private_key_filtering(
+    tmp_path: Path,
+) -> None:
+    secret = "private-key-material-that-must-not-cross-the-metadata-cap"
+    description = (
+        "x" * 4000
+        + "-----BEGIN PRIVATE KEY-----\n"
+        + secret
+        + "\n"
+        + "y" * 200
+        + "\n-----END PRIVATE KEY-----"
+    )
+    context = _context(tmp_path)
+    context = replace(
+        context,
+        validation=replace(context.validation, description=description),
+    )
+
+    envelope = build_review_envelope(context, Limits())
+    result = _reviewer(FakeTransport()).review(context)
+
+    assert secret not in envelope.canonical_json
+    assert "-----BEGIN PRIVATE KEY-----" not in envelope.canonical_json
+    assert "<TRUNCATED:METADATA>" in envelope.canonical_json
+    assert envelope.truncated
+    assert result.classification is Classification.AMBIGUOUS
+    assert result.reason.code is ReasonCode.FM_CONTEXT_TRUNCATED
+
+
 @pytest.mark.parametrize(
     ("line", "secret", "marker"),
     [
@@ -935,6 +966,7 @@ def test_review_call_limit_is_enforced_before_transport(tmp_path: Path) -> None:
         FmTransportError("HTTP 503"),
         ValueError(f"invalid header {API_KEY}"),
         UnicodeError(f"invalid header encoding {API_KEY}"),
+        IncompleteRead(f"partial response containing {API_KEY}".encode(), 128),
     ],
 )
 def test_transport_failure_stays_ambiguous_without_leaking_error(
@@ -1074,3 +1106,45 @@ def test_urllib_transport_wraps_invalid_header_without_echoing_secret() -> None:
         )
 
     assert secret not in str(exc_info.value)
+
+
+def test_urllib_transport_wraps_incomplete_read_without_echoing_partial_body() -> None:
+    secret_fragment = f'{{"upstream":"{API_KEY}"}}'.encode()
+
+    class IncompleteResponse:
+        status = 200
+
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
+        def __enter__(self) -> IncompleteResponse:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def read(self, size: int) -> bytes:
+            del size
+            raise IncompleteRead(secret_fragment, len(secret_fragment) + 128)
+
+    class IncompleteOpener:
+        def open(self, *args: object, **kwargs: object) -> IncompleteResponse:
+            del args, kwargs
+            return IncompleteResponse()
+
+    transport = UrllibFmTransport(
+        max_response_bytes=1024,
+        opener=cast(OpenerDirector, IncompleteOpener()),
+    )
+
+    with pytest.raises(FmTransportError) as exc_info:
+        transport.send(
+            CLOUD_RU_FM_ENDPOINT,
+            {"Authorization": f"Bearer {API_KEY}"},
+            {"test": True},
+            timeout_seconds=2,
+        )
+
+    assert str(exc_info.value) == "FM API request failed"
+    assert API_KEY not in str(exc_info.value)
+    assert secret_fragment.decode() not in str(exc_info.value)
