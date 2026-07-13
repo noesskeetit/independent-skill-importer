@@ -51,6 +51,19 @@ _HOST_PATH_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _BACKSLASH_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?P<path>(?:\.\.\\|\.\\|~\\)[^\s`'\"<>]+)")
+_HOME_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_./:])(?P<path>~/[^\s`'\"<>]{1,1024})")
+_FILE_API_ONE_SEGMENT_PATH_RE = re.compile(
+    r"\b(?:open|path|readFile|readFileSync|load)\s*\(\s*[\"']"
+    r"(?P<path>/(?!/)[A-Za-z0-9_.-]{1,256}|~/[A-Za-z0-9_.-]{1,256})[\"']",
+    re.IGNORECASE,
+)
+_SHELL_ONE_SEGMENT_PATH_RE = re.compile(
+    r"^\s*(?:[-*+]\s+|\$\s+|>\s+)?"
+    r"(?:source|cat|less|head|tail|stat|ls|cd|rm|cp|mv|chmod|chown)\s+"
+    r"(?:-[A-Za-z0-9_.-]+\s+)*"
+    r"(?P<path>/(?!/)[A-Za-z0-9_.-]{1,256}|~/[A-Za-z0-9_.-]{1,256})(?:\s|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 _MCP_TOOL_RE = re.compile(r"\bmcp__(?P<server>[A-Za-z0-9_.-]+)__(?P<tool>[A-Za-z0-9_.-]+)\b")
 _COMMAND_REFERENCE_RE = re.compile(
     r"(?<![\w-])/(?P<slash>[A-Za-z0-9_.-]+)\b"
@@ -461,6 +474,13 @@ def _path_references(content: str) -> Iterable[tuple[str, int]]:
         yield _clean_reference(value), match.start()
     for match in _BACKSLASH_PATH_TOKEN_RE.finditer(content):
         yield _clean_reference(match.group("path")), match.start("path")
+    for pattern in (
+        _HOME_PATH_TOKEN_RE,
+        _FILE_API_ONE_SEGMENT_PATH_RE,
+        _SHELL_ONE_SEGMENT_PATH_RE,
+    ):
+        for match in pattern.finditer(content):
+            yield _clean_reference(match.group("path")), match.start("path")
 
 
 def _decode_reference(value: str) -> str:
@@ -613,7 +633,7 @@ def _derive_owned_components(
         for item in boundaries
         if item.root != boundary.root and _is_within(item.root, boundary.root)
     )
-    skill_roots = frozenset(_skill_roots(inventory))
+    skill_roots = _excluded_skill_roots(candidate, inventory)
     for path in sorted(manifest_paths):
         entry = inventory.by_path.get(path)
         if entry is None:
@@ -1156,8 +1176,26 @@ def _analyze_symlinks(
 
 def _is_documentation(path: str, boundary: PackageBoundary) -> bool:
     relative = PurePosixPath(_relative_to(path, boundary.root))
-    if any(part.casefold() in _DOCUMENTATION_DIRECTORIES for part in relative.parts[:-1]):
-        return True
+    parts = tuple(part.casefold() for part in relative.parts)
+    documentation_indexes = [
+        index for index, part in enumerate(parts[:-1]) if part in _DOCUMENTATION_DIRECTORIES
+    ]
+    if documentation_indexes:
+        named_component = parts[0] in {
+            "agent",
+            "agents",
+            "command",
+            "commands",
+            "hook",
+            "hooks",
+            "mcp",
+            "mcpserver",
+            "mcpservers",
+            "provider",
+            "providers",
+        }
+        if documentation_indexes != [1] or not named_component:
+            return True
     name = relative.name.casefold()
     return name.startswith(("readme", "changelog", "license"))
 
@@ -1172,6 +1210,15 @@ def _skill_roots(inventory: Inventory) -> tuple[str, ...]:
                 and PurePosixPath(entry.path).name in {"SKILL.md", "skill.md"}
             }
         )
+    )
+
+
+def _excluded_skill_roots(candidate: SkillCandidate, inventory: Inventory) -> frozenset[str]:
+    """Return sibling skill payloads, never an ancestor that shadows plugin runtime."""
+    return frozenset(
+        root
+        for root in _skill_roots(inventory)
+        if root != candidate.root and not _is_within(candidate.root, root)
     )
 
 
@@ -1325,7 +1372,7 @@ def _analyze_reverse_dependencies(
         for item in boundaries
         if item.root != boundary.root and _is_within(item.root, boundary.root)
     )
-    skill_roots = frozenset(_skill_roots(inventory))
+    skill_roots = _excluded_skill_roots(candidate, inventory)
     for entry in inventory.entries:
         if (
             entry.kind != "file"

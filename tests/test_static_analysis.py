@@ -333,6 +333,41 @@ def test_https_reference_remains_external_and_is_not_path_traversal(tmp_path: Pa
     assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
 
 
+def test_https_tilde_path_is_not_mistaken_for_local_home_path(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill("Read [user docs](https://example.com/~user/config).\n")},
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '```python\nopen("/etc")\n```\n',
+        '```python\nPath("~/.env")\n```\n',
+        "```sh\nsource ~/config\n```\n",
+    ],
+)
+def test_contextual_one_segment_host_path_is_blocked(body: str, tmp_path: Path) -> None:
+    result = _analyze(tmp_path, {"skills/alpha/SKILL.md": _skill(body)})
+
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+
+
+def test_slash_command_is_not_mistaken_for_one_segment_host_path(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill("Run `/deploy` when requested.\n")},
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
+
+
 def test_missing_local_reference_is_nonportable(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
@@ -803,6 +838,38 @@ def test_nested_plugin_runtime_is_not_reverse_dependency_of_outer_plugin(tmp_pat
 
     assert result.classification is Classification.AMBIGUOUS
     assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
+def test_root_skill_does_not_shadow_reverse_dependency_of_nested_candidate(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "runtime/workflow.js"}),
+            "runtime/workflow.js": 'runSkill("alpha")',
+            "SKILL.md": _skill(name="root"),
+            "skills/alpha/SKILL.md": _skill(),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME in result.reason_codes
+
+
+def test_root_skill_does_not_shadow_owned_components_of_nested_candidate(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": "{}",
+            "commands/deploy.md": "deploy",
+            "mcp/docs/server.js": "pass",
+            "SKILL.md": _skill(name="root"),
+            "skills/alpha/SKILL.md": _skill("Run `/deploy`, then call `mcp__docs__search`.\n"),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_COMMAND_REFERENCE in result.reason_codes
+    assert ReasonCode.PLUGIN_OWNED_MCP_TOOL in result.reason_codes
 
 
 def test_internal_relative_symlink_is_safe(tmp_path: Path) -> None:
