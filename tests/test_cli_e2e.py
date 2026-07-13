@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 from fixture_factory import write_tree
 
-from skill_importer.cli import cli
+from skill_importer.cli import _render_human, cli
+from skill_importer.models import ExternalRequirements, ScanReport, SourceSpec
+from skill_importer.pipeline import ScanOptions, SkillImporterPipeline
 
 
 def _skill(name: str, body: str = "Self-contained.\n") -> str:
@@ -140,6 +143,60 @@ def test_human_output_escapes_untrusted_terminal_control_characters(
     assert "\x1b" not in result.stdout
     assert "\\u001b[31mowned" in result.stdout
     assert "portable" in result.stdout
+    assert "package: none" in result.stdout
+    assert "externalRequirements: binaries=[] environment=[]" in result.stdout
+
+
+def test_human_preview_shows_boundary_requirements_and_exact_groups_with_escaping(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    plugin_root = "plugins/\x1bplugin"
+    skill_text = _skill('"\\u001b[31msame"')
+    write_tree(
+        source,
+        {
+            f"{plugin_root}/plugin.json": '{"name":"mixed"}',
+            f"{plugin_root}/src/runtime.py": "def activate():\n    return None\n",
+            f"{plugin_root}/skills/one/SKILL.md": skill_text,
+            f"{plugin_root}/skills/two/SKILL.md": skill_text,
+        },
+    )
+    report = SkillImporterPipeline(api_key_provider=lambda: None).scan(
+        SourceSpec.local(source),
+        ScanOptions(use_llm=False),
+    )
+    skills = tuple(
+        replace(
+            skill,
+            external_requirements=ExternalRequirements(
+                binaries=("git", "\x1bbin"),
+                environment=("TOKEN", "\x1bENV"),
+            ),
+        )
+        for skill in report.skills
+    )
+    report = ScanReport(
+        source=report.source,
+        skills=skills,
+        duplicates=report.duplicates,
+        name_conflicts=report.name_conflicts,
+    )
+
+    output = _render_human(report)
+
+    assert "\x1b" not in output
+    assert "package: root=plugins/\\u001bplugin" in output
+    assert "manifest=plugins/\\u001bplugin/plugin.json" in output
+    assert "kind=plugin packageKind=mixed" in output
+    assert "externalRequirements: binaries=[git, \\u001bbin]" in output
+    assert "environment=[TOKEN, \\u001bENV]" in output
+    assert f"groupId={report.duplicates[0].group_id}" in output
+    assert f"contentHash={report.duplicates[0].content_hash}" in output
+    assert all(candidate_id in output for candidate_id in report.duplicates[0].candidate_ids)
+    assert f"groupId={report.name_conflicts[0].group_id}" in output
+    assert "name=\\u001b[31msame" in output
 
 
 def test_scan_does_not_create_output_or_modify_source(runner: CliRunner, tmp_path: Path) -> None:

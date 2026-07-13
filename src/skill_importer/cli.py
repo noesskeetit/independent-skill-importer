@@ -45,6 +45,10 @@ def _escape_terminal(value: object) -> str:
     return "".join(escaped)
 
 
+def _render_values(values: tuple[str, ...]) -> str:
+    return "[" + ", ".join(_escape_terminal(value) for value in values) + "]"
+
+
 def _render_human(report: ScanReport) -> str:
     source = report.source
     revision = source.resolved_commit_sha or source.snapshot_sha256
@@ -58,18 +62,60 @@ def _render_human(report: ScanReport) -> str:
     for skill in report.skills:
         reason_codes = ",".join(reason.code.value for reason in skill.reasons)
         lines.append(
-            "  "
-            + " | ".join(
-                (
-                    _escape_terminal(skill.candidate.root),
-                    _escape_terminal(skill.name or "-"),
-                    skill.classification.value,
-                    _escape_terminal(reason_codes),
-                )
-            )
+            "  root="
+            + _escape_terminal(skill.candidate.root)
+            + " name="
+            + _escape_terminal(skill.name or "-")
+            + " classification="
+            + _escape_terminal(skill.classification.value)
         )
-    lines.append(f"Duplicates: {len(report.duplicates)}")
-    lines.append(f"Name conflicts: {len(report.name_conflicts)}")
+        boundary = skill.candidate.enclosing_boundary
+        if boundary is None:
+            lines.append("    package: none")
+        else:
+            lines.append(
+                "    package: root="
+                + _escape_terminal(boundary.root)
+                + " manifest="
+                + _escape_terminal(boundary.manifest_path)
+                + " kind="
+                + _escape_terminal(boundary.manifest_kind)
+                + " packageKind="
+                + _escape_terminal(boundary.package_kind)
+            )
+        requirements = skill.external_requirements
+        lines.append(
+            "    externalRequirements: binaries="
+            + _render_values(requirements.binaries)
+            + " environment="
+            + _render_values(requirements.environment)
+        )
+        lines.append("    reasons: " + _escape_terminal(reason_codes))
+
+    lines.append("Duplicate groups:")
+    if not report.duplicates:
+        lines.append("  (none)")
+    for duplicate_group in report.duplicates:
+        lines.append(
+            "  groupId="
+            + _escape_terminal(duplicate_group.group_id)
+            + " contentHash="
+            + _escape_terminal(duplicate_group.content_hash)
+            + " candidates="
+            + _render_values(duplicate_group.candidate_ids)
+        )
+    lines.append("Name conflict groups:")
+    if not report.name_conflicts:
+        lines.append("  (none)")
+    for conflict_group in report.name_conflicts:
+        lines.append(
+            "  groupId="
+            + _escape_terminal(conflict_group.group_id)
+            + " name="
+            + _escape_terminal(conflict_group.name)
+            + " candidates="
+            + _render_values(conflict_group.candidate_ids)
+        )
     counts = report.counts
     lines.append(
         "Counts: "

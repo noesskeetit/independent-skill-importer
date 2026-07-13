@@ -753,45 +753,78 @@ class ScanReport:
         if any(skill.candidate.source != self.source for skill in self.skills):
             raise ValueError("scan report skills must share report source provenance")
 
-        duplicate_by_id = {group.group_id: group for group in self.duplicates}
-        conflict_by_id = {group.group_id: group for group in self.name_conflicts}
-        if len(duplicate_by_id) != len(self.duplicates):
-            raise ValueError("scan report duplicate group IDs must be unique")
-        if len(conflict_by_id) != len(self.name_conflicts):
-            raise ValueError("scan report name conflict group IDs must be unique")
+        expected_duplicate_members: dict[str, list[str]] = {}
+        expected_conflict_members: dict[str, list[str]] = {}
+        for skill in self.skills:
+            if skill.content_hash is not None:
+                expected_duplicate_members.setdefault(skill.content_hash, []).append(
+                    skill.candidate_id
+                )
+            if skill.name:
+                expected_conflict_members.setdefault(skill.name, []).append(skill.candidate_id)
+        expected_duplicates = {
+            content_hash: tuple(sorted(candidate_ids))
+            for content_hash, candidate_ids in expected_duplicate_members.items()
+            if len(candidate_ids) >= 2
+        }
+        expected_conflicts = {
+            name: tuple(sorted(candidate_ids))
+            for name, candidate_ids in expected_conflict_members.items()
+            if len(candidate_ids) >= 2
+        }
 
+        actual_duplicates: dict[str, DuplicateGroup] = {}
         for duplicate_group in self.duplicates:
-            for candidate_id in duplicate_group.candidate_ids:
-                duplicate_skill = skills_by_id.get(candidate_id)
-                if duplicate_skill is None:
-                    raise ValueError("duplicate group references an unknown candidate")
-                if duplicate_skill.content_hash != duplicate_group.content_hash:
-                    raise ValueError("duplicate group content hash does not match its candidate")
-                if duplicate_skill.duplicate_group != duplicate_group.group_id:
-                    raise ValueError("duplicate group annotation does not match its candidate")
+            if duplicate_group.content_hash in actual_duplicates:
+                raise ValueError(
+                    "duplicate equivalence groups must have exactly one group per hash"
+                )
+            actual_duplicates[duplicate_group.content_hash] = duplicate_group
+        if set(actual_duplicates) != set(expected_duplicates) or any(
+            actual_duplicates[key].candidate_ids != members
+            for key, members in expected_duplicates.items()
+        ):
+            raise ValueError(
+                "duplicate equivalence groups must exactly partition all matching skills"
+            )
+
+        actual_conflicts: dict[str, NameConflictGroup] = {}
         for conflict_group in self.name_conflicts:
-            for candidate_id in conflict_group.candidate_ids:
-                conflict_skill = skills_by_id.get(candidate_id)
-                if conflict_skill is None:
-                    raise ValueError("name conflict group references an unknown candidate")
-                if conflict_skill.name != conflict_group.name:
-                    raise ValueError("name conflict group name does not match its candidate")
-                if conflict_skill.name_conflict_group != conflict_group.group_id:
-                    raise ValueError("name conflict group annotation does not match its candidate")
+            if conflict_group.name in actual_conflicts:
+                raise ValueError("name equivalence groups must have exactly one group per name")
+            actual_conflicts[conflict_group.name] = conflict_group
+        if set(actual_conflicts) != set(expected_conflicts) or any(
+            actual_conflicts[key].candidate_ids != members
+            for key, members in expected_conflicts.items()
+        ):
+            raise ValueError("name equivalence groups must exactly partition all matching skills")
 
         for skill in self.skills:
-            if skill.duplicate_group is not None:
-                annotated_duplicate_group = duplicate_by_id.get(skill.duplicate_group)
-                if (
-                    annotated_duplicate_group is None
-                    or skill.candidate_id not in annotated_duplicate_group.candidate_ids
-                ):
-                    raise ValueError("skill has a dangling duplicate group annotation")
-            if skill.name_conflict_group is not None and (
-                (annotated_conflict_group := conflict_by_id.get(skill.name_conflict_group)) is None
-                or skill.candidate_id not in annotated_conflict_group.candidate_ids
-            ):
-                raise ValueError("skill has a dangling name conflict group annotation")
+            member_duplicate_group = (
+                actual_duplicates.get(skill.content_hash)
+                if skill.content_hash is not None
+                else None
+            )
+            expected_duplicate_id = (
+                member_duplicate_group.group_id if member_duplicate_group is not None else None
+            )
+            if skill.duplicate_group != expected_duplicate_id:
+                raise ValueError("skill duplicate group annotation must exactly match membership")
+            has_duplicate_reason = ReasonCode.DUPLICATE_CONTENT in skill.reason_codes
+            if has_duplicate_reason != (member_duplicate_group is not None):
+                raise ValueError("duplicate equivalence reason must exist if and only if grouped")
+
+            member_conflict_group = actual_conflicts.get(skill.name) if skill.name else None
+            expected_conflict_id = (
+                member_conflict_group.group_id if member_conflict_group is not None else None
+            )
+            if skill.name_conflict_group != expected_conflict_id:
+                raise ValueError(
+                    "skill name conflict group annotation must exactly match membership"
+                )
+            has_conflict_reason = ReasonCode.NAME_CONFLICT in skill.reason_codes
+            if has_conflict_reason != (member_conflict_group is not None):
+                raise ValueError("name equivalence reason must exist if and only if grouped")
 
     @property
     def counts(self) -> dict[str, int]:

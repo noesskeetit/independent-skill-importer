@@ -180,7 +180,7 @@ def _duplicate_reason(skill: AnalyzedSkill, group: DuplicateGroup) -> DecisionRe
         evidence=(
             Evidence(
                 path=skill.candidate.entrypoint,
-                line=1,
+                line=None,
                 field="contentHash",
                 value=group.content_hash,
                 detector="pipeline.duplicate_content",
@@ -196,7 +196,7 @@ def _name_conflict_reason(skill: AnalyzedSkill, group: NameConflictGroup) -> Dec
         evidence=(
             Evidence(
                 path=skill.candidate.entrypoint,
-                line=1,
+                line=None,
                 field="name",
                 value=group.name,
                 detector="pipeline.name_conflict",

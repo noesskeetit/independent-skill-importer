@@ -688,14 +688,24 @@ def test_scan_report_rejects_group_member_missing_from_skills(tmp_path: Path) ->
     skill = _analyzed_skill(tmp_path)
     group = DuplicateGroup(content_hash=SHA256, candidate_ids=(skill.candidate_id, "other"))
 
-    with pytest.raises(ValueError, match="unknown candidate"):
+    with pytest.raises(ValueError, match="duplicate equivalence groups"):
         ScanReport(source=skill.candidate.source, skills=(skill,), duplicates=(group,))
 
 
-def test_scan_report_rejects_dangling_skill_group_annotation(tmp_path: Path) -> None:
-    skill = replace(_analyzed_skill(tmp_path), duplicate_group=f"sha256:{SHA256}")
+@pytest.mark.parametrize("dimension", ["duplicate", "name"])
+def test_scan_report_rejects_dangling_skill_group_annotation(
+    dimension: str, tmp_path: Path
+) -> None:
+    skill = replace(
+        _analyzed_skill(tmp_path),
+        **{
+            "duplicate_group" if dimension == "duplicate" else "name_conflict_group": (
+                f"sha256:{SHA256}"
+            )
+        },
+    )
 
-    with pytest.raises(ValueError, match="duplicate group annotation"):
+    with pytest.raises(ValueError, match="group annotation"):
         ScanReport(source=skill.candidate.source, skills=(skill,))
 
 
@@ -709,8 +719,8 @@ def test_scan_report_rejects_annotation_for_nonmember_of_existing_group(tmp_path
         content_hash=SHA256,
         candidate_ids=(first.candidate_id, second.candidate_id),
     )
-    first = replace(first, duplicate_group=group.group_id)
-    second = replace(second, duplicate_group=group.group_id)
+    first = _annotate_equivalence("duplicate", first, group)
+    second = _annotate_equivalence("duplicate", second, group)
     unrelated = replace(unrelated, duplicate_group=group.group_id)
 
     with pytest.raises(ValueError, match="duplicate group annotation"):
@@ -719,6 +729,136 @@ def test_scan_report_rejects_annotation_for_nonmember_of_existing_group(tmp_path
             skills=(first, second, unrelated),
             duplicates=(group,),
         )
+
+
+def _equivalent_skills(
+    tmp_path: Path,
+    dimension: str,
+    count: int,
+) -> tuple[AnalyzedSkill, ...]:
+    return tuple(
+        _analyzed_skill_at(
+            tmp_path,
+            f"skills/item-{index}",
+            name="same-name" if dimension == "name" else f"name-{index}",
+            content_hash=(SHA256 if dimension == "duplicate" else f"{index + 1:064x}"),
+        )
+        for index in range(count)
+    )
+
+
+def _equivalence_group(
+    dimension: str,
+    skills: tuple[AnalyzedSkill, ...],
+) -> DuplicateGroup | NameConflictGroup:
+    candidate_ids = tuple(skill.candidate_id for skill in skills)
+    if dimension == "duplicate":
+        return DuplicateGroup(content_hash=SHA256, candidate_ids=candidate_ids)
+    return NameConflictGroup(name="same-name", candidate_ids=candidate_ids)
+
+
+def _annotate_equivalence(
+    dimension: str,
+    skill: AnalyzedSkill,
+    group: DuplicateGroup | NameConflictGroup,
+) -> AnalyzedSkill:
+    if dimension == "duplicate":
+        return replace(
+            skill,
+            duplicate_group=group.group_id,
+            reasons=(*skill.reasons, _reason(ReasonCode.DUPLICATE_CONTENT)),
+        )
+    return replace(
+        skill,
+        name_conflict_group=group.group_id,
+        reasons=(*skill.reasons, _reason(ReasonCode.NAME_CONFLICT)),
+    )
+
+
+@pytest.mark.parametrize("dimension", ["duplicate", "name"])
+def test_scan_report_accepts_exact_triple_equivalence_group(dimension: str, tmp_path: Path) -> None:
+    skills = _equivalent_skills(tmp_path, dimension, 3)
+    group = _equivalence_group(dimension, skills)
+    annotated = tuple(_annotate_equivalence(dimension, skill, group) for skill in skills)
+
+    report = ScanReport(
+        source=annotated[0].candidate.source,
+        skills=annotated,
+        duplicates=(group,) if dimension == "duplicate" else (),
+        name_conflicts=(group,) if dimension == "name" else (),  # type: ignore[arg-type]
+    )
+
+    assert len(report.duplicates if dimension == "duplicate" else report.name_conflicts) == 1
+
+
+@pytest.mark.parametrize("dimension", ["duplicate", "name"])
+def test_scan_report_rejects_group_missing_third_equivalent_candidate(
+    dimension: str, tmp_path: Path
+) -> None:
+    skills = _equivalent_skills(tmp_path, dimension, 3)
+    group = _equivalence_group(dimension, skills[:2])
+    annotated = (
+        *(_annotate_equivalence(dimension, skill, group) for skill in skills[:2]),
+        skills[2],
+    )
+
+    with pytest.raises(ValueError, match="equivalence groups"):
+        ScanReport(
+            source=skills[0].candidate.source,
+            skills=annotated,
+            duplicates=(group,) if dimension == "duplicate" else (),
+            name_conflicts=(group,) if dimension == "name" else (),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("dimension", ["duplicate", "name"])
+def test_scan_report_rejects_split_equivalence_groups(dimension: str, tmp_path: Path) -> None:
+    skills = _equivalent_skills(tmp_path, dimension, 4)
+    first_group = _equivalence_group(dimension, skills[:2])
+    second_group = _equivalence_group(dimension, skills[2:])
+    annotated = tuple(
+        _annotate_equivalence(
+            dimension,
+            skill,
+            first_group if index < 2 else second_group,
+        )
+        for index, skill in enumerate(skills)
+    )
+
+    with pytest.raises(ValueError, match="equivalence groups"):
+        ScanReport(
+            source=skills[0].candidate.source,
+            skills=annotated,
+            duplicates=(first_group, second_group) if dimension == "duplicate" else (),
+            name_conflicts=(first_group, second_group) if dimension == "name" else (),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("dimension", ["duplicate", "name"])
+def test_scan_report_rejects_missing_equivalence_group(dimension: str, tmp_path: Path) -> None:
+    skills = _equivalent_skills(tmp_path, dimension, 2)
+
+    with pytest.raises(ValueError, match="equivalence groups"):
+        ScanReport(source=skills[0].candidate.source, skills=skills)
+
+
+@pytest.mark.parametrize(
+    ("dimension", "reason_code"),
+    [
+        ("duplicate", ReasonCode.DUPLICATE_CONTENT),
+        ("name", ReasonCode.NAME_CONFLICT),
+    ],
+)
+def test_scan_report_rejects_equivalence_reason_on_nonmember(
+    dimension: str,
+    reason_code: ReasonCode,
+    tmp_path: Path,
+) -> None:
+    skill = _equivalent_skills(tmp_path, dimension, 1)[0]
+    skill = replace(skill, reasons=(*skill.reasons, _reason(reason_code)))
+
+    with pytest.raises(ValueError, match="equivalence reason"):
+        ScanReport(source=skill.candidate.source, skills=(skill,))
 
 
 def test_import_plan_serializes_destination_mapping(tmp_path: Path) -> None:

@@ -433,6 +433,13 @@ def test_scan_keeps_same_name_duplicates_and_annotates_both_groups(tmp_path: Pat
     assert all(skill.name_conflict_group == conflict.group_id for skill in report.skills)
     assert all(ReasonCode.DUPLICATE_CONTENT in skill.reason_codes for skill in report.skills)
     assert all(ReasonCode.NAME_CONFLICT in skill.reason_codes for skill in report.skills)
+    assert all(
+        evidence.line is None
+        for skill in report.skills
+        for reason in skill.reasons
+        if reason.code in {ReasonCode.DUPLICATE_CONTENT, ReasonCode.NAME_CONFLICT}
+        for evidence in reason.evidence
+    )
     assert all(skill.classification is Classification.PORTABLE for skill in report.skills)
 
 
