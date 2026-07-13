@@ -979,6 +979,8 @@ def test_limits_are_immutable_and_match_approved_defaults() -> None:
     assert limits.max_fm_context_chars == 128 * 1024
     assert limits.max_fm_response_bytes == 1024 * 1024
     assert limits.max_fm_reviews == 50
+    assert limits.max_manifest_bytes == 10 * 1024 * 1024
+    assert limits.to_dict()["maxManifestBytes"] == 10 * 1024 * 1024
     with pytest.raises(FrozenInstanceError):
         limits.max_entries = 1  # type: ignore[misc]
 

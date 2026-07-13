@@ -5,10 +5,11 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import stat
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 
@@ -31,10 +32,14 @@ from skill_importer.models import (
     Evidence,
     InventoryEntry,
     ReasonCode,
+    ResolvedSource,
     ScanReport,
+    SkillCandidate,
     SourceSpec,
+    build_candidate_id,
 )
 from skill_importer.pipeline import ScanOperation, ScanOptions, SkillImporterPipeline
+from skill_importer.source import SourceResolver
 
 
 def _skill(name: str, body: str = "Self-contained.\n", **extra: str) -> str:
@@ -561,6 +566,164 @@ def test_cleanup_failure_does_not_mask_original_baseexception(
     assert not os.path.lexists(out)
 
 
+def test_cleanup_aborts_on_unexpected_entry_and_preserves_primary_exception(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("unexpected-cleanup")})
+    out = tmp_path / "out"
+    captured_staging: Path | None = None
+
+    def add_unexpected(staging: Path) -> None:
+        nonlocal captured_staging
+        captured_staging = staging
+        (staging / "competitor-marker").write_text("keep")
+        raise _SentinelBaseException()
+
+    with pytest.raises(_SentinelBaseException):
+        _import(source, out, before_publish=add_unexpected)
+
+    assert captured_staging is not None
+    assert (captured_staging / "competitor-marker").read_text() == "keep"
+    assert stat.S_IMODE(captured_staging.stat().st_mode) == 0o700
+    assert not os.path.lexists(out)
+
+
+def test_cleanup_aborts_when_a_ledger_entry_is_missing(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("missing-cleanup")})
+    out = tmp_path / "out"
+    captured_staging: Path | None = None
+
+    def remove_manifest(staging: Path) -> None:
+        nonlocal captured_staging
+        captured_staging = staging
+        (staging / "import-manifest.json").unlink()
+        raise _SentinelBaseException()
+
+    with pytest.raises(_SentinelBaseException):
+        _import(source, out, before_publish=remove_manifest)
+
+    assert captured_staging is not None
+    assert captured_staging.is_dir()
+    assert not os.path.lexists(out)
+
+
+def test_cleanup_directory_replacement_between_lstat_and_open_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("cleanup-swap")})
+    out = tmp_path / "out"
+    original_open = importer_module.os.open
+    cleanup_phase = False
+    swapped = False
+    captured_staging: Path | None = None
+    payload_name: str | None = None
+
+    def begin_cleanup(staging: Path) -> None:
+        nonlocal cleanup_phase, captured_staging, payload_name
+        captured_staging = staging
+        payload = next(path for path in staging.iterdir() if path.is_dir())
+        payload_name = payload.name
+        cleanup_phase = True
+        raise _SentinelBaseException()
+
+    def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if cleanup_phase and not swapped and path == payload_name:
+            assert captured_staging is not None
+            assert payload_name is not None
+            swapped = True
+            payload = captured_staging / payload_name
+            shutil.rmtree(payload)
+            payload.mkdir(mode=0o700)
+            (payload / "competitor-marker").write_text("keep")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(importer_module.os, "open", swapping_open)
+
+    with pytest.raises(_SentinelBaseException):
+        _import(source, out, before_publish=begin_cleanup)
+
+    assert swapped
+    assert captured_staging is not None
+    assert payload_name is not None
+    assert (captured_staging / payload_name / "competitor-marker").read_text() == "keep"
+    assert not os.path.lexists(out)
+
+
+def test_cleanup_top_level_replacement_is_preserved(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("top-level-swap")})
+    out = tmp_path / "out"
+    captured_staging: Path | None = None
+
+    def replace_staging(staging: Path) -> None:
+        nonlocal captured_staging
+        captured_staging = staging
+        shutil.rmtree(staging)
+        staging.mkdir(mode=0o700)
+        (staging / "competitor-marker").write_text("keep")
+        raise _SentinelBaseException()
+
+    with pytest.raises(_SentinelBaseException):
+        _import(source, out, before_publish=replace_staging)
+
+    assert captured_staging is not None
+    assert (captured_staging / "competitor-marker").read_text() == "keep"
+    assert not os.path.lexists(out)
+
+
+def test_manifest_create_race_never_adopts_or_deletes_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = importer_module._prepare_output(tmp_path / "out")
+    staging = importer_module._create_staging(output)
+    original_stat = importer_module.os.stat
+    swapped = False
+
+    def swapping_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal swapped
+        if path == "import-manifest.json" and not swapped:
+            swapped = True
+            directory_fd = kwargs["dir_fd"]
+            assert isinstance(directory_fd, int)
+            os.unlink("import-manifest.json", dir_fd=directory_fd)
+            competitor_fd = os.open(
+                "import-manifest.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                os.write(competitor_fd, b"keep")
+            finally:
+                os.close(competitor_fd)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(importer_module.os, "stat", swapping_stat)
+    try:
+        with pytest.raises(ImporterError, match="MANIFEST_WRITE_FAILED"):
+            importer_module._write_manifest(staging.file_fd, staging.ledger, b"{}\n")
+        importer_module._safe_cleanup_staging(output, staging)
+
+        assert swapped
+        assert (staging.path / "import-manifest.json").read_bytes() == b"keep"
+    finally:
+        monkeypatch.setattr(importer_module.os, "stat", original_stat)
+        with suppress(OSError):
+            os.close(staging.file_fd)
+        shutil.rmtree(staging.path, ignore_errors=True)
+        os.close(output.parent_fd)
+
+
 @pytest.mark.parametrize(
     "existing_kind",
     ["file", "directory", "symlink", "dangling-symlink"],
@@ -952,13 +1115,19 @@ def test_manifest_is_canonical_allowlisted_and_preserves_provenance(
     )
     record = manifest["imported"][0]
     provenance = record["provenance"][0]
+    source_provenance = manifest["source"]
     assert record["contentHash"] == result.imported[0].content_hash
-    assert provenance["canonicalSourceUrl"] == source.resolve().as_uri()
-    assert provenance["resolvedCommitSha"] is None
-    assert len(provenance["snapshotSha256"]) == 64
+    assert source_provenance["canonicalSourceUrl"] == source.resolve().as_uri()
+    assert source_provenance["resolvedCommitSha"] is None
+    assert len(source_provenance["snapshotSha256"]) == 64
     assert provenance["originalRoot"] == "good"
     assert provenance["entrypoint"] == "good/SKILL.md"
-    assert set(manifest) == {"schemaVersion", "imported", "rejected"}
+    assert set(manifest) == {"schemaVersion", "source", "imported", "rejected"}
+    assert set(source_provenance) == {
+        "canonicalSourceUrl",
+        "resolvedCommitSha",
+        "snapshotSha256",
+    }
     assert set(record) == {
         "name",
         "contentHash",
@@ -969,8 +1138,10 @@ def test_manifest_is_canonical_allowlisted_and_preserves_provenance(
     assert set(manifest["rejected"][0]) == {
         "candidateId",
         "name",
+        "nameTruncated",
         "classification",
         "originalRoot",
+        "originalRootTruncated",
         "reasonCodes",
     }
     for forbidden in (
@@ -1004,6 +1175,171 @@ def test_manifest_serialization_never_calls_full_skill_serializer(
     assert (out / "import-manifest.json").is_file()
 
 
+def test_manifest_source_provenance_occurs_once_for_duplicate_layouts(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    skill_text = _skill("common-source")
+    write_tree(
+        source,
+        {
+            "one/SKILL.md": skill_text,
+            "two/SKILL.md": skill_text,
+            "three/SKILL.md": skill_text,
+        },
+    )
+    out = tmp_path / "out"
+
+    _import(source, out)
+    raw = (out / "import-manifest.json").read_bytes()
+    manifest = json.loads(raw)
+
+    assert raw.count(source.resolve().as_uri().encode()) == 1
+    assert manifest["source"]["canonicalSourceUrl"] == source.resolve().as_uri()
+    assert len(manifest["imported"][0]["provenance"]) == 3
+    assert set(manifest["imported"][0]["provenance"][0]) == {
+        "candidateId",
+        "originalRoot",
+        "entrypoint",
+    }
+
+
+@pytest.mark.parametrize("limit_delta", [0, -1])
+def test_manifest_limit_is_exact_and_includes_trailing_newline(
+    limit_delta: int,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("exact-limit")})
+    report = _scan(source)
+    plan = build_import_plan(report, Limits())
+    encoded = importer_module._manifest_bytes(plan, Limits().max_manifest_bytes)
+    exact_limit = len(encoded) + limit_delta
+
+    if limit_delta == 0:
+        exact_plan = build_import_plan(report, Limits(max_manifest_bytes=exact_limit))
+        assert importer_module._manifest_bytes(exact_plan, exact_limit) == encoded
+        assert importer_module._manifest_bytes(plan, exact_limit) == encoded
+        assert encoded.endswith(b"\n")
+    else:
+        with pytest.raises(ImporterError, match="MANIFEST_TOO_LARGE"):
+            build_import_plan(report, Limits(max_manifest_bytes=exact_limit))
+        with pytest.raises(ImporterError, match="MANIFEST_TOO_LARGE"):
+            importer_module._manifest_bytes(plan, exact_limit)
+
+
+def test_many_provenance_records_fail_low_manifest_preflight(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    skill_text = _skill("many-layouts")
+    write_tree(
+        source,
+        {f"layout-{index}/SKILL.md": skill_text for index in range(40)},
+    )
+    report = _scan(source)
+
+    with pytest.raises(ImporterError, match="MANIFEST_TOO_LARGE"):
+        build_import_plan(report, Limits(max_manifest_bytes=512))
+
+
+def test_imported_name_over_byte_cap_fails_before_output(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("n" * 1025)})
+    out = tmp_path / "out"
+
+    with pytest.raises(ImporterError, match="MANIFEST_METADATA_TOO_LARGE"):
+        _import(source, out)
+
+    assert not os.path.lexists(out)
+    assert not list(tmp_path.glob(".out.skill-importer-*"))
+
+
+class _CanonicalUrlResolver:
+    def __init__(self, canonical_url: str, limits: Limits) -> None:
+        self._canonical_url = canonical_url
+        self._delegate = SourceResolver(limits=limits)
+
+    def resolve(self, spec: SourceSpec, workspace: Path) -> ResolvedSource:
+        return replace(
+            self._delegate.resolve(spec, workspace),
+            canonical_url=self._canonical_url,
+        )
+
+
+def test_canonical_url_over_byte_cap_fails_before_output(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("long-url")})
+    out = tmp_path / "out"
+    limits = Limits()
+    pipeline = SkillImporterPipeline(
+        limits=limits,
+        resolver=_CanonicalUrlResolver("https://example.invalid/" + "u" * 16_385, limits),
+        api_key_provider=lambda: None,
+    )
+
+    with pytest.raises(ImporterError, match="MANIFEST_METADATA_TOO_LARGE"):
+        SkillImporter(pipeline=pipeline).import_source(
+            SourceSpec.local(source), out, ScanOptions(use_llm=False)
+        )
+
+    assert not os.path.lexists(out)
+
+
+@pytest.mark.parametrize("field", ["root", "entrypoint"])
+def test_imported_path_metadata_over_byte_cap_is_rejected(
+    field: str,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("long-path")})
+    report = _scan(source)
+    skill = report.skills[0]
+    long_root = "r" * 4097
+    entrypoint = f"{long_root}/SKILL.md"
+    if field == "entrypoint":
+        long_root = "r" * 4090
+        entrypoint = f"{long_root}/SKILL.md"
+    candidate = SkillCandidate(
+        candidate_id=build_candidate_id(report.source, long_root),
+        source=report.source,
+        root=long_root,
+        entrypoint=entrypoint,
+        enclosing_boundary=None,
+    )
+    modified = replace(skill, candidate=candidate)
+    modified_report = ScanReport(source=report.source, skills=(modified,))
+
+    with pytest.raises(ImporterError, match="MANIFEST_METADATA_TOO_LARGE"):
+        build_import_plan(modified_report, Limits())
+
+
+def test_rejected_optional_metadata_has_explicit_truncation_flags(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(
+        source,
+        {
+            "plugin.json": '{"name":"mixed"}',
+            "src/runtime.py": "RUNTIME = True\n",
+            "skills/item/SKILL.md": _skill("r" * 2048),
+        },
+    )
+
+    plan = build_import_plan(_scan(source), Limits())
+    rejected = plan.to_dict()["manifest"]["rejected"][0]
+
+    assert rejected["nameTruncated"] is True
+    assert len(rejected["name"].encode()) <= 512
+    assert rejected["originalRootTruncated"] is False
+
+
 def test_zero_portable_import_publishes_only_manifest(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -1030,3 +1366,195 @@ def test_output_inside_original_source_is_rejected(tmp_path: Path) -> None:
         _import(source, out)
 
     assert not os.path.lexists(out)
+
+
+def test_case_insensitive_source_alias_cannot_bypass_output_containment(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "SourceCase"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("case-alias")})
+    alias = tmp_path / "sourcecase"
+    try:
+        alias_stat = alias.stat()
+    except FileNotFoundError:
+        pytest.skip("test filesystem is case-sensitive")
+    if (alias_stat.st_dev, alias_stat.st_ino) != (
+        source.stat().st_dev,
+        source.stat().st_ino,
+    ):
+        pytest.skip("test filesystem does not resolve the alias to the source inode")
+    out = alias / "imported"
+
+    with pytest.raises(ImporterError, match="UNSAFE_OUTPUT"):
+        _import(source, out)
+
+    assert not os.path.lexists(out)
+
+
+def test_intermediate_parent_symlink_swap_cannot_redirect_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("binding")})
+    binding = tmp_path / "binding"
+    original_parent = binding / "parent"
+    original_leaf = original_parent / "leaf"
+    original_leaf.mkdir(parents=True)
+    saved_parent = binding / "saved-parent"
+    alternate_parent = binding / "alternate"
+    alternate_leaf = alternate_parent / "leaf"
+    alternate_leaf.mkdir(parents=True)
+    out = original_leaf / "out"
+    original_resolve = Path.resolve
+    swapped = False
+
+    def resolve_then_swap(path: Path, *args: object, **kwargs: object) -> Path:
+        nonlocal swapped
+        resolved = original_resolve(path, *args, **kwargs)
+        if not swapped and path == out.parent:
+            swapped = True
+            original_parent.rename(saved_parent)
+            original_parent.symlink_to(alternate_parent, target_is_directory=True)
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", resolve_then_swap)
+
+    with pytest.raises(ImporterError, match="OUTPUT_PARENT"):
+        _import(source, out)
+
+    assert swapped
+    assert not os.path.lexists(alternate_leaf / "out")
+    assert not os.path.lexists(saved_parent / "leaf/out")
+
+
+def test_stable_resolved_parent_symlink_remains_usable(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("stable-parent")})
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias = tmp_path / "parent-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    requested_out = alias / "out"
+
+    result = _import(source, requested_out)
+
+    assert result.output_path == real_parent / "out"
+    assert (real_parent / "out/import-manifest.json").is_file()
+
+
+@pytest.mark.parametrize("failure_point", ["fstat", "lstat"])
+def test_prepare_output_closes_parent_fd_on_post_open_failure(
+    failure_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out"
+    original_open = importer_module.os.open
+    original_fstat = importer_module.os.fstat
+    captured_fd: int | None = None
+
+    def capturing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal captured_fd
+        file_fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == tmp_path or (path == tmp_path.name and kwargs.get("dir_fd") is not None):
+            captured_fd = file_fd
+        return file_fd
+
+    def failing_fstat(file_fd: int) -> os.stat_result:
+        if failure_point == "fstat" and file_fd == captured_fd:
+            raise OSError(errno.EIO, "injected fstat failure")
+        return original_fstat(file_fd)
+
+    def failing_lstat(directory_fd: int, name: str) -> os.stat_result | None:
+        del directory_fd, name
+        raise OSError(errno.EIO, "injected lstat failure")
+
+    monkeypatch.setattr(importer_module.os, "open", capturing_open)
+    monkeypatch.setattr(importer_module.os, "fstat", failing_fstat)
+    if failure_point == "lstat":
+        monkeypatch.setattr(importer_module, "_lstat_at", failing_lstat)
+
+    with pytest.raises(ImporterError):
+        importer_module._prepare_output(out)
+
+    assert captured_fd is not None
+    with pytest.raises(OSError) as error:
+        original_fstat(captured_fd)
+    assert error.value.errno == errno.EBADF
+
+
+def test_prepare_output_maps_expanduser_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_expanduser(_path: Path) -> Path:
+        raise RuntimeError("unknown user")
+
+    monkeypatch.setattr(Path, "expanduser", fail_expanduser)
+
+    with pytest.raises(ImporterError, match=r"UNSAFE_OUTPUT|OUTPUT_PARENT"):
+        importer_module._prepare_output(Path("~missing/out"))
+
+
+@pytest.mark.parametrize("failure_point", ["lstat", "fstat", "fchmod"])
+def test_create_staging_closes_fd_and_removes_owned_directory_on_failure(
+    failure_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = importer_module._prepare_output(tmp_path / "out")
+    original_open = importer_module.os.open
+    original_fstat = importer_module.os.fstat
+    original_fchmod = importer_module.os.fchmod
+    original_lstat_at = importer_module._lstat_at
+    captured_fd: int | None = None
+    staging = None
+
+    def capturing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal captured_fd
+        file_fd = original_open(path, flags, *args, **kwargs)
+        if isinstance(path, str) and ".skill-importer-" in path:
+            captured_fd = file_fd
+        return file_fd
+
+    def failing_fstat(file_fd: int) -> os.stat_result:
+        if failure_point == "fstat" and file_fd == captured_fd:
+            raise OSError(errno.EIO, "injected fstat failure")
+        return original_fstat(file_fd)
+
+    def failing_fchmod(file_fd: int, mode: int) -> None:
+        if failure_point == "fchmod" and file_fd == captured_fd:
+            raise OSError(errno.EIO, "injected fchmod failure")
+        original_fchmod(file_fd, mode)
+
+    lstat_failed = False
+
+    def failing_lstat(directory_fd: int, name: str) -> os.stat_result | None:
+        nonlocal lstat_failed
+        if failure_point == "lstat" and not lstat_failed and ".skill-importer-" in name:
+            lstat_failed = True
+            raise OSError(errno.EIO, "injected lstat failure")
+        return original_lstat_at(directory_fd, name)
+
+    monkeypatch.setattr(importer_module.os, "open", capturing_open)
+    monkeypatch.setattr(importer_module.os, "fstat", failing_fstat)
+    monkeypatch.setattr(importer_module.os, "fchmod", failing_fchmod)
+    monkeypatch.setattr(importer_module, "_lstat_at", failing_lstat)
+    try:
+        with pytest.raises(ImporterError):
+            staging = importer_module._create_staging(output)
+    finally:
+        if staging is not None:
+            with suppress(OSError):
+                os.close(staging.file_fd)
+            shutil.rmtree(staging.path, ignore_errors=True)
+        os.close(output.parent_fd)
+
+    if captured_fd is not None:
+        with pytest.raises(OSError) as error:
+            original_fstat(captured_fd)
+        assert error.value.errno == errno.EBADF
+    assert not list(tmp_path.glob(".out.skill-importer-*"))

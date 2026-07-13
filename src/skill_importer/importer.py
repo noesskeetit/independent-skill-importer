@@ -14,7 +14,7 @@ import sys
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -27,6 +27,7 @@ from .models import (
     ImportRecord,
     InventoryEntry,
     PackageBoundary,
+    ResolvedSource,
     ScanReport,
     SourceKind,
     SourceSpec,
@@ -35,8 +36,11 @@ from .pipeline import ScanOperation, ScanOptions, SkillImporterPipeline, compute
 
 _READ_CHUNK_SIZE = 64 * 1024
 _MAX_SLUG_BYTES = 80
-_MAX_REJECTED_NAME_CHARS = 512
-_MAX_REJECTED_ROOT_CHARS = 4096
+_MAX_IMPORTED_NAME_BYTES = 1024
+_MAX_CANONICAL_URL_BYTES = 16 * 1024
+_MAX_IMPORTED_PATH_BYTES = 4 * 1024
+_MAX_REJECTED_NAME_BYTES = 512
+_MAX_REJECTED_ROOT_BYTES = 4 * 1024
 _MAX_SYMLINK_STEPS = 128
 _WINDOWS_DRIVE_RE = re.compile(r"[A-Za-z]:")
 _UNSUPPORTED_FSYNC_ERRNOS = frozenset(
@@ -203,62 +207,204 @@ def _destination_prefix_lengths(groups: Sequence[tuple[str, str]]) -> tuple[int,
     return tuple(lengths)
 
 
-def _bounded_rejected_text(value: str | None, limit: int) -> str | None:
+def _required_manifest_text(value: str, limit: int, field_name: str) -> str:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ImporterError(
+            "MANIFEST_METADATA_TOO_LARGE",
+            f"manifest {field_name} is not valid UTF-8 text",
+        ) from exc
+    if len(encoded) > limit:
+        raise ImporterError(
+            "MANIFEST_METADATA_TOO_LARGE",
+            f"manifest {field_name} exceeds its byte limit",
+        )
+    return value
+
+
+def _truncate_manifest_text(value: str | None, limit: int) -> tuple[str | None, bool]:
     if value is None:
-        return None
-    return value[:limit]
+        return None, False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", errors="ignore"), True
+
+
+@dataclass(slots=True)
+class _ManifestBudget:
+    """Conservative build-time guard against an oversized raw manifest graph."""
+
+    limit: int
+    consumed: int = 0
+
+    def charge(self, value: str) -> None:
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ImporterError(
+                "MANIFEST_METADATA_TOO_LARGE",
+                "manifest metadata is not valid UTF-8 text",
+            ) from exc
+        self.consumed += size
+        if self.consumed > self.limit:
+            raise ImporterError("MANIFEST_TOO_LARGE", "import manifest exceeds the byte limit")
+
+
+def _canonical_json_encode(value: object, append: Callable[[bytes], None]) -> None:
+    def scalar(item: object) -> bytes:
+        try:
+            return json.dumps(
+                item,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ImporterError(
+                "INVALID_IMPORT_PLAN", "import manifest is not canonical JSON"
+            ) from exc
+
+    if isinstance(value, Mapping):
+        keys = tuple(value.keys())
+        if any(not isinstance(key, str) for key in keys):
+            raise ImporterError(
+                "INVALID_IMPORT_PLAN", "import manifest object keys must be strings"
+            )
+        append(b"{")
+        for index, key in enumerate(sorted(keys)):
+            if index:
+                append(b",")
+            append(scalar(key))
+            append(b":")
+            _canonical_json_encode(value[key], append)
+        append(b"}")
+        return
+    if isinstance(value, tuple | list):
+        append(b"[")
+        for index, item in enumerate(value):
+            if index:
+                append(b",")
+            _canonical_json_encode(item, append)
+        append(b"]")
+        return
+    append(scalar(value))
+
+
+def _validate_manifest_size(payload: Mapping[str, object], max_bytes: int) -> None:
+    consumed = 0
+
+    def count(chunk: bytes) -> None:
+        nonlocal consumed
+        consumed += len(chunk)
+        if consumed > max_bytes:
+            raise ImporterError("MANIFEST_TOO_LARGE", "import manifest exceeds the byte limit")
+
+    if max_bytes <= 0:
+        raise ImporterError("MANIFEST_TOO_LARGE", "import manifest exceeds the byte limit")
+    _canonical_json_encode(payload, count)
+    count(b"\n")
 
 
 def _build_manifest(
+    source: ResolvedSource,
     selected: tuple[AnalyzedSkill, ...],
     rejected: tuple[AnalyzedSkill, ...],
     records: tuple[ImportRecord, ...],
+    limits: Limits,
 ) -> dict[str, object]:
+    canonical_url = _required_manifest_text(
+        source.canonical_url, _MAX_CANONICAL_URL_BYTES, "canonical source URL"
+    )
+    budget = _ManifestBudget(limits.max_manifest_bytes)
+    budget.charge(canonical_url)
+    resolved_commit_sha = source.resolved_commit_sha
+    snapshot_sha256 = source.snapshot_sha256
+    if resolved_commit_sha is not None:
+        budget.charge(resolved_commit_sha)
+    budget.charge(snapshot_sha256)
     selected_by_id = {skill.candidate_id: skill for skill in selected}
     imported: list[dict[str, object]] = []
     for record in records:
-        provenance = []
+        name = _required_manifest_text(record.name, _MAX_IMPORTED_NAME_BYTES, "imported name")
+        for value in (name, record.content_hash, record.destination):
+            budget.charge(value)
+        provenance: list[dict[str, object]] = []
         for candidate_id in record.candidate_ids:
             skill = selected_by_id[candidate_id]
-            source = skill.candidate.source
+            original_root = _required_manifest_text(
+                skill.candidate.root, _MAX_IMPORTED_PATH_BYTES, "imported original root"
+            )
+            entrypoint = _required_manifest_text(
+                skill.candidate.entrypoint, _MAX_IMPORTED_PATH_BYTES, "imported entrypoint"
+            )
+            for value in (candidate_id, original_root, entrypoint):
+                budget.charge(value)
             provenance.append(
                 {
                     "candidateId": candidate_id,
-                    "canonicalSourceUrl": source.canonical_url,
-                    "resolvedCommitSha": source.resolved_commit_sha,
-                    "snapshotSha256": source.snapshot_sha256,
-                    "originalRoot": skill.candidate.root,
-                    "entrypoint": skill.candidate.entrypoint,
+                    "originalRoot": original_root,
+                    "entrypoint": entrypoint,
                 }
             )
         imported.append(
             {
-                "name": record.name,
+                "name": name,
                 "contentHash": record.content_hash,
                 "destination": record.destination,
                 "candidateIds": list(record.candidate_ids),
                 "provenance": provenance,
             }
         )
-    rejected_summary = [
-        {
-            "candidateId": skill.candidate_id,
-            "name": _bounded_rejected_text(skill.name, _MAX_REJECTED_NAME_CHARS),
-            "classification": skill.classification.value,
-            "originalRoot": _bounded_rejected_text(skill.candidate.root, _MAX_REJECTED_ROOT_CHARS),
-            "reasonCodes": sorted(reason.code.value for reason in skill.reasons),
-        }
-        for skill in rejected
-    ]
-    return {
+    rejected_summary: list[dict[str, object]] = []
+    for skill in rejected:
+        rejected_name, name_truncated = _truncate_manifest_text(
+            skill.name, _MAX_REJECTED_NAME_BYTES
+        )
+        rejected_root, root_truncated = _truncate_manifest_text(
+            skill.candidate.root, _MAX_REJECTED_ROOT_BYTES
+        )
+        reason_codes = sorted(reason.code.value for reason in skill.reasons)
+        for value in (
+            skill.candidate_id,
+            rejected_name or "",
+            skill.classification.value,
+            rejected_root or "",
+            *reason_codes,
+        ):
+            budget.charge(value)
+        rejected_summary.append(
+            {
+                "candidateId": skill.candidate_id,
+                "name": rejected_name,
+                "nameTruncated": name_truncated,
+                "classification": skill.classification.value,
+                "originalRoot": rejected_root,
+                "originalRootTruncated": root_truncated,
+                "reasonCodes": reason_codes,
+            }
+        )
+    manifest: dict[str, object] = {
         "schemaVersion": "1.0",
+        "source": {
+            "canonicalSourceUrl": canonical_url,
+            "resolvedCommitSha": resolved_commit_sha,
+            "snapshotSha256": snapshot_sha256,
+        },
         "imported": imported,
         "rejected": rejected_summary,
     }
+    _validate_manifest_size(manifest, limits.max_manifest_bytes)
+    return manifest
 
 
-def build_import_plan(report: ScanReport) -> ImportPlan:
+def build_import_plan(report: ScanReport, limits: Limits | None = None) -> ImportPlan:
     """Build a deterministic, pure, exact partition of one scan report."""
+    effective_limits = limits or Limits()
     selected = tuple(
         sorted(
             (skill for skill in report.skills if skill.classification is Classification.PORTABLE),
@@ -317,7 +463,13 @@ def build_import_plan(report: ScanReport) -> ImportPlan:
         selected=selected,
         rejected=rejected,
         records=records,
-        manifest_payload=_build_manifest(selected, rejected, records),
+        manifest_payload=_build_manifest(
+            report.source,
+            selected,
+            rejected,
+            records,
+            effective_limits,
+        ),
     )
 
 
@@ -332,12 +484,42 @@ class _OutputHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class _CreatedEntry:
+    path: tuple[str, ...]
+    kind: str
+    device: int
+    inode: int
+    link_count: int
+    symlink_target: str | None = None
+
+
+@dataclass(slots=True)
+class _CreationLedger:
+    entries: list[_CreatedEntry]
+    _entries_by_path: dict[tuple[str, ...], _CreatedEntry] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+
+    def record(self, entry: _CreatedEntry) -> None:
+        if entry.path in self._entries_by_path:
+            raise ImporterError("COPY_FAILED", "destination path was created more than once")
+        self.entries.append(entry)
+        self._entries_by_path[entry.path] = entry
+
+    def by_path(self) -> Mapping[tuple[str, ...], _CreatedEntry]:
+        return self._entries_by_path
+
+
+@dataclass(frozen=True, slots=True)
 class _StagingHandle:
     name: str
     path: Path
     file_fd: int
     device: int
     inode: int
+    ledger: _CreationLedger
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +527,59 @@ class _Payload:
     record: ImportRecord
     representative: AnalyzedSkill
     entries: tuple[tuple[str, InventoryEntry], ...]
+
+
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_verified_child_directory(parent_fd: int, name: str) -> int:
+    child_fd = -1
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode):
+            raise OSError(errno.ENOTDIR, "path component is not a directory")
+        child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+        opened = os.fstat(child_fd)
+        if not stat.S_ISDIR(opened.st_mode) or (before.st_dev, before.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            raise OSError(errno.ESTALE, "directory changed while being opened")
+        return child_fd
+    except BaseException:
+        if child_fd >= 0:
+            with suppress(OSError):
+                os.close(child_fd)
+        raise
+
+
+def _open_absolute_directory(path: Path) -> int:
+    if not path.is_absolute():
+        raise OSError(errno.EINVAL, "directory path must be absolute")
+    current_fd = -1
+    try:
+        current_fd = os.open(path.anchor, _directory_open_flags())
+        root_stat = os.fstat(current_fd)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise OSError(errno.ENOTDIR, "filesystem root is not a directory")
+        for part in path.parts[1:]:
+            next_fd = _open_verified_child_directory(current_fd, part)
+            previous_fd = current_fd
+            current_fd = next_fd
+            try:
+                os.close(previous_fd)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(current_fd)
+                current_fd = -1
+                raise
+        return current_fd
+    except BaseException:
+        if current_fd >= 0:
+            with suppress(OSError):
+                os.close(current_fd)
+        raise
 
 
 def _lstat_at(directory_fd: int, name: str) -> os.stat_result | None:
@@ -355,9 +590,18 @@ def _lstat_at(directory_fd: int, name: str) -> os.stat_result | None:
 
 
 def _prepare_output(out: Path) -> _OutputHandle:
-    requested = out.expanduser()
+    try:
+        requested = out.expanduser()
+    except (OSError, RuntimeError) as exc:
+        raise ImporterError("UNSAFE_OUTPUT", "output path could not be expanded safely") from exc
     output_name = requested.name
-    if not output_name or output_name in {".", ".."} or "\x00" in output_name:
+    if (
+        not output_name
+        or output_name in {".", ".."}
+        or "\x00" in output_name
+        or "/" in output_name
+        or "\\" in output_name
+    ):
         raise ImporterError("UNSAFE_OUTPUT", "output must have a safe basename")
     try:
         parent_path = requested.parent.resolve(strict=True)
@@ -365,60 +609,192 @@ def _prepare_output(out: Path) -> _OutputHandle:
         raise ImporterError(
             "OUTPUT_PARENT_UNAVAILABLE", "output parent directory is unavailable"
         ) from exc
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = -1
     try:
-        parent_fd = os.open(parent_path, flags)
+        parent_fd = _open_absolute_directory(parent_path)
         parent_stat = os.fstat(parent_fd)
-    except OSError as exc:
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise OSError(errno.ENOTDIR, "output parent is not a directory")
+        if _lstat_at(parent_fd, output_name) is not None:
+            raise ImporterError("OUTPUT_EXISTS", "output path already exists")
+        handle = _OutputHandle(
+            parent_path=parent_path,
+            output_path=parent_path / output_name,
+            output_name=output_name,
+            parent_fd=parent_fd,
+            parent_device=parent_stat.st_dev,
+            parent_inode=parent_stat.st_ino,
+        )
+        parent_fd = -1
+        return handle
+    except ImporterError:
+        raise
+    except (OSError, RuntimeError) as exc:
         raise ImporterError(
             "OUTPUT_PARENT_UNAVAILABLE", "output parent directory is unavailable"
         ) from exc
-    if not stat.S_ISDIR(parent_stat.st_mode):
-        os.close(parent_fd)
-        raise ImporterError("OUTPUT_PARENT_UNAVAILABLE", "output parent is not a directory")
-    if _lstat_at(parent_fd, output_name) is not None:
-        os.close(parent_fd)
-        raise ImporterError("OUTPUT_EXISTS", "output path already exists")
-    return _OutputHandle(
-        parent_path=parent_path,
-        output_path=parent_path / output_name,
-        output_name=output_name,
-        parent_fd=parent_fd,
-        parent_device=parent_stat.st_dev,
-        parent_inode=parent_stat.st_ino,
-    )
+    finally:
+        if parent_fd >= 0:
+            with suppress(OSError):
+                os.close(parent_fd)
 
 
-def _path_contains(root: Path, candidate: Path) -> bool:
+def _directory_identity(path: Path, error_code: str, message: str) -> tuple[int, int]:
+    directory_fd = -1
     try:
-        candidate.relative_to(root)
-    except ValueError:
-        return False
-    return True
+        resolved = path.resolve(strict=True)
+        directory_fd = _open_absolute_directory(resolved)
+        current = os.fstat(directory_fd)
+        if not stat.S_ISDIR(current.st_mode):
+            raise OSError(errno.ENOTDIR, "path is not a directory")
+        return current.st_dev, current.st_ino
+    except (OSError, RuntimeError) as exc:
+        raise ImporterError(error_code, message) from exc
+    finally:
+        if directory_fd >= 0:
+            with suppress(OSError):
+                os.close(directory_fd)
+
+
+def _directory_ancestry_intersects(
+    directory_fd: int,
+    forbidden: set[tuple[int, int]],
+) -> bool:
+    current_fd = -1
+    seen: set[tuple[int, int]] = set()
+    try:
+        current_fd = os.dup(directory_fd)
+        for _ in range(1024):
+            current = os.fstat(current_fd)
+            identity = (current.st_dev, current.st_ino)
+            if identity in forbidden:
+                return True
+            if identity in seen:
+                raise OSError(errno.ELOOP, "directory ancestry contains a cycle")
+            seen.add(identity)
+            parent_fd = _open_verified_child_directory(current_fd, "..")
+            try:
+                parent = os.fstat(parent_fd)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(parent_fd)
+                raise
+            parent_identity = (parent.st_dev, parent.st_ino)
+            previous_fd = current_fd
+            current_fd = parent_fd
+            try:
+                os.close(previous_fd)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(current_fd)
+                current_fd = -1
+                raise
+            if parent_identity == identity:
+                return False
+        raise OSError(errno.ELOOP, "directory ancestry exceeds the safe limit")
+    finally:
+        if current_fd >= 0:
+            with suppress(OSError):
+                os.close(current_fd)
 
 
 def _validate_output_relationships(
     spec: SourceSpec,
     operation: ScanOperation,
-    output_path: Path,
+    output: _OutputHandle,
 ) -> None:
-    roots = [operation.resolved.snapshot_root.resolve()]
+    forbidden = {
+        _directory_identity(
+            operation.resolved.snapshot_root,
+            "SOURCE_CHANGED",
+            "source snapshot is unavailable for output validation",
+        )
+    }
     if spec.kind is SourceKind.LOCAL:
         try:
-            roots.append(Path(spec.value).expanduser().resolve(strict=True))
+            local_path = Path(spec.value).expanduser()
         except (OSError, RuntimeError) as exc:
             raise ImporterError("SOURCE_UNAVAILABLE", "local source path is unavailable") from exc
-    for root in roots:
-        if _path_contains(root, output_path) or _path_contains(output_path, root):
-            raise ImporterError(
-                "UNSAFE_OUTPUT",
-                "output cannot overlap the source or operation snapshot",
+        forbidden.add(
+            _directory_identity(
+                local_path,
+                "SOURCE_UNAVAILABLE",
+                "local source path is unavailable",
             )
+        )
+    try:
+        overlaps = _directory_ancestry_intersects(output.parent_fd, forbidden)
+    except OSError as exc:
+        raise ImporterError(
+            "OUTPUT_PARENT_CHANGED", "output parent ancestry could not be verified"
+        ) from exc
+    if overlaps:
+        raise ImporterError(
+            "UNSAFE_OUTPUT",
+            "output cannot overlap the source or operation snapshot",
+        )
+
+
+def _remove_empty_owned_directory(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int] | None,
+) -> None:
+    """Best-effort removal of one known-empty directory without following replacements."""
+    if identity is None:
+        return
+    current = _lstat_at(parent_fd, name)
+    if (
+        current is None
+        or not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != identity
+    ):
+        return
+    opened_fd = -1
+    verification_fd = -1
+    try:
+        opened_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+        # A duplicated descriptor also makes injected failures tied to the raw
+        # open descriptor unable to turn a cleanup attempt into an fd leak.
+        verification_fd = os.dup(opened_fd)
+        os.close(opened_fd)
+        opened_fd = -1
+        opened = os.fstat(verification_fd)
+        if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != identity:
+            return
+        with os.scandir(verification_fd) as iterator:
+            if next(iterator, None) is not None:
+                return
+        final = _lstat_at(parent_fd, name)
+        if (
+            final is None
+            or not stat.S_ISDIR(final.st_mode)
+            or (final.st_dev, final.st_ino) != identity
+        ):
+            return
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        return
+    finally:
+        for file_fd in (verification_fd, opened_fd):
+            if file_fd >= 0:
+                with suppress(OSError):
+                    os.close(file_fd)
+
+
+def _recover_created_directory_identity(parent_fd: int, name: str) -> tuple[int, int] | None:
+    """Recover an identity only when a one-shot post-mkdir observation failed."""
+    try:
+        current = _lstat_at(parent_fd, name)
+    except OSError:
+        return None
+    if current is None or not stat.S_ISDIR(current.st_mode):
+        return None
+    return current.st_dev, current.st_ino
 
 
 def _create_staging(output: _OutputHandle) -> _StagingHandle:
     prefix = f".{output.output_name[:48]}.skill-importer-"
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     for _ in range(64):
         name = f"{prefix}{secrets.token_hex(16)}"
         try:
@@ -429,22 +805,40 @@ def _create_staging(output: _OutputHandle) -> _StagingHandle:
             raise ImporterError(
                 "STAGING_CREATE_FAILED", "staging directory could not be created"
             ) from exc
+
+        file_fd = -1
+        owned_identity: tuple[int, int] | None = None
         try:
-            file_fd = os.open(name, flags, dir_fd=output.parent_fd)
-            os.fchmod(file_fd, 0o700)
-            current = os.fstat(file_fd)
-            if not stat.S_ISDIR(current.st_mode):
+            created = _lstat_at(output.parent_fd, name)
+            if created is None or not stat.S_ISDIR(created.st_mode):
                 raise ImporterError("STAGING_CHANGED", "staging path is not a directory")
+            owned_identity = (created.st_dev, created.st_ino)
+            file_fd = os.open(name, _directory_open_flags(), dir_fd=output.parent_fd)
+            opened = os.fstat(file_fd)
+            if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != owned_identity:
+                raise ImporterError("STAGING_CHANGED", "staging directory identity changed")
+            os.fchmod(file_fd, 0o700)
             return _StagingHandle(
                 name=name,
                 path=output.parent_path / name,
                 file_fd=file_fd,
-                device=current.st_dev,
-                inode=current.st_ino,
+                device=opened.st_dev,
+                inode=opened.st_ino,
+                ledger=_CreationLedger([]),
             )
-        except BaseException:
-            with suppress(OSError):
-                os.rmdir(name, dir_fd=output.parent_fd)
+        except BaseException as exc:
+            if file_fd >= 0:
+                with suppress(OSError):
+                    os.close(file_fd)
+            if owned_identity is None:
+                owned_identity = _recover_created_directory_identity(output.parent_fd, name)
+            _remove_empty_owned_directory(output.parent_fd, name, owned_identity)
+            if isinstance(exc, ImporterError):
+                raise
+            if isinstance(exc, OSError):
+                raise ImporterError(
+                    "STAGING_CREATE_FAILED", "staging directory could not be initialized"
+                ) from exc
             raise
     raise ImporterError("STAGING_CREATE_FAILED", "a unique staging directory could not be created")
 
@@ -561,11 +955,65 @@ def _source_parent_fd(snapshot_fd: int, repository_path: str) -> tuple[int, str]
         raise ImporterError("SOURCE_CHANGED", "source directory changed during import") from exc
 
 
-def _destination_parent_fd(staging_fd: int, parts: Sequence[str]) -> tuple[int, str]:
+def _entry_stat_matches(entry: _CreatedEntry, current: os.stat_result) -> bool:
+    return (
+        _kind_from_mode(current.st_mode) == entry.kind
+        and (current.st_dev, current.st_ino) == (entry.device, entry.inode)
+        and (entry.kind == "directory" or current.st_nlink == entry.link_count == 1)
+    )
+
+
+def _open_ledger_directory_chain(
+    staging_fd: int,
+    parts: Sequence[str],
+    ledger: _CreationLedger,
+) -> int:
+    current_fd = os.dup(staging_fd)
+    entries = ledger.by_path()
+    traversed: tuple[str, ...] = ()
+    try:
+        for part in parts:
+            traversed = (*traversed, part)
+            expected = entries.get(traversed)
+            if expected is None or expected.kind != "directory":
+                raise OSError(errno.ESTALE, "destination directory is absent from the ledger")
+            before = os.stat(part, dir_fd=current_fd, follow_symlinks=False)
+            if not _entry_stat_matches(expected, before):
+                raise OSError(errno.ESTALE, "destination directory identity changed")
+            next_fd = os.open(part, _directory_open_flags(), dir_fd=current_fd)
+            try:
+                opened = os.fstat(next_fd)
+                if not _entry_stat_matches(expected, opened):
+                    raise OSError(errno.ESTALE, "destination directory changed while opening")
+            except BaseException:
+                with suppress(OSError):
+                    os.close(next_fd)
+                raise
+            previous_fd = current_fd
+            current_fd = next_fd
+            try:
+                os.close(previous_fd)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(current_fd)
+                current_fd = -1
+                raise
+        return current_fd
+    except BaseException:
+        with suppress(OSError):
+            os.close(current_fd)
+        raise
+
+
+def _destination_parent_fd(
+    staging_fd: int,
+    parts: Sequence[str],
+    ledger: _CreationLedger,
+) -> tuple[int, str]:
     if not parts:
         raise ImporterError("COPY_FAILED", "destination entry path is invalid")
     try:
-        return _open_directory_chain(staging_fd, parts[:-1]), parts[-1]
+        return _open_ledger_directory_chain(staging_fd, parts[:-1], ledger), parts[-1]
     except OSError as exc:
         raise ImporterError("COPY_FAILED", "staging directory changed during import") from exc
 
@@ -645,6 +1093,7 @@ def _fsync_directory(file_fd: int) -> None:
 def _copy_regular_file(
     snapshot_fd: int,
     staging_fd: int,
+    ledger: _CreationLedger,
     source_path: str,
     destination_parts: Sequence[str],
     entry: InventoryEntry,
@@ -669,7 +1118,9 @@ def _copy_regular_file(
         if _regular_signature(pre_open) != _regular_signature(opened):
             raise ImporterError("SOURCE_CHANGED", "source file changed before it was opened")
 
-        destination_parent, destination_name = _destination_parent_fd(staging_fd, destination_parts)
+        destination_parent, destination_name = _destination_parent_fd(
+            staging_fd, destination_parts, ledger
+        )
         output_mode = 0o700 if entry.executable else 0o600
         destination_file = os.open(
             destination_name,
@@ -677,6 +1128,24 @@ def _copy_regular_file(
             output_mode,
             dir_fd=destination_parent,
         )
+        destination_opened = os.fstat(destination_file)
+        if not stat.S_ISREG(destination_opened.st_mode) or destination_opened.st_nlink != 1:
+            raise ImporterError("COPY_FAILED", "new destination file has an unsafe identity")
+        created_entry = _CreatedEntry(
+            path=tuple(destination_parts),
+            kind="file",
+            device=destination_opened.st_dev,
+            inode=destination_opened.st_ino,
+            link_count=destination_opened.st_nlink,
+        )
+        ledger.record(created_entry)
+        destination_path_stat = os.stat(
+            destination_name,
+            dir_fd=destination_parent,
+            follow_symlinks=False,
+        )
+        if not _entry_stat_matches(created_entry, destination_path_stat):
+            raise ImporterError("COPY_FAILED", "destination file changed while being created")
         os.fchmod(destination_file, output_mode)
         digest = hashlib.sha256()
         copied = 0
@@ -815,6 +1284,7 @@ def _validate_symlink_chain(
 def _copy_symlink(
     snapshot_fd: int,
     staging_fd: int,
+    ledger: _CreationLedger,
     payload: _Payload,
     relative_path: str,
     entry: InventoryEntry,
@@ -841,10 +1311,40 @@ def _copy_symlink(
             raise ImporterError("SYMLINK_CHANGED", "symlink target changed during import")
         _normalize_symlink_target(relative_path, target)
         _validate_symlink_chain(snapshot_fd, payload, relative_path)
-        destination_parent, destination_name = _destination_parent_fd(staging_fd, destination_parts)
+        destination_parent, destination_name = _destination_parent_fd(
+            staging_fd, destination_parts, ledger
+        )
         os.symlink(target, destination_name, dir_fd=destination_parent)
-        if os.readlink(destination_name, dir_fd=destination_parent) != target:
+        destination_before = os.stat(
+            destination_name,
+            dir_fd=destination_parent,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISLNK(destination_before.st_mode):
+            raise ImporterError("COPY_FAILED", "destination symlink changed kind")
+        destination_target = os.readlink(destination_name, dir_fd=destination_parent)
+        destination_after = os.stat(
+            destination_name,
+            dir_fd=destination_parent,
+            follow_symlinks=False,
+        )
+        if destination_target != target or (
+            destination_before.st_dev,
+            destination_before.st_ino,
+            destination_before.st_mode,
+        ) != (destination_after.st_dev, destination_after.st_ino, destination_after.st_mode):
             raise ImporterError("COPY_FAILED", "destination symlink verification failed")
+        created_entry = _CreatedEntry(
+            path=tuple(destination_parts),
+            kind="symlink",
+            device=destination_before.st_dev,
+            inode=destination_before.st_ino,
+            link_count=destination_before.st_nlink,
+            symlink_target=target,
+        )
+        if not _entry_stat_matches(created_entry, destination_after):
+            raise ImporterError("COPY_FAILED", "destination symlink identity changed")
+        ledger.record(created_entry)
     except ImporterError:
         raise
     except OSError as exc:
@@ -862,12 +1362,30 @@ def _validate_source_directory(snapshot_fd: int, repository_path: str) -> None:
         raise ImporterError("SOURCE_CHANGED", "source directory changed during import")
 
 
-def _create_destination_directory(staging_fd: int, parts: Sequence[str]) -> None:
-    parent_fd, name = _destination_parent_fd(staging_fd, parts)
+def _create_destination_directory(
+    staging_fd: int,
+    ledger: _CreationLedger,
+    parts: Sequence[str],
+) -> None:
+    parent_fd, name = _destination_parent_fd(staging_fd, parts, ledger)
     child_fd = -1
     try:
         os.mkdir(name, 0o700, dir_fd=parent_fd)
-        child_fd = _open_directory_chain(parent_fd, (name,))
+        created = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(created.st_mode):
+            raise ImporterError("COPY_FAILED", "new destination directory changed kind")
+        created_entry = _CreatedEntry(
+            path=tuple(parts),
+            kind="directory",
+            device=created.st_dev,
+            inode=created.st_ino,
+            link_count=created.st_nlink,
+        )
+        child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+        opened = os.fstat(child_fd)
+        if not _entry_stat_matches(created_entry, opened):
+            raise ImporterError("COPY_FAILED", "destination directory identity changed")
+        ledger.record(created_entry)
         os.fchmod(child_fd, 0o700)
     except ImporterError:
         raise
@@ -884,6 +1402,7 @@ def _copy_payloads(
     operation: ScanOperation,
     payloads: Sequence[_Payload],
     staging_fd: int,
+    ledger: _CreationLedger,
     limits: Limits,
     observer: Callable[[InventoryEntry], None] | None,
 ) -> tuple[tuple[str, ...], ...]:
@@ -902,7 +1421,7 @@ def _copy_payloads(
             )
             root_fd = _open_directory_chain(snapshot_fd, root_parts)
             os.close(root_fd)
-            _create_destination_directory(staging_fd, (payload.record.destination,))
+            _create_destination_directory(staging_fd, ledger, (payload.record.destination,))
             created_directories.append((payload.record.destination,))
             for relative_path, entry in payload.entries:
                 destination_parts = (
@@ -912,12 +1431,13 @@ def _copy_payloads(
                 source_path = _repo_path(payload.representative.candidate.root, relative_path)
                 if entry.kind == "directory":
                     _validate_source_directory(snapshot_fd, source_path)
-                    _create_destination_directory(staging_fd, destination_parts)
+                    _create_destination_directory(staging_fd, ledger, destination_parts)
                     created_directories.append(tuple(destination_parts))
                 elif entry.kind == "file":
                     _copy_regular_file(
                         snapshot_fd,
                         staging_fd,
+                        ledger,
                         source_path,
                         destination_parts,
                         entry,
@@ -928,6 +1448,7 @@ def _copy_payloads(
                     _copy_symlink(
                         snapshot_fd,
                         staging_fd,
+                        ledger,
                         payload,
                         relative_path,
                         entry,
@@ -944,7 +1465,11 @@ def _copy_payloads(
     return tuple(created_directories)
 
 
-def _write_manifest(staging_fd: int, manifest_bytes: bytes) -> None:
+def _write_manifest(
+    staging_fd: int,
+    ledger: _CreationLedger,
+    manifest_bytes: bytes,
+) -> None:
     file_fd = -1
     try:
         file_fd = os.open(
@@ -953,6 +1478,24 @@ def _write_manifest(staging_fd: int, manifest_bytes: bytes) -> None:
             0o600,
             dir_fd=staging_fd,
         )
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ImporterError("MANIFEST_WRITE_FAILED", "manifest has an unsafe identity")
+        created_entry = _CreatedEntry(
+            path=("import-manifest.json",),
+            kind="file",
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            link_count=opened.st_nlink,
+        )
+        ledger.record(created_entry)
+        created = os.stat(
+            "import-manifest.json",
+            dir_fd=staging_fd,
+            follow_symlinks=False,
+        )
+        if not _entry_stat_matches(created_entry, created):
+            raise ImporterError("MANIFEST_WRITE_FAILED", "manifest identity changed")
         os.fchmod(file_fd, 0o600)
         _write_all(file_fd, manifest_bytes)
         _fsync_file(file_fd)
@@ -981,100 +1524,224 @@ def _fsync_created_directories(staging_fd: int, directories: Sequence[tuple[str,
     _fsync_directory(staging_fd)
 
 
-def _manifest_bytes(plan: ImportPlan) -> bytes:
-    def allowlisted_json(value: object) -> object:
-        if isinstance(value, Mapping):
-            return {key: allowlisted_json(item) for key, item in value.items()}
-        if isinstance(value, tuple):
-            return [allowlisted_json(item) for item in value]
-        return value
+def _manifest_bytes(plan: ImportPlan, max_bytes: int) -> bytes:
+    """Encode frozen allowlisted metadata without materializing a thawed JSON graph."""
+    encoded = bytearray()
 
-    try:
-        encoded = json.dumps(
-            allowlisted_json(plan.manifest_payload),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise ImporterError("INVALID_IMPORT_PLAN", "import manifest is not canonical JSON") from exc
-    return encoded + b"\n"
+    def append(chunk: bytes) -> None:
+        if len(encoded) + len(chunk) > max_bytes:
+            raise ImporterError("MANIFEST_TOO_LARGE", "import manifest exceeds the byte limit")
+        encoded.extend(chunk)
+
+    if max_bytes <= 0:
+        raise ImporterError("MANIFEST_TOO_LARGE", "import manifest exceeds the byte limit")
+    _canonical_json_encode(plan.manifest_payload, append)
+    append(b"\n")
+    return bytes(encoded)
 
 
-def _remove_directory_contents(directory_fd: int) -> None:
-    with os.scandir(directory_fd) as iterator:
-        names = sorted(entry.name for entry in iterator)
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    for name in names:
-        try:
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISDIR(current.st_mode):
-            child_fd = os.open(name, flags, dir_fd=directory_fd)
-            try:
-                _remove_directory_contents(child_fd)
-            finally:
-                os.close(child_fd)
-            os.rmdir(name, dir_fd=directory_fd)
-        else:
-            os.unlink(name, dir_fd=directory_fd)
-
-
-def _cleanup_staging(
-    parent_fd: int,
-    staging_name: str,
-    expected_device: int,
-    expected_inode: int,
-) -> None:
-    current = _lstat_at(parent_fd, staging_name)
-    if current is None:
-        return
+def _open_staging_for_cleanup(parent_fd: int, staging: _StagingHandle) -> int:
+    expected = (staging.device, staging.inode)
+    before = _lstat_at(parent_fd, staging.name)
     if (
-        not stat.S_ISDIR(current.st_mode)
-        or current.st_dev != expected_device
-        or current.st_ino != expected_inode
+        before is None
+        or not stat.S_ISDIR(before.st_mode)
+        or (before.st_dev, before.st_ino) != expected
+        or stat.S_IMODE(before.st_mode) != 0o700
     ):
-        return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    staging_fd = os.open(staging_name, flags, dir_fd=parent_fd)
+        raise OSError(errno.ESTALE, "staging directory identity changed")
+    staging_fd = -1
     try:
+        staging_fd = os.open(staging.name, _directory_open_flags(), dir_fd=parent_fd)
         opened = os.fstat(staging_fd)
-        if opened.st_dev != expected_device or opened.st_ino != expected_inode:
-            return
-        _remove_directory_contents(staging_fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != expected
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise OSError(errno.ESTALE, "staging directory changed while opening")
+        return staging_fd
+    except BaseException:
+        if staging_fd >= 0:
+            with suppress(OSError):
+                os.close(staging_fd)
+        raise
+
+
+def _directory_names(directory_fd: int) -> set[str]:
+    with os.scandir(directory_fd) as iterator:
+        return {entry.name for entry in iterator}
+
+
+def _ledger_child_sets(
+    entries: Mapping[tuple[str, ...], _CreatedEntry],
+) -> dict[tuple[str, ...], set[str]]:
+    children: dict[tuple[str, ...], set[str]] = {(): set()}
+    for entry in entries.values():
+        if entry.kind == "directory":
+            children[entry.path] = set()
+    for entry in entries.values():
+        if not entry.path or entry.path[:-1] not in children:
+            raise OSError(errno.ESTALE, "ledger directory ancestry is incomplete")
+        children[entry.path[:-1]].add(entry.path[-1])
+    return children
+
+
+def _validate_ledger_entry(
+    staging_fd: int,
+    ledger: _CreationLedger,
+    entry: _CreatedEntry,
+) -> None:
+    parent_fd = _open_ledger_directory_chain(staging_fd, entry.path[:-1], ledger)
+    opened_fd = -1
+    try:
+        name = entry.path[-1]
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _entry_stat_matches(entry, before):
+            raise OSError(errno.ESTALE, "ledger entry identity changed")
+        if entry.kind == "directory":
+            opened_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+            opened = os.fstat(opened_fd)
+            if not _entry_stat_matches(entry, opened):
+                raise OSError(errno.ESTALE, "ledger directory changed while opening")
+        elif entry.kind == "file":
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            opened_fd = os.open(name, flags, dir_fd=parent_fd)
+            opened = os.fstat(opened_fd)
+            if not _entry_stat_matches(entry, opened):
+                raise OSError(errno.ESTALE, "ledger file changed while opening")
+        elif entry.kind == "symlink":
+            target = os.readlink(name, dir_fd=parent_fd)
+            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if target != entry.symlink_target or not _entry_stat_matches(entry, after):
+                raise OSError(errno.ESTALE, "ledger symlink changed while reading")
+        else:
+            raise OSError(errno.ESTALE, "ledger contains an unsupported entry")
+        after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _entry_stat_matches(entry, after):
+            raise OSError(errno.ESTALE, "ledger entry changed during validation")
+    finally:
+        if opened_fd >= 0:
+            with suppress(OSError):
+                os.close(opened_fd)
+        os.close(parent_fd)
+
+
+def _preflight_cleanup(staging_fd: int, ledger: _CreationLedger) -> None:
+    entries = ledger.by_path()
+    if len(entries) != len(ledger.entries):
+        raise OSError(errno.ESTALE, "ledger contains duplicate paths")
+    child_sets = _ledger_child_sets(entries)
+    for path, expected_names in sorted(child_sets.items(), key=lambda item: item[0]):
+        directory_fd = _open_ledger_directory_chain(staging_fd, path, ledger)
+        try:
+            if _directory_names(directory_fd) != expected_names:
+                raise OSError(errno.ESTALE, "staging child set differs from the ledger")
+        finally:
+            os.close(directory_fd)
+    for entry in sorted(entries.values(), key=lambda item: item.path):
+        _validate_ledger_entry(staging_fd, ledger, entry)
+
+
+def _delete_ledger_entry(
+    staging_fd: int,
+    ledger: _CreationLedger,
+    entry: _CreatedEntry,
+) -> None:
+    _validate_ledger_entry(staging_fd, ledger, entry)
+    parent_fd = _open_ledger_directory_chain(staging_fd, entry.path[:-1], ledger)
+    child_fd = -1
+    try:
+        name = entry.path[-1]
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not _entry_stat_matches(entry, current):
+            raise OSError(errno.ESTALE, "ledger entry changed before deletion")
+        if entry.kind == "directory":
+            child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+            opened = os.fstat(child_fd)
+            if not _entry_stat_matches(entry, opened) or _directory_names(child_fd):
+                raise OSError(errno.ESTALE, "ledger directory is not the expected empty directory")
+            os.close(child_fd)
+            child_fd = -1
+            final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _entry_stat_matches(entry, final):
+                raise OSError(errno.ESTALE, "ledger directory changed before rmdir")
+            os.rmdir(name, dir_fd=parent_fd)
+        elif entry.kind == "file":
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            child_fd = os.open(name, flags, dir_fd=parent_fd)
+            opened = os.fstat(child_fd)
+            if not _entry_stat_matches(entry, opened):
+                raise OSError(errno.ESTALE, "ledger file changed before unlink")
+            final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _entry_stat_matches(entry, final):
+                raise OSError(errno.ESTALE, "ledger entry changed before unlink")
+            os.unlink(name, dir_fd=parent_fd)
+        elif entry.kind == "symlink":
+            target = os.readlink(name, dir_fd=parent_fd)
+            final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if target != entry.symlink_target or not _entry_stat_matches(entry, final):
+                raise OSError(errno.ESTALE, "ledger symlink changed before unlink")
+            os.unlink(name, dir_fd=parent_fd)
+        else:  # pragma: no cover - rejected during preflight
+            raise OSError(errno.ESTALE, "ledger contains an unsupported entry")
+    finally:
+        if child_fd >= 0:
+            with suppress(OSError):
+                os.close(child_fd)
+        os.close(parent_fd)
+
+
+def _cleanup_staging(parent_fd: int, staging: _StagingHandle) -> None:
+    staging_fd = _open_staging_for_cleanup(parent_fd, staging)
+    try:
+        _preflight_cleanup(staging_fd, staging.ledger)
+        for entry in sorted(
+            staging.ledger.entries,
+            key=lambda item: (-len(item.path), item.path),
+        ):
+            _delete_ledger_entry(staging_fd, staging.ledger, entry)
+        if _directory_names(staging_fd):
+            raise OSError(errno.ESTALE, "staging directory is not empty after ledger cleanup")
     finally:
         os.close(staging_fd)
-    final = _lstat_at(parent_fd, staging_name)
+
+    final_fd = _open_staging_for_cleanup(parent_fd, staging)
+    try:
+        if _directory_names(final_fd):
+            raise OSError(errno.ESTALE, "staging directory changed before final removal")
+    finally:
+        os.close(final_fd)
+    final = _lstat_at(parent_fd, staging.name)
     if (
-        final is not None
-        and stat.S_ISDIR(final.st_mode)
-        and final.st_dev == expected_device
-        and final.st_ino == expected_inode
+        final is None
+        or not stat.S_ISDIR(final.st_mode)
+        or (final.st_dev, final.st_ino) != (staging.device, staging.inode)
+        or stat.S_IMODE(final.st_mode) != 0o700
     ):
-        os.rmdir(staging_name, dir_fd=parent_fd)
+        raise OSError(errno.ESTALE, "staging directory changed before final rmdir")
+    os.rmdir(staging.name, dir_fd=parent_fd)
 
 
 def _safe_cleanup_staging(output: _OutputHandle, staging: _StagingHandle) -> None:
     with suppress(BaseException):
-        _cleanup_staging(
-            output.parent_fd,
-            staging.name,
-            staging.device,
-            staging.inode,
-        )
+        _cleanup_staging(output.parent_fd, staging)
 
 
 def _verify_parent(output: _OutputHandle) -> None:
+    current_fd = -1
     try:
-        current = os.stat(output.parent_path, follow_symlinks=False)
-    except OSError as exc:
+        current_fd = _open_absolute_directory(output.parent_path)
+        current = os.fstat(current_fd)
+    except (OSError, RuntimeError) as exc:
         raise ImporterError("OUTPUT_PARENT_CHANGED", "output parent path changed") from exc
-    if (
-        not stat.S_ISDIR(current.st_mode)
-        or current.st_dev != output.parent_device
-        or current.st_ino != output.parent_inode
+    finally:
+        if current_fd >= 0:
+            with suppress(OSError):
+                os.close(current_fd)
+    if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (
+        output.parent_device,
+        output.parent_inode,
     ):
         raise ImporterError("OUTPUT_PARENT_CHANGED", "output parent path changed")
 
@@ -1121,25 +1788,26 @@ class SkillImporter:
         try:
             with self.pipeline.scan_operation(spec, options) as operation:
                 try:
-                    plan = build_import_plan(operation.report)
+                    plan = build_import_plan(operation.report, self.pipeline.limits)
                 except ValueError as exc:
                     raise ImporterError(
                         "INVALID_IMPORT_PLAN", "scan produced an invalid import plan"
                     ) from exc
-                manifest_bytes = _manifest_bytes(plan)
+                manifest_bytes = _manifest_bytes(plan, self.pipeline.limits.max_manifest_bytes)
                 payloads = _validate_copy_plan(operation, plan, self.pipeline.limits)
                 output = _prepare_output(out)
-                _validate_output_relationships(spec, operation, output.output_path)
+                _validate_output_relationships(spec, operation, output)
                 staging = _create_staging(output)
                 staging_fd_open = True
                 created_directories = _copy_payloads(
                     operation,
                     payloads,
                     staging.file_fd,
+                    staging.ledger,
                     self.pipeline.limits,
                     self.copy_observer,
                 )
-                _write_manifest(staging.file_fd, manifest_bytes)
+                _write_manifest(staging.file_fd, staging.ledger, manifest_bytes)
                 _fsync_created_directories(staging.file_fd, created_directories)
                 result = ImportResult(
                     output_path=output.output_path,
