@@ -1,0 +1,4 @@
+{
+  "name": "adjacent-plugin",
+  "runtime": "src/runtime.py"
+}

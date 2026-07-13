@@ -1,0 +1,5 @@
+{
+  "name": "github-blob-seed",
+  "runtime": "src/runtime.py",
+  "skills": ["skills/blob-skill", "skills/other"]
+}

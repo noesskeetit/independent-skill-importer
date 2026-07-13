@@ -1,0 +1,6 @@
+{
+  "name": "plugin-root-variable-fixture",
+  "scripts": {
+    "tool": "scripts/tool"
+  }
+}

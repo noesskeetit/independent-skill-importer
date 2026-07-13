@@ -1,0 +1,4 @@
+{
+  "name": "mixed-unproven-fixture",
+  "runtime": "src/runtime.py"
+}
