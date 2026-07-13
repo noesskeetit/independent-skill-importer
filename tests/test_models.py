@@ -88,6 +88,37 @@ def _analyzed_skill(snapshot_root: Path) -> AnalyzedSkill:
     )
 
 
+def _analyzed_skill_at(
+    snapshot_root: Path,
+    root: str,
+    *,
+    name: str,
+    content_hash: str = SHA256,
+) -> AnalyzedSkill:
+    source = _resolved_source(snapshot_root)
+    candidate = SkillCandidate(
+        candidate_id=model_module.build_candidate_id(source, root),
+        source=source,
+        root=root,
+        entrypoint=f"{root}/SKILL.md",
+        enclosing_boundary=None,
+    )
+    validation = ValidationResult(
+        valid=True,
+        name=name,
+        description="example",
+        frontmatter={"name": name, "description": "example"},
+    )
+    return AnalyzedSkill(
+        candidate=candidate,
+        validation=validation,
+        static_classification=Classification.PORTABLE,
+        classification=Classification.PORTABLE,
+        reasons=(_reason(),),
+        content_hash=content_hash,
+    )
+
+
 def _invalid_validation() -> ValidationResult:
     return ValidationResult(
         valid=False,
@@ -139,6 +170,7 @@ def test_reason_code_surface_contains_approved_poc_codes() -> None:
         "PLUGIN_OWNED_MCP_TOOL",
         "PLUGIN_COMMAND_REFERENCE",
         "PLUGIN_RUNTIME_FILE_REFERENCE",
+        "PLUGIN_RUNTIME_INSIDE_SKILL_ROOT",
         "REFERENCED_BY_PLUGIN_RUNTIME",
         "MISSING_LOCAL_RESOURCE",
         "DYNAMIC_REFERENCE_UNRESOLVED",
@@ -622,16 +654,9 @@ def test_fm_review_rejects_non_fm_classification() -> None:
 
 def test_scan_report_serializes_counts_conflicts_and_requirements(tmp_path: Path) -> None:
     skill = _analyzed_skill(tmp_path)
-    report = ScanReport(
-        source=skill.candidate.source,
-        skills=(skill,),
-        duplicates=(
-            DuplicateGroup(content_hash=SHA256, candidate_ids=(skill.candidate_id, "other")),
-        ),
-        name_conflicts=(
-            NameConflictGroup(name="x", candidate_ids=(skill.candidate_id, "other")),
-        ),
-    )
+    duplicate = DuplicateGroup(content_hash=SHA256, candidate_ids=(skill.candidate_id, "other"))
+    conflict = NameConflictGroup(name="x", candidate_ids=(skill.candidate_id, "other"))
+    report = ScanReport(source=skill.candidate.source, skills=(skill,))
 
     payload = report.to_dict()
     assert payload["schemaVersion"] == "1.0"
@@ -646,8 +671,54 @@ def test_scan_report_serializes_counts_conflicts_and_requirements(tmp_path: Path
     assert payload["skills"][0]["candidateId"] == skill.candidate_id
     assert payload["skills"][0]["contentHash"] == SHA256
     assert payload["skills"][0]["externalRequirements"]["binaries"] == ["git"]
-    assert payload["duplicates"][0]["candidateIds"] == [skill.candidate_id, "other"]
-    assert payload["nameConflicts"][0]["name"] == "x"
+    assert duplicate.to_dict()["candidateIds"] == sorted([skill.candidate_id, "other"])
+    assert conflict.to_dict()["name"] == "x"
+    assert duplicate.to_dict()["groupId"].startswith("sha256:")
+    assert conflict.to_dict()["groupId"].startswith("sha256:")
+
+
+def test_scan_report_rejects_duplicate_candidate_identity(tmp_path: Path) -> None:
+    skill = _analyzed_skill(tmp_path)
+
+    with pytest.raises(ValueError, match="candidate IDs"):
+        ScanReport(source=skill.candidate.source, skills=(skill, skill))
+
+
+def test_scan_report_rejects_group_member_missing_from_skills(tmp_path: Path) -> None:
+    skill = _analyzed_skill(tmp_path)
+    group = DuplicateGroup(content_hash=SHA256, candidate_ids=(skill.candidate_id, "other"))
+
+    with pytest.raises(ValueError, match="unknown candidate"):
+        ScanReport(source=skill.candidate.source, skills=(skill,), duplicates=(group,))
+
+
+def test_scan_report_rejects_dangling_skill_group_annotation(tmp_path: Path) -> None:
+    skill = replace(_analyzed_skill(tmp_path), duplicate_group=f"sha256:{SHA256}")
+
+    with pytest.raises(ValueError, match="duplicate group annotation"):
+        ScanReport(source=skill.candidate.source, skills=(skill,))
+
+
+def test_scan_report_rejects_annotation_for_nonmember_of_existing_group(tmp_path: Path) -> None:
+    first = _analyzed_skill_at(tmp_path, "skills/first", name="first")
+    second = _analyzed_skill_at(tmp_path, "skills/second", name="second")
+    unrelated = _analyzed_skill_at(
+        tmp_path, "skills/unrelated", name="unrelated", content_hash="b" * 64
+    )
+    group = DuplicateGroup(
+        content_hash=SHA256,
+        candidate_ids=(first.candidate_id, second.candidate_id),
+    )
+    first = replace(first, duplicate_group=group.group_id)
+    second = replace(second, duplicate_group=group.group_id)
+    unrelated = replace(unrelated, duplicate_group=group.group_id)
+
+    with pytest.raises(ValueError, match="duplicate group annotation"):
+        ScanReport(
+            source=first.candidate.source,
+            skills=(first, second, unrelated),
+            duplicates=(group,),
+        )
 
 
 def test_import_plan_serializes_destination_mapping(tmp_path: Path) -> None:

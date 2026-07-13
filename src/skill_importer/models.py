@@ -107,6 +107,7 @@ class ReasonCode(StrEnum):
     PLUGIN_OWNED_MCP_TOOL = "PLUGIN_OWNED_MCP_TOOL"
     PLUGIN_COMMAND_REFERENCE = "PLUGIN_COMMAND_REFERENCE"
     PLUGIN_RUNTIME_FILE_REFERENCE = "PLUGIN_RUNTIME_FILE_REFERENCE"
+    PLUGIN_RUNTIME_INSIDE_SKILL_ROOT = "PLUGIN_RUNTIME_INSIDE_SKILL_ROOT"
     REFERENCED_BY_PLUGIN_RUNTIME = "REFERENCED_BY_PLUGIN_RUNTIME"
     MISSING_LOCAL_RESOURCE = "MISSING_LOCAL_RESOURCE"
     DYNAMIC_REFERENCE_UNRESOLVED = "DYNAMIC_REFERENCE_UNRESOLVED"
@@ -281,6 +282,15 @@ def build_candidate_id(source: ResolvedSource, root: str) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
+    return f"sha256:{hashlib.sha256(identity).hexdigest()}"
+
+
+def _build_group_id(kind: str, key: str, candidate_ids: tuple[str, ...]) -> str:
+    identity = json.dumps(
+        [kind, key, list(candidate_ids)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return f"sha256:{hashlib.sha256(identity).hexdigest()}"
 
 
@@ -545,6 +555,10 @@ class AnalyzedSkill:
         self._validate_validation_classification()
         if self.content_hash is not None:
             _validate_sha256(self.content_hash, "content_hash")
+        if self.duplicate_group is not None:
+            _validate_sha256(self.duplicate_group, "duplicate_group", prefixed=True)
+        if self.name_conflict_group is not None:
+            _validate_sha256(self.name_conflict_group, "name_conflict_group", prefixed=True)
         if self.analysis_method not in {"static", "static+fm"}:
             raise ValueError("analysis method must be static or static+fm")
         if self.analysis_method == "static+fm" and self.fm_review is None:
@@ -646,15 +660,28 @@ class DuplicateGroup:
 
     content_hash: str
     candidate_ids: tuple[str, ...]
+    group_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         _validate_sha256(self.content_hash, "content_hash")
-        object.__setattr__(self, "candidate_ids", tuple(self.candidate_ids))
-        if len(set(self.candidate_ids)) < 2:
+        candidate_ids = tuple(sorted(self.candidate_ids))
+        object.__setattr__(self, "candidate_ids", candidate_ids)
+        if len(candidate_ids) != len(set(candidate_ids)) or len(candidate_ids) < 2:
             raise ValueError("duplicate group requires at least two distinct candidates")
+        if any(not candidate_id for candidate_id in candidate_ids):
+            raise ValueError("duplicate group candidate IDs must not be empty")
+        object.__setattr__(
+            self,
+            "group_id",
+            _build_group_id("duplicate", self.content_hash, candidate_ids),
+        )
 
     def to_dict(self) -> dict[str, object]:
-        return {"contentHash": self.content_hash, "candidateIds": list(self.candidate_ids)}
+        return {
+            "groupId": self.group_id,
+            "contentHash": self.content_hash,
+            "candidateIds": list(self.candidate_ids),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -663,16 +690,29 @@ class NameConflictGroup:
 
     name: str
     candidate_ids: tuple[str, ...]
+    group_id: str = field(init=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "candidate_ids", tuple(self.candidate_ids))
+        candidate_ids = tuple(sorted(self.candidate_ids))
+        object.__setattr__(self, "candidate_ids", candidate_ids)
         if not self.name:
             raise ValueError("name conflict group requires a non-empty name")
-        if len(set(self.candidate_ids)) < 2:
+        if len(candidate_ids) != len(set(candidate_ids)) or len(candidate_ids) < 2:
             raise ValueError("name conflict group requires at least two distinct candidates")
+        if any(not candidate_id for candidate_id in candidate_ids):
+            raise ValueError("name conflict group candidate IDs must not be empty")
+        object.__setattr__(
+            self,
+            "group_id",
+            _build_group_id("name-conflict", self.name, candidate_ids),
+        )
 
     def to_dict(self) -> dict[str, object]:
-        return {"name": self.name, "candidateIds": list(self.candidate_ids)}
+        return {
+            "groupId": self.group_id,
+            "name": self.name,
+            "candidateIds": list(self.candidate_ids),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -688,13 +728,70 @@ class ScanReport:
     schema_version: str = "1.0"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "skills", tuple(self.skills))
-        object.__setattr__(self, "duplicates", tuple(self.duplicates))
-        object.__setattr__(self, "name_conflicts", tuple(self.name_conflicts))
+        skills = tuple(
+            sorted(self.skills, key=lambda skill: (skill.candidate.root, skill.candidate_id))
+        )
+        duplicates = tuple(
+            sorted(self.duplicates, key=lambda group: (group.content_hash, group.group_id))
+        )
+        name_conflicts = tuple(
+            sorted(self.name_conflicts, key=lambda group: (group.name, group.group_id))
+        )
+        object.__setattr__(self, "skills", skills)
+        object.__setattr__(self, "duplicates", duplicates)
+        object.__setattr__(self, "name_conflicts", name_conflicts)
         object.__setattr__(self, "warnings", tuple(self.warnings))
         object.__setattr__(self, "errors", tuple(self.errors))
         if self.schema_version != "1.0":
             raise ValueError("unsupported scan report schema version")
+        self._validate_references()
+
+    def _validate_references(self) -> None:
+        skills_by_id = {skill.candidate_id: skill for skill in self.skills}
+        if len(skills_by_id) != len(self.skills):
+            raise ValueError("scan report candidate IDs must be unique")
+        if any(skill.candidate.source != self.source for skill in self.skills):
+            raise ValueError("scan report skills must share report source provenance")
+
+        duplicate_by_id = {group.group_id: group for group in self.duplicates}
+        conflict_by_id = {group.group_id: group for group in self.name_conflicts}
+        if len(duplicate_by_id) != len(self.duplicates):
+            raise ValueError("scan report duplicate group IDs must be unique")
+        if len(conflict_by_id) != len(self.name_conflicts):
+            raise ValueError("scan report name conflict group IDs must be unique")
+
+        for duplicate_group in self.duplicates:
+            for candidate_id in duplicate_group.candidate_ids:
+                duplicate_skill = skills_by_id.get(candidate_id)
+                if duplicate_skill is None:
+                    raise ValueError("duplicate group references an unknown candidate")
+                if duplicate_skill.content_hash != duplicate_group.content_hash:
+                    raise ValueError("duplicate group content hash does not match its candidate")
+                if duplicate_skill.duplicate_group != duplicate_group.group_id:
+                    raise ValueError("duplicate group annotation does not match its candidate")
+        for conflict_group in self.name_conflicts:
+            for candidate_id in conflict_group.candidate_ids:
+                conflict_skill = skills_by_id.get(candidate_id)
+                if conflict_skill is None:
+                    raise ValueError("name conflict group references an unknown candidate")
+                if conflict_skill.name != conflict_group.name:
+                    raise ValueError("name conflict group name does not match its candidate")
+                if conflict_skill.name_conflict_group != conflict_group.group_id:
+                    raise ValueError("name conflict group annotation does not match its candidate")
+
+        for skill in self.skills:
+            if skill.duplicate_group is not None:
+                annotated_duplicate_group = duplicate_by_id.get(skill.duplicate_group)
+                if (
+                    annotated_duplicate_group is None
+                    or skill.candidate_id not in annotated_duplicate_group.candidate_ids
+                ):
+                    raise ValueError("skill has a dangling duplicate group annotation")
+            if skill.name_conflict_group is not None and (
+                (annotated_conflict_group := conflict_by_id.get(skill.name_conflict_group)) is None
+                or skill.candidate_id not in annotated_conflict_group.candidate_ids
+            ):
+                raise ValueError("skill has a dangling name conflict group annotation")
 
     @property
     def counts(self) -> dict[str, int]:

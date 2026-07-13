@@ -780,7 +780,7 @@ def test_packaging_only_skill_registration_is_not_reverse_dependency(tmp_path: P
     assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
 
 
-def test_skill_root_equal_to_mixed_plugin_root_is_ambiguous(tmp_path: Path) -> None:
+def test_skill_root_equal_to_mixed_plugin_root_is_plugin_bound(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
         {
@@ -791,8 +791,8 @@ def test_skill_root_equal_to_mixed_plugin_root_is_ambiguous(tmp_path: Path) -> N
         root=".",
     )
 
-    assert result.classification is Classification.AMBIGUOUS
-    assert ReasonCode.MIXED_PLUGIN_AUTONOMY_UNPROVEN in result.reason_codes
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_RUNTIME_INSIDE_SKILL_ROOT in result.reason_codes
 
 
 def test_skill_root_equal_to_truly_skills_only_plugin_root_is_portable(tmp_path: Path) -> None:

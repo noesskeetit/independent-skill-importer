@@ -261,6 +261,7 @@ _BOUND_CODES = frozenset(
         ReasonCode.PLUGIN_OWNED_MCP_TOOL,
         ReasonCode.PLUGIN_COMMAND_REFERENCE,
         ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
+        ReasonCode.PLUGIN_RUNTIME_INSIDE_SKILL_ROOT,
         ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME,
         ReasonCode.MISSING_LOCAL_RESOURCE,
         ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
@@ -274,6 +275,9 @@ _MESSAGES = {
     ReasonCode.PLUGIN_OWNED_MCP_TOOL: "skill calls an MCP tool owned by the plugin",
     ReasonCode.PLUGIN_COMMAND_REFERENCE: "skill invokes a command owned by the plugin",
     ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE: "skill depends on plugin runtime or components",
+    ReasonCode.PLUGIN_RUNTIME_INSIDE_SKILL_ROOT: (
+        "skill payload contains a mixed plugin package and its runtime"
+    ),
     ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME: "plugin runtime references this skill",
     ReasonCode.MISSING_LOCAL_RESOURCE: "skill references a missing local resource",
     ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED: "skill contains a dynamic resource reference",
@@ -1630,6 +1634,19 @@ def analyze_static(
                 detector="static.validation.fail_closed",
             ),
         )
+
+    for boundary in boundaries:
+        if boundary.package_kind == "mixed" and _is_within(boundary.root, candidate.root):
+            collector.add(
+                ReasonCode.PLUGIN_RUNTIME_INSIDE_SKILL_ROOT,
+                Evidence(
+                    path=boundary.manifest_path,
+                    line=1,
+                    field="packageKind",
+                    value=boundary.package_kind,
+                    detector="static.payload.mixed_plugin",
+                ),
+            )
 
     owned = _derive_owned_components(candidate, inventory, boundaries)
     _analyze_symlinks(candidate, inventory, collector)
