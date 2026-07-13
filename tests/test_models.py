@@ -1,8 +1,11 @@
-from dataclasses import FrozenInstanceError
+import json
+from collections.abc import Mapping
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
 
+import skill_importer.models as model_module
 from skill_importer.errors import ImporterError
 from skill_importer.limits import Limits
 from skill_importer.models import (
@@ -62,7 +65,7 @@ def _reason(code: ReasonCode = ReasonCode.STANDALONE_NO_PLUGIN_BOUNDARY) -> Deci
 def _analyzed_skill(snapshot_root: Path) -> AnalyzedSkill:
     source = _resolved_source(snapshot_root)
     candidate = SkillCandidate(
-        candidate_id="candidate-1",
+        candidate_id=model_module.build_candidate_id(source, "skills/x"),
         source=source,
         root="skills/x",
         entrypoint="skills/x/SKILL.md",
@@ -168,6 +171,369 @@ def test_file_inventory_entry_requires_valid_sha256() -> None:
     assert entry.to_dict()["sha256"] == SHA256
 
 
+def test_candidate_id_builder_is_deterministic_for_source_revision_and_root(
+    tmp_path: Path,
+) -> None:
+    source = _resolved_source(tmp_path)
+
+    candidate_id = model_module.build_candidate_id(source, "skills/x")
+
+    assert candidate_id == model_module.build_candidate_id(source, "skills/x")
+    assert candidate_id.startswith("sha256:")
+    assert len(candidate_id) == len("sha256:") + 64
+    assert candidate_id != model_module.build_candidate_id(source, "skills/y")
+
+
+def test_candidate_rejects_id_not_derived_from_provenance_and_root(tmp_path: Path) -> None:
+    source = _resolved_source(tmp_path)
+
+    with pytest.raises(ValueError, match="candidate ID must match"):
+        SkillCandidate(
+            candidate_id="candidate-1",
+            source=source,
+            root="skills/x",
+            entrypoint="skills/x/SKILL.md",
+            enclosing_boundary=None,
+        )
+
+
+def test_candidate_root_must_be_entrypoint_direct_parent(tmp_path: Path) -> None:
+    source = _resolved_source(tmp_path)
+
+    with pytest.raises(ValueError, match="direct parent"):
+        SkillCandidate(
+            candidate_id=model_module.build_candidate_id(source, "."),
+            source=source,
+            root=".",
+            entrypoint="skills/x/SKILL.md",
+            enclosing_boundary=None,
+        )
+
+    root = "skills/x"
+    candidate = SkillCandidate(
+        candidate_id=model_module.build_candidate_id(source, root),
+        source=source,
+        root=root,
+        entrypoint="skills/x/SKILL.md",
+        enclosing_boundary=None,
+    )
+    assert candidate.root == root
+
+
+@pytest.mark.parametrize("kind", [SourceKind.GIT, SourceKind.GITHUB])
+def test_remote_resolved_source_requires_immutable_commit(kind: SourceKind, tmp_path: Path) -> None:
+    spec = SourceSpec(kind=kind, value="https://example.com/acme/repo.git")
+
+    with pytest.raises(ValueError, match="remote source requires"):
+        ResolvedSource(
+            spec=spec,
+            canonical_url="https://example.com/acme/repo.git",
+            snapshot_root=tmp_path,
+            snapshot_sha256=SHA256,
+            discovery_scope=".",
+            resolved_commit_sha=None,
+        )
+
+
+def test_local_source_revision_uses_snapshot_even_when_git_head_is_known(tmp_path: Path) -> None:
+    source = ResolvedSource(
+        spec=SourceSpec.local(tmp_path),
+        canonical_url=tmp_path.as_uri(),
+        snapshot_root=tmp_path,
+        snapshot_sha256=SHA256,
+        discovery_scope=".",
+        resolved_commit_sha="b" * 40,
+    )
+
+    assert source.revision == SHA256
+
+
+def test_import_plan_rejects_unverified_ambiguous_promotion(tmp_path: Path) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+
+    with pytest.raises(ValueError, match="ambiguous classification requires FM review"):
+        promoted = replace(
+            static_skill,
+            static_classification=Classification.AMBIGUOUS,
+            classification=Classification.PORTABLE,
+        )
+        ImportPlan(selected=(promoted,), rejected=(), records=())
+
+
+@pytest.mark.parametrize(
+    ("review_classification", "final_classification", "reason_code"),
+    [
+        (Classification.PLUGIN_BOUND, Classification.PORTABLE, ReasonCode.FM_PLUGIN_BOUND),
+        (Classification.PORTABLE, Classification.PLUGIN_BOUND, ReasonCode.FM_PORTABLE_VERIFIED),
+        (Classification.AMBIGUOUS, Classification.PLUGIN_BOUND, ReasonCode.FM_INVALID_RESPONSE),
+    ],
+)
+def test_final_classification_must_match_fm_review(
+    review_classification: Classification,
+    final_classification: Classification,
+    reason_code: ReasonCode,
+    tmp_path: Path,
+) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+    review = FmReview(
+        analysis_hash=f"sha256:{SHA256}",
+        classification=review_classification,
+        confidence=0.95,
+        reason=_reason(reason_code),
+        rationale="review",
+    )
+
+    with pytest.raises(ValueError, match="match FM review"):
+        replace(
+            static_skill,
+            static_classification=Classification.AMBIGUOUS,
+            classification=final_classification,
+            fm_review=review,
+            analysis_method="static+fm",
+            reasons=(review.reason,),
+        )
+
+
+def test_portable_fm_promotion_requires_confidence_threshold(tmp_path: Path) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+    review = FmReview(
+        analysis_hash=f"sha256:{SHA256}",
+        classification=Classification.PORTABLE,
+        confidence=0.89,
+        reason=_reason(ReasonCode.FM_PORTABLE_VERIFIED),
+        rationale="review",
+    )
+
+    with pytest.raises(ValueError, match="confidence"):
+        replace(
+            static_skill,
+            static_classification=Classification.AMBIGUOUS,
+            classification=Classification.PORTABLE,
+            fm_review=review,
+            analysis_method="static+fm",
+            reasons=(review.reason,),
+        )
+
+
+@pytest.mark.parametrize("missing_proof", ["evidence", "reason"])
+def test_portable_fm_promotion_requires_verified_reason_and_evidence(
+    missing_proof: str,
+    tmp_path: Path,
+) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+    reason = (
+        DecisionReason(
+            code=ReasonCode.FM_PORTABLE_VERIFIED,
+            message="review",
+            evidence=(),
+        )
+        if missing_proof == "evidence"
+        else _reason(ReasonCode.FM_INVALID_RESPONSE)
+    )
+    review = FmReview(
+        analysis_hash=f"sha256:{SHA256}",
+        classification=Classification.PORTABLE,
+        confidence=0.95,
+        reason=reason,
+        rationale="review",
+    )
+
+    with pytest.raises(ValueError, match="verified reason with evidence"):
+        replace(
+            static_skill,
+            static_classification=Classification.AMBIGUOUS,
+            classification=Classification.PORTABLE,
+            fm_review=review,
+            analysis_method="static+fm",
+            reasons=(review.reason,),
+        )
+
+
+def test_fm_reason_must_be_present_in_analyzed_reasons(tmp_path: Path) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+    review = FmReview(
+        analysis_hash=f"sha256:{SHA256}",
+        classification=Classification.PLUGIN_BOUND,
+        confidence=0.95,
+        reason=_reason(ReasonCode.FM_PLUGIN_BOUND),
+        rationale="review",
+    )
+
+    with pytest.raises(ValueError, match="FM reason"):
+        replace(
+            static_skill,
+            static_classification=Classification.AMBIGUOUS,
+            classification=Classification.PLUGIN_BOUND,
+            fm_review=review,
+            analysis_method="static+fm",
+            reasons=(_reason(ReasonCode.MIXED_PLUGIN_AUTONOMY_UNPROVEN),),
+        )
+
+
+def test_valid_fm_promotion_can_enter_import_plan(tmp_path: Path) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+    review = FmReview(
+        analysis_hash=f"sha256:{SHA256}",
+        classification=Classification.PORTABLE,
+        confidence=0.95,
+        reason=_reason(ReasonCode.FM_PORTABLE_VERIFIED),
+        rationale="review",
+    )
+    promoted = replace(
+        static_skill,
+        static_classification=Classification.AMBIGUOUS,
+        classification=Classification.PORTABLE,
+        fm_review=review,
+        analysis_method="static+fm",
+        reasons=(review.reason,),
+    )
+
+    plan = ImportPlan(selected=(promoted,), rejected=(), records=())
+
+    assert plan.selected == (promoted,)
+
+
+@pytest.mark.parametrize(
+    "context_reason",
+    [ReasonCode.FM_CONTEXT_TRUNCATED, ReasonCode.FM_CONTEXT_REDACTED],
+)
+def test_portable_fm_promotion_rejects_incomplete_context(
+    context_reason: ReasonCode,
+    tmp_path: Path,
+) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+    review = FmReview(
+        analysis_hash=f"sha256:{SHA256}",
+        classification=Classification.PORTABLE,
+        confidence=0.95,
+        reason=_reason(ReasonCode.FM_PORTABLE_VERIFIED),
+        rationale="review",
+    )
+
+    with pytest.raises(ValueError, match="unredacted context"):
+        replace(
+            static_skill,
+            static_classification=Classification.AMBIGUOUS,
+            classification=Classification.PORTABLE,
+            fm_review=review,
+            analysis_method="static+fm",
+            reasons=(review.reason, _reason(context_reason)),
+        )
+
+
+def test_import_plan_defensively_revalidates_portable_fm_promotion(tmp_path: Path) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+    review = FmReview(
+        analysis_hash=f"sha256:{SHA256}",
+        classification=Classification.PORTABLE,
+        confidence=0.95,
+        reason=_reason(ReasonCode.FM_PORTABLE_VERIFIED),
+        rationale="review",
+    )
+    promoted = replace(
+        static_skill,
+        static_classification=Classification.AMBIGUOUS,
+        classification=Classification.PORTABLE,
+        fm_review=review,
+        analysis_method="static+fm",
+        reasons=(review.reason,),
+    )
+    object.__setattr__(
+        promoted,
+        "reasons",
+        (*promoted.reasons, _reason(ReasonCode.FM_CONTEXT_REDACTED)),
+    )
+
+    with pytest.raises(ValueError, match="unredacted context"):
+        ImportPlan(selected=(promoted,), rejected=(), records=())
+
+
+def test_frontmatter_is_recursively_immutable_and_detached() -> None:
+    original = {
+        "name": "x",
+        "description": "example",
+        "requires": {"bins": ["git"]},
+    }
+    validation = ValidationResult(
+        valid=True,
+        name="x",
+        description="example",
+        frontmatter=original,
+    )
+
+    original["requires"]["bins"].append("docker")
+
+    assert validation.to_dict()["frontmatter"]["requires"]["bins"] == ["git"]
+    requires = validation.frontmatter["requires"]
+    assert isinstance(requires, Mapping)
+    with pytest.raises(TypeError):
+        requires["bins"] = ("docker",)  # type: ignore[index]
+
+
+def test_manifest_payload_is_recursively_immutable_and_detached(tmp_path: Path) -> None:
+    payload = {"metadata": {"tags": ["safe"]}}
+    plan = ImportPlan(
+        selected=(_analyzed_skill(tmp_path),),
+        rejected=(),
+        records=(),
+        manifest_payload=payload,
+    )
+
+    payload["metadata"]["tags"].append("mutated")
+
+    assert plan.to_dict()["manifest"] == {"metadata": {"tags": ["safe"]}}
+    metadata = plan.manifest_payload["metadata"]
+    assert isinstance(metadata, Mapping)
+    with pytest.raises(TypeError):
+        metadata["tags"] = ("mutated",)  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [object(), float("nan"), float("inf"), {1: "non-string-key"}],
+)
+def test_frontmatter_rejects_values_outside_strict_json_domain(value: object) -> None:
+    with pytest.raises(ValueError, match="JSON"):
+        ValidationResult(
+            valid=True,
+            name="x",
+            description="example",
+            frontmatter={"name": "x", "description": "example", "value": value},
+        )
+
+
+@pytest.mark.parametrize("value", [object(), float("-inf"), {1: "non-string-key"}])
+def test_manifest_rejects_values_outside_strict_json_domain(
+    value: object,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="JSON"):
+        ImportPlan(
+            selected=(_analyzed_skill(tmp_path),),
+            rejected=(),
+            records=(),
+            manifest_payload={"value": value},
+        )
+
+
+def test_nested_domain_serializers_return_plain_json_values(tmp_path: Path) -> None:
+    validation = ValidationResult(
+        valid=True,
+        name="x",
+        description="example",
+        frontmatter={"nested": {"items": [1, True, None]}},
+    )
+    plan = ImportPlan(
+        selected=(_analyzed_skill(tmp_path),),
+        rejected=(),
+        records=(),
+        manifest_payload={"nested": {"items": [1, True, None]}},
+    )
+
+    json.dumps(validation.to_dict(), allow_nan=False)
+    json.dumps(plan.to_dict(), allow_nan=False)
+
+
 def test_source_inventory_and_boundary_use_stable_json_names(tmp_path: Path) -> None:
     source = _resolved_source(tmp_path)
     inventory = Inventory(
@@ -205,8 +571,12 @@ def test_scan_report_serializes_counts_conflicts_and_requirements(tmp_path: Path
     report = ScanReport(
         source=skill.candidate.source,
         skills=(skill,),
-        duplicates=(DuplicateGroup(content_hash=SHA256, candidate_ids=("candidate-1", "other")),),
-        name_conflicts=(NameConflictGroup(name="x", candidate_ids=("candidate-1", "other")),),
+        duplicates=(
+            DuplicateGroup(content_hash=SHA256, candidate_ids=(skill.candidate_id, "other")),
+        ),
+        name_conflicts=(
+            NameConflictGroup(name="x", candidate_ids=(skill.candidate_id, "other")),
+        ),
     )
 
     payload = report.to_dict()
@@ -219,10 +589,10 @@ def test_scan_report_serializes_counts_conflicts_and_requirements(tmp_path: Path
         "invalid": 0,
         "blocked": 0,
     }
-    assert payload["skills"][0]["candidateId"] == "candidate-1"
+    assert payload["skills"][0]["candidateId"] == skill.candidate_id
     assert payload["skills"][0]["contentHash"] == SHA256
     assert payload["skills"][0]["externalRequirements"]["binaries"] == ["git"]
-    assert payload["duplicates"][0]["candidateIds"] == ["candidate-1", "other"]
+    assert payload["duplicates"][0]["candidateIds"] == [skill.candidate_id, "other"]
     assert payload["nameConflicts"][0]["name"] == "x"
 
 
@@ -232,7 +602,7 @@ def test_import_plan_serializes_destination_mapping(tmp_path: Path) -> None:
         name="x",
         content_hash=SHA256,
         destination=f"x--{SHA256[:12]}",
-        candidate_ids=("candidate-1",),
+        candidate_ids=(skill.candidate_id,),
     )
     plan = ImportPlan(selected=(skill,), rejected=(), records=(record,))
 

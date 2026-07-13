@@ -1,5 +1,8 @@
 """Immutable domain models shared across the importer pipeline."""
 
+import hashlib
+import json
+import math
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -43,6 +46,33 @@ def _validate_sha256(value: str, field_name: str, *, prefixed: bool = False) -> 
 
 def _is_within(path: str, root: str) -> bool:
     return root == "." or path == root or path.startswith(f"{root}/")
+
+
+def _freeze_json(value: object, field_name: str) -> object:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{field_name} must contain only finite JSON numbers")
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{field_name} JSON object keys must be strings")
+            frozen[key] = _freeze_json(item, field_name)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item, field_name) for item in value)
+    raise ValueError(f"{field_name} must contain only JSON values")
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 class Classification(StrEnum):
@@ -218,10 +248,16 @@ class ResolvedSource:
             and _GIT_SHA_RE.fullmatch(self.resolved_commit_sha) is None
         ):
             raise ValueError("resolved commit SHA must be 40 lowercase hexadecimal characters")
+        if self.spec.kind in {SourceKind.GIT, SourceKind.GITHUB} and (
+            self.resolved_commit_sha is None
+        ):
+            raise ValueError("remote source requires a resolved commit SHA")
 
     @property
     def revision(self) -> str:
         """Return the immutable revision component used for candidate identity."""
+        if self.spec.kind is SourceKind.LOCAL:
+            return self.snapshot_sha256
         return self.resolved_commit_sha or self.snapshot_sha256
 
     def to_dict(self) -> dict[str, object]:
@@ -234,6 +270,17 @@ class ResolvedSource:
             "snapshotSha256": self.snapshot_sha256,
             "discoveryScope": self.discovery_scope,
         }
+
+
+def build_candidate_id(source: ResolvedSource, root: str) -> str:
+    """Build a stable identity from immutable provenance and normalized skill root."""
+    _validate_relative_path(root, "skill root", allow_root=True)
+    identity = json.dumps(
+        [source.canonical_url, source.revision, root],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    return f"sha256:{hashlib.sha256(identity).hexdigest()}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,14 +398,15 @@ class SkillCandidate:
     enclosing_boundary: PackageBoundary | None
 
     def __post_init__(self) -> None:
-        if not self.candidate_id:
-            raise ValueError("candidate ID must not be empty")
         _validate_relative_path(self.root, "skill root", allow_root=True)
         _validate_relative_path(self.entrypoint, "skill entrypoint")
-        if not _is_within(self.entrypoint, self.root):
-            raise ValueError("skill entrypoint must be within skill root")
+        entrypoint_parent = PurePosixPath(self.entrypoint).parent.as_posix()
+        if self.root != entrypoint_parent:
+            raise ValueError("skill root must be the entrypoint direct parent")
         if PurePosixPath(self.entrypoint).name not in {"SKILL.md", "skill.md"}:
             raise ValueError("skill entrypoint must be SKILL.md or skill.md")
+        if self.candidate_id != build_candidate_id(self.source, self.root):
+            raise ValueError("candidate ID must match source provenance and skill root")
         if self.enclosing_boundary is not None and not _is_within(
             self.root, self.enclosing_boundary.root
         ):
@@ -396,7 +444,10 @@ class ValidationResult:
             or not self.description.strip()
         ):
             raise ValueError("valid frontmatter requires non-empty name and description")
-        object.__setattr__(self, "frontmatter", MappingProxyType(dict(self.frontmatter)))
+        frozen_frontmatter = _freeze_json(self.frontmatter, "frontmatter")
+        if not isinstance(frozen_frontmatter, Mapping):
+            raise ValueError("frontmatter must be a JSON object")
+        object.__setattr__(self, "frontmatter", frozen_frontmatter)
         object.__setattr__(self, "reasons", tuple(self.reasons))
         object.__setattr__(self, "warnings", tuple(self.warnings))
 
@@ -406,7 +457,7 @@ class ValidationResult:
             "valid": self.valid,
             "name": self.name,
             "description": self.description,
-            "frontmatter": dict(self.frontmatter),
+            "frontmatter": _thaw_json(self.frontmatter),
             "reasons": [reason.to_dict() for reason in self.reasons],
             "warnings": [warning.to_dict() for warning in self.warnings],
         }
@@ -498,19 +549,47 @@ class AnalyzedSkill:
             raise ValueError("static+fm analysis requires an FM review")
         if self.fm_review is not None and self.analysis_method != "static+fm":
             raise ValueError("FM review requires static+fm analysis method")
-        if self.static_classification in {
-            Classification.PORTABLE,
-            Classification.PLUGIN_BOUND,
-            Classification.INVALID,
-            Classification.BLOCKED,
-        } and self.classification is not self.static_classification:
+        if self.static_classification is Classification.AMBIGUOUS:
+            self._validate_ambiguous_transition()
+        elif self.classification is not self.static_classification:
             raise ValueError("final classification cannot weaken a deterministic static decision")
-        if self.static_classification is Classification.AMBIGUOUS and self.classification not in {
-            Classification.PORTABLE,
-            Classification.PLUGIN_BOUND,
-            Classification.AMBIGUOUS,
-        }:
-            raise ValueError("FM review cannot turn ambiguity into invalid or blocked")
+        elif self.fm_review is not None:
+            raise ValueError("FM review is allowed only for ambiguous static classification")
+        if self.classification is Classification.PORTABLE:
+            self._validate_portable_for_import()
+
+    def _validate_ambiguous_transition(self) -> None:
+        if self.fm_review is None:
+            if self.classification is not Classification.AMBIGUOUS:
+                raise ValueError("ambiguous classification requires FM review before promotion")
+            return
+        if self.classification is not self.fm_review.classification:
+            raise ValueError("final classification must match FM review classification")
+        if self.fm_review.reason not in self.reasons:
+            raise ValueError("FM reason must be present in analyzed reasons")
+        if self.classification is Classification.PORTABLE:
+            if self.fm_review.confidence is None or self.fm_review.confidence < 0.90:
+                raise ValueError("portable FM promotion requires confidence >= 0.90")
+            if (
+                self.fm_review.reason.code is not ReasonCode.FM_PORTABLE_VERIFIED
+                or not self.fm_review.reason.evidence
+            ):
+                raise ValueError("portable FM promotion requires a verified reason with evidence")
+
+    def _validate_portable_for_import(self) -> None:
+        if self.classification is not Classification.PORTABLE:
+            raise ValueError("import plan may select only portable skills")
+        if self.static_classification is Classification.PORTABLE:
+            return
+        if self.static_classification is not Classification.AMBIGUOUS:
+            raise ValueError("deterministic non-portable classification cannot be imported")
+        self._validate_ambiguous_transition()
+        if any(
+            reason.code.value.startswith("FM_")
+            and reason.code is not ReasonCode.FM_PORTABLE_VERIFIED
+            for reason in self.reasons
+        ):
+            raise ValueError("portable FM promotion requires complete unredacted context")
 
     @property
     def candidate_id(self) -> str:
@@ -670,11 +749,14 @@ class ImportPlan:
         object.__setattr__(self, "selected", tuple(self.selected))
         object.__setattr__(self, "rejected", tuple(self.rejected))
         object.__setattr__(self, "records", tuple(self.records))
-        object.__setattr__(
-            self, "manifest_payload", MappingProxyType(dict(self.manifest_payload))
-        )
+        frozen_manifest = _freeze_json(self.manifest_payload, "manifest payload")
+        if not isinstance(frozen_manifest, Mapping):
+            raise ValueError("manifest payload must be a JSON object")
+        object.__setattr__(self, "manifest_payload", frozen_manifest)
         if any(skill.classification is not Classification.PORTABLE for skill in self.selected):
             raise ValueError("import plan may select only portable skills")
+        for skill in self.selected:
+            skill._validate_portable_for_import()
         if any(skill.classification is Classification.PORTABLE for skill in self.rejected):
             raise ValueError("portable skills cannot appear in the rejected set")
 
@@ -684,5 +766,5 @@ class ImportPlan:
             "selected": [skill.to_dict() for skill in self.selected],
             "rejected": [skill.to_dict() for skill in self.rejected],
             "records": [record.to_dict() for record in self.records],
-            "manifest": dict(self.manifest_payload),
+            "manifest": _thaw_json(self.manifest_payload),
         }
