@@ -139,13 +139,16 @@ duplicate/name-conflict groups и counts. `--json` выдаёт stable schema `1
 | `plugin_bound` | Есть доказанная зависимость от enclosing plugin/runtime либо skill является внутренним orchestration-компонентом. |
 | `ambiguous` | Автономность не доказана; без дополнительного доказательства import запрещён. |
 | `invalid` | `SKILL.md`/`skill.md` или обязательный frontmatter некорректен. |
-| `blocked` | Обнаружено unsafe состояние: traversal, escaping symlink, path collision или limit violation. |
+| `blocked` | Обнаружено unsafe состояние, которое можно привязать к candidate: например traversal или escaping symlink. |
 
 Static precedence неизменяем:
 
 ```text
 blocked > invalid > plugin_bound > ambiguous > portable
 ```
+
+Source-global collision или limit overflow может остановить всю операцию контролируемой ошибкой
+до формирования candidates; такой случай не маскируется искусственным `blocked` result.
 
 FM не вызывается для static `portable`, `plugin_bound`, `invalid` или `blocked` и не может ослабить
 детерминированное решение. Без `--no-llm` FM рассматривает только static `ambiguous`.
@@ -177,8 +180,11 @@ export LLM_API_KEY='...'
 uv run skill-importer scan ../source
 ```
 
-Импортер не загружает dotenv и не ищет `.env`. Ключ нельзя передать CLI option; он не включается
-в semantic request body, scan JSON, errors или import manifest.
+Импортер не загружает dotenv и не использует `.env` как источник конфигурации или API key. Файл
+`.env`, лежащий внутри source, всё ещё считается недоверенным repository data: он может попасть в
+inventory и, если находится внутри portable skill root, быть скопирован как часть payload, но
+исключается из FM envelope. Ключ нельзя передать CLI option; он не включается в semantic request
+body, scan JSON, errors или import manifest.
 
 Если static `ambiguous` требует review, но `LLM_API_KEY` отсутствует/некорректен, network call не
 выполняется: candidate остаётся `ambiguous` с `FM_REVIEW_UNAVAILABLE`. То же fail-closed поведение
@@ -264,11 +270,18 @@ Publication работает так:
    `ATOMIC_NOREPLACE_UNSUPPORTED`; existing output сохраняется.
 
 Creation ledger хранит path, kind, device/inode, link count и symlink target каждой созданной
-entry. При ошибке cleanup удаляет только полностью совпавшие ledger entries. Если same-UID
-конкурент или другая ошибка изменила staging, importer предпочитает ничего неизвестного не
-удалять. В таком случае `--out` не появляется, но рядом может остаться orphan directory вида
-`.OUT.skill-importer-*`, созданная вызывающим UID и защищённая mode `0700`. Оператор должен
-проверить и удалить такой residual вручную; наличие residual не означает опубликованный import.
+entry. Cleanup делает preflight и повторные identity-проверки; обнаруженный mismatch прерывает
+удаление и оставляет residual вместо намеренного принятия неизвестной entry. Это best-effort
+защита, а не inode-conditioned delete: POSIX `unlink`/`rmdir` оставляют финальное окно между
+последней проверкой pathname и syscall, в котором malicious same-UID процесс может подменить entry,
+и replacement тогда может быть удалён. Поэтому security boundary должен включать private
+importer-owned output parent.
+
+При безопасно обнаруженном mismatch `--out` не появляется, но рядом может остаться orphan вида
+`.OUT.skill-importer-*`. После подтверждения staging identity importer применяет `fchmod(0700)`;
+при сбое до этой точки исходный `mkdir(0700)` с учётом `umask` создаёт mode не более разрешающий,
+чем `0700`. Оператор должен проверить и удалить residual вручную; его наличие не означает
+опубликованный import.
 
 ## Scan JSON schema `1.0`
 
@@ -440,8 +453,9 @@ evidence там, где pipeline может локализовать их к can
   benchmarks.
 - Native atomic publication реализована только для macOS и Linux/filesystems с соответствующей
   no-replace семантикой. Другие platforms fail-closed до появления проверенного publisher.
-- Same-UID процесс может вмешаться в sibling staging. Ledger предотвращает удаление неизвестных
-  replacements, но безопасным результатом может стать `0700` orphan, требующий operator cleanup.
+- Same-UID процесс может вмешаться в sibling staging. Ledger обнаруживает многие replacements и
+  оставляет restrictive orphan, но не устраняет финальный pathname-check → `unlink`/`rmdir` race;
+  production требует private importer-owned parent и audited residual cleanup.
 - POC публикует только новый filesystem output. Production integration должна преобразовывать
   `ImportPlan` в транзакцию registry/object storage и сохранить те же provenance/no-clobber
   invariants.
