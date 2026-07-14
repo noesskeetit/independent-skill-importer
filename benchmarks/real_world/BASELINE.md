@@ -3,6 +3,10 @@
 Проверено 2026-07-14 на Python 3.12 тем же public `SkillImporterPipeline.scan()`, который
 использует CLI. Все источники зафиксированы на SHA из `cases.json`; FM review выключен.
 
+Post-fix implementation checkpoint:
+`87cfb513d1ad40d891e2b666ddb01cca4142cc0f`. На нём corpus повторён после финального static,
+resolver и atomic-import hardening; результат ниже не перенесён со старого запуска.
+
 Итог: **9/9 source/semantic cases совпали с manual oracle, плюс совпал 1/1 expected
 operational guard; disagreements — 0**. C08 не включается в semantic numerator: ранний
 `SCAN_LIMIT_EXCEEDED` не доказывает canonical source, commit SHA или candidate verdict.

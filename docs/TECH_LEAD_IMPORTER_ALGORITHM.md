@@ -97,10 +97,19 @@ Remote source fetch-ится в изолированный bare repository с `-
 через checkout.
 
 Для GitHub canonical URL нормализуется к `https://github.com/<owner>/<repo>.git`. Tree/blob route
-разбирается с учётом branch/tag names из `git ls-remote`; при неоднозначности нужен explicit
-`--ref`. Blob URL устанавливает discovery scope в **родительский каталог файла**, поэтому URL на
-`SKILL.md` обнаруживает и импортирует весь skill root, а не один Markdown-файл. Явный `--subpath`
+разбирается с учётом branch/tag names из `git ls-remote`: выбирается самый длинный ref-prefix, а
+если advertised ref не совпал, первый полный 40-hex component трактуется как immutable commit SHA.
+Explicit `--ref`, совпавший с route prefix, целиком потребляет и slash-components ref. Blob URL
+устанавливает discovery scope в **родительский каталог файла**, поэтому URL на `SKILL.md`
+обнаруживает и импортирует весь skill root, а не один Markdown-файл. Явный `--subpath`
 переопределяет scope из route.
+
+Когда discovery scope получен именно из blob route, после extraction resolver делает exact target
+check по resolved snapshot: каждый ancestor проверяется через `lstat` как directory без symlink, а
+последний component — как существующий regular file. Missing target, directory target или symlink
+возвращают `INVALID_SOURCE`; URL не может притвориться ссылкой на `SKILL.md`, фактически указывая на
+другой kind или отсутствующий path. При explicit `--subpath` источником scope становится именно
+переданный subpath, поэтому route-derived blob target отдельно не валидируется.
 
 `subpath` ограничивает только candidate discovery. Resolver всё равно получает bounded snapshot
 всего revision, а inventory, boundary detection и reverse-dependency analysis видят repository
@@ -170,6 +179,11 @@ Plugin manifests нужны только для определения package o
 - `mixed`: обнаружены runtime declarations/directories, посторонний executable/package content
   либо manifest нельзя безопасно разобрать.
 
+Distribution-only metadata (`.gitignore`, `.editorconfig`, CONTRIBUTING/SECURITY/
+CODE_OF_CONDUCT/ARCHITECTURE и metadata-only `package.json`) не превращает package в `mixed`.
+Runtime/script declarations в `package.json`, executable components и runtime directories —
+превращают.
+
 Candidate связывается с innermost boundary для public report. Portability analysis при этом
 учитывает и внешние enclosing boundaries: outer plugin runtime не должен стать невидимым из-за
 вложенного skills-only package.
@@ -204,9 +218,25 @@ Validator использует bounded `yaml.SafeLoader` variant и требуе
 
 Static analyzer рассматривает repository как недоверенные bytes и ищет только package-bearing
 contexts. Он сочетает parsers для Python, JavaScript/TypeScript, shell, Markdown и structured
-config с conservative fallback detectors. Test/fixture text остаётся payload, но inert string,
-comment, heredoc, unknown Markdown fence, regex или write destination не становится dependency
-автоматически.
+config с conservative execution/read fallback для PowerShell, Ruby и Go. Test/fixture text
+остаётся payload, но inert string, comment, quoted heredoc, unknown Markdown fence, regex или write
+destination не становится dependency автоматически. Unquoted shell heredoc сохраняет variable
+expansion и проверяется как активный context.
+
+После language-specific detectors bounded residual pass ищет active literals/dataflow в runtime
+files. Если path выходит за skill root, но его consumer не позволяет доказать конкретную plugin
+dependency, analyzer не выдаёт `portable`: он добавляет `STATIC_ANALYSIS_INCOMPLETE` с
+source-addressable evidence, классифицирует candidate как `ambiguous` и, когда target существует в
+inventory, включает его в `review_paths` для optional FM adjudication. Comments и доказанные write
+destinations в этот fallback не попадают. Ruby adapter bounded-образом восстанавливает string
+assignments, concatenation через `+`, `File.join`, calls с/без скобок и различает known read/write
+sinks от unknown consumers. Literal, binding, expression-length и propagation-depth limits
+fail-closed дают тот же uncertainty reason; молчаливый ранний выход запрещён.
+
+Отсутствие candidates — отдельный штатный результат pipeline: `scan` возвращает нулевые counts, а
+`import` атомарно публикует только manifest с пустыми `imported`/`rejected`. Это позволяет безопасно
+прогонять importer по произвольным project repositories, marketplace и monorepo, где skills может
+не быть вообще.
 
 ### Forward dependencies: skill зависит от plugin/package
 
@@ -245,9 +275,12 @@ changelog, license, обычные docs/examples и sibling skill payloads. `REF
 | Нет enclosing plugin boundary и нет dependency/unsafe finding | `portable` | `STANDALONE_NO_PLUGIN_BOUNDARY` |
 | Enclosing package — `skills_only`, dependency не найдена | `portable` | `SKILLS_ONLY_PACKAGE` |
 | Есть forward или reverse package dependency | `plugin_bound` | Конкретный dependency reason |
+| Active external path/dataflow найден, но его роль статически не доказана | `ambiguous` | `STATIC_ANALYSIS_INCOMPLETE` |
 | Mixed plugin, но связь не доказана | `ambiguous` | `MIXED_PLUGIN_AUTONOMY_UNPROVEN` |
 | Frontmatter/entrypoint некорректен | `invalid` | `INVALID_FRONTMATTER` |
 | Candidate-addressable symlink выходит за root | `blocked` | `SYMLINK_ESCAPE` |
+| Directory symlink graph образует цикл | `blocked` | `SYMLINK_CYCLE` |
+| Текстовый resource path проходит выше snapshot root | `blocked` | `PATH_TRAVERSAL` |
 
 Precedence неизменяем и fail-closed:
 
@@ -265,6 +298,10 @@ candidate и возвращается как operational `ImporterError`. Absolu
 FM — дополнительный adjudicator, а не реализация основного анализа. Он вызывается только для
 static `ambiguous`. Детерминированные `portable`, `plugin_bound`, `invalid` и `blocked` никогда не
 передаются модели и не могут быть ослаблены её ответом.
+
+Это включает candidates с `STATIC_ANALYSIS_INCOMPLETE`: residual static uncertainty открывает
+обычную FM-review lane, но сама по себе не разрешает import. При `--no-llm`, unavailable FM или
+любом невалидном/fail-closed ответе candidate остаётся `ambiguous`.
 
 CLI включает review по умолчанию; `--no-llm` оставляет static ambiguity без сети. Текущий adapter
 использует Cloud.ru chat completions, model `zai-org/GLM-5.1` по умолчанию и ключ только из process
@@ -314,7 +351,8 @@ DecisionReason
   `PLUGIN_RUNTIME_FILE_REFERENCE`, `REFERENCED_BY_PLUGIN_RUNTIME`,
   `MISSING_LOCAL_RESOURCE`, `DYNAMIC_REFERENCE_UNRESOLVED`;
 - uncertainty/validation/extraction: `MIXED_PLUGIN_AUTONOMY_UNPROVEN`,
-  `INVALID_FRONTMATTER`, `SYMLINK_ESCAPE`;
+  `STATIC_ANALYSIS_INCOMPLETE`, `INVALID_FRONTMATTER`, `SYMLINK_ESCAPE`, `SYMLINK_CYCLE`,
+  `PATH_TRAVERSAL`, `PATH_COLLISION`, `FILE_TOO_LARGE`, `SCAN_LIMIT_EXCEEDED`;
 - equivalence metadata: `DUPLICATE_CONTENT`, `NAME_CONFLICT`;
 - FM: `FM_PORTABLE_VERIFIED`, `FM_PLUGIN_BOUND`, `FM_REVIEW_UNAVAILABLE`,
   `FM_INVALID_RESPONSE`, `FM_EVIDENCE_INVALID`, `FM_CONTEXT_TRUNCATED`,
@@ -447,10 +485,15 @@ Publication:
 
 1. Parent `--out` должен существовать, сам output — отсутствовать.
 2. Рядом создаётся private random staging directory mode `0700`.
-3. Payloads пишутся с `O_EXCL`/`O_NOFOLLOW`, files получают `0600` или `0700` для executable.
-4. `import-manifest.json` пишется canonical JSON с trailing newline и mode `0600`.
-5. Files и directories синхронизируются через `fsync`.
-6. Staging публикуется native no-clobber rename: `renameatx_np(RENAME_EXCL)` на macOS или
+3. До copy весь payload directory/symlink graph проверяется на cycles; во время copy каждая
+   symlink chain заново разрешается только по immutable inventory и source fd.
+4. Payloads пишутся с `O_EXCL`/`O_NOFOLLOW`, files получают `0600` или `0700` для executable.
+5. `import-manifest.json` пишется canonical JSON с trailing newline и mode `0600`.
+6. Files и directories синхронизируются через `fsync`.
+7. Creation ledger перед publication заново проверяет полный child set и entry identities. Для
+   symlink сверяется exact target, для directory — mode, для regular file — mode, size и SHA-256
+   перечитанных exact bytes.
+8. Staging публикуется native no-clobber rename: `renameatx_np(RENAME_EXCL)` на macOS или
    `renameat2(RENAME_NOREPLACE)` на Linux.
 
 Unsafe `os.replace` fallback отсутствует. Existing destination не перезаписывается. Unsupported
@@ -494,6 +537,7 @@ Default `Limits`:
 | `fm_timeout_seconds` | 20 s | Один FM request |
 | `max_archive_bytes` | 100 MiB | `git archive` tar |
 | `max_entries` | 10,000 | Source/import entries |
+| `max_candidates` | 1,000 | Candidates, допускаемые к анализу за operation |
 | `max_scan_bytes` | 250 MiB | Суммарные regular-file bytes |
 | `max_file_bytes` | 10 MiB | Один regular file |
 | `max_depth` | 64 | Path depth |
@@ -559,8 +603,12 @@ FM client.
 8. **Independent skill checker.** После extraction отдельная подсистема должна оценивать
    malicious/destructive behavior, capabilities и execution permissions. Её нельзя смешивать с
    package-autonomy verdict.
-9. **Combined audit.** После финальной интеграции нужны full test/lint/type/build/wheel gates,
-   installed-wheel scan→import smoke, online pinned corpus и независимый security review.
+9. **Flow-sensitive adapters.** Текущий bounded Python/JavaScript taint analysis намеренно
+   консервативен при сложных reassignment/scope graphs. Production adapters должны уменьшать
+   false positives, не ослабляя fail-closed verdict для реально consumed repository paths.
+10. **Analysis indexing.** Текущий worst case повторно просматривает runtime-relevant files для
+    каждого candidate (`O(candidates * runtime files)`). Production нужен bounded pre-index/cache
+    ownership и references с тем же source-addressable evidence contract.
 
 Неизменяемая product boundary для всех следующих шагов: importer извлекает только самостоятельные
 skills. Он не импортирует plugins и не конвертирует plugin runtime в skill.
