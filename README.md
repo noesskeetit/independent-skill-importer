@@ -38,6 +38,31 @@ manifest и публикует новый output через native atomic no-clo
 analysis по-прежнему видят весь bounded snapshot, поэтому blob URL внутри plugin не маскирует
 enclosing runtime.
 
+## Архитектурный документ и real-world benchmark
+
+- [Tech-lead описание алгоритма](docs/TECH_LEAD_IMPORTER_ALGORITHM.md) связывает product decision
+  «plugin-bound skill бесполезен отдельно» с фактическими модулями, reason/evidence contract,
+  optional FM adjudication и atomic import. Там же явно проведена граница между importer и
+  отдельным skill security checker.
+- [Real-world benchmark](benchmarks/real_world/README.md) запускает public read-only scan path по
+  десяти вручную размеченным GitHub cases, pinned на полные commit SHA. Manifest находится в
+  [`benchmarks/real_world/cases.json`](benchmarks/real_world/cases.json); обычные tests полностью
+  offline, а сеть включается только явным `--online`.
+- [Аудит и следующие шаги](AUDIT_AND_NEXT_STEPS.md) отделяет уже реализованные функциональные
+  исправления от отложенного combined audit и production backlog.
+
+```bash
+# Offline contract tests benchmark runner-а
+uv run pytest -q tests/test_real_world_benchmark.py
+
+# Explicit online static corpus; labels manifest не переписываются
+uv run python benchmarks/real_world/run.py \
+  --online \
+  --manifest benchmarks/real_world/cases.json \
+  --json-out .artifacts/real-world-benchmark.json \
+  --markdown-out .artifacts/real-world-benchmark.md
+```
+
 ## Требования и установка
 
 - Python `>=3.12`;
