@@ -41,12 +41,14 @@ manifest и публикует новый output через native atomic no-clo
 analysis по-прежнему видят весь bounded snapshot, поэтому blob URL внутри plugin не маскирует
 enclosing runtime.
 
-## Архитектурный документ и real-world benchmark
+## Документация и real-world benchmark
 
-- [Tech-lead описание алгоритма](docs/TECH_LEAD_IMPORTER_ALGORITHM.md) связывает product decision
-  «plugin-bound skill бесполезен отдельно» с фактическими модулями, reason/evidence contract,
-  optional FM adjudication и atomic import. Там же явно проведена граница между importer и
-  отдельным skill security checker.
+- [Короткое описание для техлида](docs/TECH_LEAD_IMPORTER_ALGORITHM.md): задача, вход, выход,
+  логика и сквозной пример `scan → import`.
+- [Алгоритм решения об импорте](docs/IMPORT_DECISION_ALGORITHM.md): как среди marketplace,
+  skillsets, plugins и обычного кода выбрать только самостоятельные skills.
+- [Внутренний implementation reference](docs/INTERNAL_IMPLEMENTATION_REFERENCE.md): подробные
+  модули, reason/evidence contract, FM lane и atomic publication.
 - [Real-world benchmark](benchmarks/real_world/README.md) запускает public read-only scan path по
   десяти вручную размеченным GitHub cases, pinned на полные commit SHA. Manifest находится в
   [`benchmarks/real_world/cases.json`](benchmarks/real_world/cases.json); обычные tests полностью
@@ -80,7 +82,7 @@ uv sync --python 3.12 --group dev
 uv run skill-importer --help
 ```
 
-Runtime dependencies заданы в `pyproject.toml`: Click 8.x и PyYAML 6.x.
+Runtime dependencies заданы в `pyproject.toml`: Click 8.x, PyYAML 6.x и python-dotenv 1.x.
 
 ## CLI и источники
 
@@ -221,20 +223,19 @@ known/unknown consumers; достижение literal/expression/depth limits с
 - timeout: 20 seconds;
 - `temperature: 0`, JSON response format и disabled thinking.
 
-Ключ берётся **только** из process environment. `FM_API_KEY` — primary name;
-`LLM_API_KEY` поддерживается как compatibility fallback, только если primary variable вообще
-отсутствует:
+При запуске CLI `FM_API_KEY` автоматически читается из `.env` в текущей директории. Значение,
+которое уже задано в process environment, имеет приоритет. Старый `LLM_API_KEY` остаётся
+compatibility fallback внутри pipeline.
 
 ```bash
-export FM_API_KEY='...'
-uv run skill-importer scan ../source
+cp .env.example .env
+# заполнить FM_API_KEY в .env
+uv run skill-importer scan https://github.com/openclaw/agent-skills
 ```
 
-Импортер не загружает dotenv и не использует `.env` как источник конфигурации или API key. Файл
-`.env`, лежащий внутри source, всё ещё считается недоверенным repository data: он может попасть в
-inventory и, если находится внутри portable skill root, быть скопирован как часть payload, но
-исключается из FM envelope. Ключ нельзя передать CLI option; он не включается в semantic request
-body, scan JSON, errors или import manifest.
+CLI не ищет `.env` внутри переданного source и не исполняет его содержимое. Поэтому запускайте
+команду из корня `independent-skill-importer`, где лежит ваш локальный `.env`. Ключ нельзя передать
+CLI option; он не включается в semantic request body, scan JSON, errors или import manifest.
 
 Если static `ambiguous` требует review, но оба ключа отсутствуют либо выбранный по этому precedence
 ключ некорректен, network call не выполняется: candidate остаётся `ambiguous` с

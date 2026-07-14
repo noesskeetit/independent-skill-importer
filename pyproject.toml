@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.1,<9",
+    "python-dotenv>=1.1,<2",
     "PyYAML>=6.0,<7",
 ]
 

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import unicodedata
 from pathlib import Path
 
 import click
+from dotenv import dotenv_values
 
 from .errors import ImporterError
 from .fm_review import DEFAULT_FM_MODEL
@@ -14,6 +16,13 @@ from .importer import ImportResult, SkillImporter
 from .models import ScanReport
 from .pipeline import ScanOptions, SkillImporterPipeline
 from .source import parse_source_spec
+
+
+def _load_local_fm_api_key() -> None:
+    """Load FM_API_KEY from .env in the directory where the CLI is launched."""
+    value = dotenv_values(Path.cwd() / ".env", interpolate=False).get("FM_API_KEY")
+    if value:
+        os.environ.setdefault("FM_API_KEY", value)
 
 
 def _model_option(
@@ -157,6 +166,7 @@ def _render_import_human(result: ImportResult) -> str:
 @click.group()
 def cli() -> None:
     """Safely discover standalone agent skills without executing repository code."""
+    _load_local_fm_api_key()
 
 
 @cli.command("scan")

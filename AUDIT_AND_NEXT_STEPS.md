@@ -4,8 +4,10 @@
 
 Репозиторий содержит Python 3.12 POC универсального импортера самостоятельных agent skills. Он
 не исполняет код источника, не устанавливает dependencies и не запускает plugin runtime, MCP,
-hooks или submodules. Архитектурный контракт зафиксирован в
-[`docs/TECH_LEAD_IMPORTER_ALGORITHM.md`](docs/TECH_LEAD_IMPORTER_ALGORITHM.md).
+hooks или submodules. Короткий контракт для техлида зафиксирован в
+[`docs/TECH_LEAD_IMPORTER_ALGORITHM.md`](docs/TECH_LEAD_IMPORTER_ALGORITHM.md), дерево решений — в
+[`docs/IMPORT_DECISION_ALGORITHM.md`](docs/IMPORT_DECISION_ALGORITHM.md), подробности реализации —
+в [`docs/INTERNAL_IMPLEMENTATION_REFERENCE.md`](docs/INTERNAL_IMPLEMENTATION_REFERENCE.md).
 
 После исходного targeted review реализована отдельная серия функциональных исправлений анализа
 реальных repository layouts и добавлен pinned corpus из десяти GitHub cases. Независимые scoped
@@ -143,7 +145,7 @@ scan `openclaw/agent-skills` resolved commit
 6. Выполнить standalone fixture scan→import installed-wheel smoke и проверить exact payload,
    manifest provenance, duplicate/name-conflict behavior и no-clobber failure path.
 7. Подтвердить, что API key/credentials не попадают в Git subprocess, ScanReport, import manifest,
-   logs и error messages; `.env` не читается и не изменяется.
+   logs и error messages; CLI читает только локальный `.env` из своей current working directory.
 8. Провести независимый whole-branch review; интегрировать/push только после clean verdict.
 
 ## Оставшиеся production-задачи
@@ -171,6 +173,6 @@ scan `openclaw/agent-skills` resolved commit
 - Если skill требует часть plugin, его нужно отклонить с reason/evidence, а не «починить» скрытым
   копированием внешних files.
 - Новые detectors сначала получают fixture/focused test, затем regression на pinned real source.
-- API key передаётся только через process environment (`FM_API_KEY`, либо `LLM_API_KEY` fallback)
-  в момент FM review; `.env` не читается и не изменяется.
+- CLI загружает `FM_API_KEY` из локального `.env` текущей директории; source-repository `.env` не
+  используется как конфигурация. Ключ не должен попадать в reports, manifests или logs.
 - Runtime security checking остаётся отдельной подсистемой после package-autonomy import decision.
