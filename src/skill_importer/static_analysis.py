@@ -68,28 +68,19 @@ _MARKDOWN_DESTINATION_RE = re.compile(
     r"!?\[[^\]]*\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<plain>[^)\s]+))",
 )
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<body>[^`\r\n]+)`(?!`)")
-_MARKDOWN_INLINE_WRITE_ACTION_RE = re.compile(
-    r"^\s*(?:(?:[-*+]|\d+[.)]|>)\s+)*"
-    r"(?:(?:then|please|always)\s+)?"
-    r"(?:(?:you\s+)?(?:must|should|need\s+to)\s+)?"
-    r"(?:create|edit|generate|keep|replace|update|write)\b",
+_MARKDOWN_INLINE_DESTINATION_BEFORE_RE = re.compile(
+    r"(?:\b(?:destination|output\s+path|write\s+target|source\.path|"
+    r"marketplace\s+config)\s*(?:is|=|:|as)"
+    r"|\b(?:write|save|export)\s+(?:the\s+)?(?:result|output|report)\s+to)\s*$",
     re.IGNORECASE,
 )
-_MARKDOWN_INLINE_OUTPUT_NOUN_RE = re.compile(
-    r"\b(?:destination|output\s+path|write\s+target)\b",
-    re.IGNORECASE,
-)
-_MARKDOWN_INLINE_MARKETPLACE_LOCATION_RE = re.compile(
-    r"\bmarketplace\s+config\s+is\s*$",
+_MARKDOWN_INLINE_DESTINATION_AFTER_RE = re.compile(
+    r"^\s+as\s+(?:(?:their|the|a|an)\s+)?"
+    r"(?:destination|output\s+path|write\s+target)\b",
     re.IGNORECASE,
 )
 _MARKDOWN_INLINE_OPTIONAL_WORKSPACE_RE = re.compile(
     r"\bif\s+the\s+current\s+git\s+repo\s+already\s+has\b",
-    re.IGNORECASE,
-)
-_MARKDOWN_INLINE_SCHEMA_EXAMPLE_RE = re.compile(
-    r"^\s*(?:[-*+]\s+)*.*(?:\bexample\b|\bpersonal\s+plugin\b|"
-    r"\brepo/team\s+plugin\b|`?path`?\s*\([^)]*\)\s*:)",
     re.IGNORECASE,
 )
 _MARKDOWN_HEADING_RE = re.compile(
@@ -435,6 +426,13 @@ class _StaticPathValue:
     value: str
     anchored_to_repository: bool = False
     propagated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _PathTaint:
+    repository: bool = False
+    plugin_value: str | None = None
+    plugin_offset: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -801,7 +799,7 @@ def _python_indirect_path_accesses(
     names_by_identifier: dict[str, list[ast.Name]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
-            names_by_identifier.setdefault(node.id.casefold(), []).append(node)
+            names_by_identifier.setdefault(node.id, []).append(node)
         target: ast.expr | None = None
         value: ast.expr | None = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -814,7 +812,7 @@ def _python_indirect_path_accesses(
             and _python_is_path_constructor(value, path_names, pathlib_modules)
         ):
             continue
-        name = target.id.casefold()
+        name = target.id
         assignment_targets.add(id(target))
         if name in bindings:
             ambiguous.add(name)
@@ -936,10 +934,21 @@ def _static_reference_value(value: _StaticPathValue, entry_path: str) -> str:
     return posixpath.relpath(posixpath.normpath(value.value), start=source_parent)
 
 
-def _python_static_bindings(tree: ast.AST) -> dict[str, ast.expr]:
+def _python_static_bindings(
+    tree: ast.AST,
+) -> tuple[dict[str, ast.expr], dict[str, tuple[ast.expr, ...]], bool]:
     bindings: dict[str, ast.expr] = {}
-    ambiguous: set[str] = set()
-    for node in ast.walk(tree):
+    values_by_name: dict[str, list[ast.expr]] = {}
+    overflow = False
+    assignments = sorted(
+        ast.walk(tree),
+        key=lambda node: (
+            getattr(node, "lineno", 0),
+            getattr(node, "col_offset", 0),
+            getattr(node, "end_lineno", 0),
+        ),
+    )
+    for node in assignments:
         target: ast.expr | None = None
         value: ast.expr | None = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -948,12 +957,101 @@ def _python_static_bindings(tree: ast.AST) -> dict[str, ast.expr]:
             target, value = node.target, node.value
         if not isinstance(target, ast.Name) or value is None:
             continue
-        name = target.id.casefold()
-        if name in bindings:
-            ambiguous.add(name)
-        elif len(bindings) < _MAX_STATIC_BINDINGS:
-            bindings[name] = value
-    return {name: value for name, value in bindings.items() if name not in ambiguous}
+        name = target.id
+        if name not in bindings and len(bindings) >= _MAX_STATIC_BINDINGS:
+            overflow = True
+            continue
+        bindings[name] = value
+        values_by_name.setdefault(name, []).append(value)
+    return (
+        bindings,
+        {name: tuple(values) for name, values in values_by_name.items()},
+        overflow,
+    )
+
+
+def _merge_path_taints(taints: Iterable[_PathTaint]) -> _PathTaint:
+    repository = False
+    plugin_value: str | None = None
+    plugin_offset: int | None = None
+    for taint in taints:
+        repository = repository or taint.repository
+        if taint.plugin_offset is not None and (
+            plugin_offset is None or taint.plugin_offset < plugin_offset
+        ):
+            plugin_value = taint.plugin_value
+            plugin_offset = taint.plugin_offset
+    return _PathTaint(
+        repository=repository,
+        plugin_value=plugin_value,
+        plugin_offset=plugin_offset,
+    )
+
+
+def _python_path_taint(
+    node: ast.expr,
+    *,
+    content: str,
+    line_starts: tuple[int, ...],
+    bindings: Mapping[str, tuple[ast.expr, ...]],
+    resolving: set[str],
+    depth: int = 0,
+) -> _PathTaint:
+    if depth >= _MAX_STATIC_PROPAGATION_DEPTH:
+        return _PathTaint()
+
+    source = ast.get_source_segment(content, node) or ""
+    plugin_match = _PLUGIN_VARIABLE_RE.search(source)
+    direct = _PathTaint(
+        repository=isinstance(node, ast.Name) and node.id == "__file__",
+        plugin_value=plugin_match.group(0) if plugin_match is not None else None,
+        plugin_offset=(
+            _node_offset(content, node, line_starts) + plugin_match.start()
+            if plugin_match is not None
+            else None
+        ),
+    )
+
+    if isinstance(node, ast.Name):
+        if node.id in resolving:
+            return direct
+        values = bindings.get(node.id, ())
+        if not values:
+            return direct
+        resolving.add(node.id)
+        propagated = _merge_path_taints(
+            _python_path_taint(
+                value,
+                content=content,
+                line_starts=line_starts,
+                bindings=bindings,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            for value in values
+        )
+        resolving.remove(node.id)
+        return _merge_path_taints((direct, propagated))
+
+    children = tuple(child for child in ast.iter_child_nodes(node) if isinstance(child, ast.expr))
+    if not children:
+        return direct
+    return _merge_path_taints(
+        (
+            direct,
+            *(
+                _python_path_taint(
+                    child,
+                    content=content,
+                    line_starts=line_starts,
+                    bindings=bindings,
+                    resolving=resolving,
+                    depth=depth + 1,
+                )
+                for child in children
+            ),
+        )
+    )
 
 
 def _python_static_path_value(
@@ -972,7 +1070,7 @@ def _python_static_path_value(
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return _StaticPathValue(node.value)
     if isinstance(node, ast.Name):
-        name = node.id.casefold()
+        name = node.id
         if name == "__file__":
             return _StaticPathValue(entry_path, anchored_to_repository=True, propagated=True)
         if name in memo:
@@ -1187,7 +1285,7 @@ def _python_static_consumed_path_references(
     subprocess_names: set[str],
     base_offset: int,
 ) -> Iterable[_PathReference]:
-    bindings = _python_static_bindings(tree)
+    bindings, taint_bindings, binding_overflow = _python_static_bindings(tree)
     memo: dict[str, _StaticPathValue | None] = {}
     emitted: set[tuple[str, int, str]] = set()
 
@@ -1206,14 +1304,12 @@ def _python_static_consumed_path_references(
         if not isinstance(node, ast.Call):
             continue
         candidates: tuple[tuple[ast.expr, str], ...] = ()
-        plugin_only = False
         if _python_is_subprocess_call(node, subprocess_modules, subprocess_names):
             argument = _python_call_argument(node)
             if isinstance(argument, (ast.List, ast.Tuple)):
                 candidates = tuple((element, "execute") for element in argument.elts)
             elif argument is not None:
                 candidates = ((argument, "execute"),)
-            plugin_only = True
         else:
             name = _python_call_name(node.func)
             if name in _PYTHON_PATH_CALLS:
@@ -1230,13 +1326,43 @@ def _python_static_consumed_path_references(
         for expression, access in candidates:
             if access == "write":
                 continue
+            taint = _python_path_taint(
+                expression,
+                content=content,
+                line_starts=line_starts,
+                bindings=taint_bindings,
+                resolving=set(),
+            )
+            if taint.plugin_value is not None and taint.plugin_offset is not None:
+                identity = (taint.plugin_value, taint.plugin_offset, access)
+                if identity not in emitted:
+                    emitted.add(identity)
+                    yield _PathReference(
+                        taint.plugin_value,
+                        base_offset + taint.plugin_offset,
+                        access,
+                        "python.plugin_tainted",
+                    )
+                continue
             value = resolved(expression)
             if value is None:
+                if taint.repository or binding_overflow:
+                    reference = (
+                        ast.get_source_segment(content, expression) or type(expression).__name__
+                    )
+                    offset = base_offset + _node_offset(content, expression, line_starts)
+                    syntax = (
+                        "python.repo_tainted.expression"
+                        if taint.repository
+                        else "python.binding_overflow.expression"
+                    )
+                    identity = (reference, offset, access)
+                    if identity not in emitted:
+                        emitted.add(identity)
+                        yield _PathReference(reference, offset, access, syntax)
                 continue
             reference = _static_reference_value(value, entry_path)
             has_plugin_variable = _PLUGIN_VARIABLE_RE.search(reference) is not None
-            if plugin_only and not has_plugin_variable:
-                continue
             if not value.propagated and not has_plugin_variable:
                 continue
             offset = base_offset + _node_offset(content, expression, line_starts)
@@ -1720,6 +1846,7 @@ def _javascript_matching_pairs(tokens: Sequence[_JavaScriptToken]) -> dict[int, 
 
 
 def _javascript_expression_end(
+    content: str,
     tokens: Sequence[_JavaScriptToken],
     start: int,
     stop: int,
@@ -1732,6 +1859,45 @@ def _javascript_expression_end(
             continue
         if tokens[index].value in {",", ";"}:
             return index
+        if index > start and "\n" in content[tokens[index - 1].end : tokens[index].start]:
+            previous = tokens[index - 1]
+            current = tokens[index]
+            continuation_tokens = {
+                ".",
+                "?.",
+                "(",
+                "[",
+                "+",
+                "-",
+                "*",
+                "/",
+                "%",
+                "**",
+                "&&",
+                "||",
+                "??",
+                "&",
+                "|",
+                "^",
+                "==",
+                "===",
+                "!=",
+                "!==",
+                "<",
+                ">",
+                "<=",
+                ">=",
+                "?",
+                ":",
+                "=>",
+            }
+            incomplete_previous = continuation_tokens | {",", "=", "!", "~"}
+            if (
+                current.value not in continuation_tokens
+                and previous.value not in incomplete_previous
+                and current.kind != "template"
+            ):
+                return index
         index += 1
     return stop
 
@@ -1760,24 +1926,85 @@ def _javascript_argument_spans(
 
 
 def _javascript_static_bindings(
+    content: str,
     tokens: Sequence[_JavaScriptToken],
     pairs: Mapping[int, int],
-) -> dict[str, tuple[int, int]]:
+) -> tuple[
+    dict[str, tuple[int, int]],
+    dict[str, tuple[tuple[int, int], ...]],
+    bool,
+]:
     bindings: dict[str, tuple[int, int]] = {}
-    ambiguous: set[str] = set()
+    spans_by_name: dict[str, list[tuple[int, int]]] = {}
+    overflow = False
     for index, token in enumerate(tokens):
         if token.value not in {"const", "let", "var"} or index + 3 >= len(tokens):
             continue
         name = tokens[index + 1]
         if name.kind != "identifier" or tokens[index + 2].value != "=":
             continue
-        end = _javascript_expression_end(tokens, index + 3, len(tokens), pairs)
-        normalized = name.value.casefold()
-        if normalized in bindings:
-            ambiguous.add(normalized)
-        elif len(bindings) < _MAX_STATIC_BINDINGS:
-            bindings[normalized] = (index + 3, end)
-    return {name: span for name, span in bindings.items() if name not in ambiguous}
+        end = _javascript_expression_end(content, tokens, index + 3, len(tokens), pairs)
+        identifier = name.value
+        if identifier not in bindings and len(bindings) >= _MAX_STATIC_BINDINGS:
+            overflow = True
+            continue
+        span = (index + 3, end)
+        bindings[identifier] = span
+        spans_by_name.setdefault(identifier, []).append(span)
+    return (
+        bindings,
+        {name: tuple(spans) for name, spans in spans_by_name.items()},
+        overflow,
+    )
+
+
+def _javascript_path_taint(
+    content: str,
+    tokens: Sequence[_JavaScriptToken],
+    start: int,
+    end: int,
+    *,
+    bindings: Mapping[str, tuple[tuple[int, int], ...]],
+    resolving: set[str],
+    depth: int = 0,
+) -> _PathTaint:
+    if depth >= _MAX_STATIC_PROPAGATION_DEPTH or start >= end:
+        return _PathTaint()
+
+    source_start = tokens[start].start
+    source_end = tokens[end - 1].end
+    source = content[source_start:source_end]
+    plugin_match = _PLUGIN_VARIABLE_RE.search(source)
+    direct = _PathTaint(
+        repository=any(
+            token.kind == "identifier" and token.value == "__dirname" for token in tokens[start:end]
+        ),
+        plugin_value=plugin_match.group(0) if plugin_match is not None else None,
+        plugin_offset=source_start + plugin_match.start() if plugin_match is not None else None,
+    )
+
+    propagated: list[_PathTaint] = []
+    for token in tokens[start:end]:
+        if token.kind != "identifier" or token.value in resolving:
+            continue
+        spans = bindings.get(token.value, ())
+        if not spans:
+            continue
+        resolving.add(token.value)
+        propagated.extend(
+            _javascript_path_taint(
+                content,
+                tokens,
+                span_start,
+                span_end,
+                bindings=bindings,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            for span_start, span_end in spans
+        )
+        resolving.remove(token.value)
+    return _merge_path_taints((direct, *propagated))
 
 
 def _javascript_static_path_value(
@@ -1812,7 +2039,7 @@ def _javascript_static_path_value(
             return _StaticPathValue(token.value)
         if token.kind != "identifier":
             return None
-        name = token.value.casefold()
+        name = token.value
         if name == "__dirname":
             return _StaticPathValue(
                 str(PurePosixPath(entry_path).parent),
@@ -1980,7 +2207,11 @@ def _javascript_path_references(
         )
         return
     pairs = _javascript_matching_pairs(tokens)
-    bindings = _javascript_static_bindings(tokens, pairs)
+    bindings, taint_bindings, binding_overflow = _javascript_static_bindings(
+        content,
+        tokens,
+        pairs,
+    )
     memo: dict[str, _StaticPathValue | None] = {}
     for path in _javascript_static_imports(tokens):
         yield _PathReference(
@@ -2000,6 +2231,21 @@ def _javascript_path_references(
         value, offset, dynamic = argument
         span = _javascript_call_argument_span(tokens, index, pairs)
         if entry_path is not None and span is not None:
+            taint = _javascript_path_taint(
+                content,
+                tokens,
+                *span,
+                bindings=taint_bindings,
+                resolving=set(),
+            )
+            if taint.plugin_value is not None and taint.plugin_offset is not None:
+                yield _PathReference(
+                    taint.plugin_value,
+                    base_offset + taint.plugin_offset,
+                    _JAVASCRIPT_PATH_CALLS[name],
+                    "javascript.plugin_tainted",
+                )
+                continue
             static_value = _javascript_static_path_value(
                 tokens,
                 *span,
@@ -2012,6 +2258,24 @@ def _javascript_path_references(
             if static_value is not None:
                 value = _static_reference_value(static_value, entry_path)
                 dynamic = False
+            elif taint.repository or binding_overflow:
+                source_start = tokens[span[0]].start
+                source_end = tokens[span[1] - 1].end
+                value = content[source_start:source_end]
+                offset = source_start
+                dynamic = True
+                syntax = (
+                    "javascript.repo_tainted.expression"
+                    if taint.repository
+                    else "javascript.binding_overflow.expression"
+                )
+                yield _PathReference(
+                    value,
+                    base_offset + offset,
+                    _JAVASCRIPT_PATH_CALLS[name],
+                    syntax,
+                )
+                continue
         syntax = "javascript.expression" if dynamic else "javascript.call"
         yield _PathReference(
             value,
@@ -2435,13 +2699,11 @@ def _markdown_inline_code_has_dependency_context(
     suffix = content[match.end() : line_end]
     body = match.group("body").strip()
     if not any(character.isspace() for character in body) and _looks_shell_path(body):
-        line = f"{prefix} {suffix}"
         proven_output_context = (
-            _MARKDOWN_INLINE_WRITE_ACTION_RE.search(prefix) is not None
-            or _MARKDOWN_INLINE_OUTPUT_NOUN_RE.search(line) is not None
-            or _MARKDOWN_INLINE_MARKETPLACE_LOCATION_RE.search(prefix) is not None
+            re.search(r"<[^>]+>", body) is not None
+            or _MARKDOWN_INLINE_DESTINATION_BEFORE_RE.search(prefix) is not None
+            or _MARKDOWN_INLINE_DESTINATION_AFTER_RE.search(suffix) is not None
             or _MARKDOWN_INLINE_OPTIONAL_WORKSPACE_RE.search(prefix) is not None
-            or _MARKDOWN_INLINE_SCHEMA_EXAMPLE_RE.search(prefix) is not None
         )
         return not proven_output_context
     tokens, failed = _shell_tokens(body)
@@ -2450,7 +2712,15 @@ def _markdown_inline_code_has_dependency_context(
 
 def _development_fence_reference_is_relevant(reference: _PathReference) -> bool:
     decoded = _decode_reference(reference.value)
-    return _PLUGIN_VARIABLE_RE.search(decoded) is not None or ".." in PurePosixPath(decoded).parts
+    path = PurePosixPath(decoded)
+    if _PLUGIN_VARIABLE_RE.search(decoded) is not None or ".." in path.parts:
+        return True
+    name = path.name.casefold()
+    return not (
+        reference.access == "execute"
+        and path.parts[:1] == ("scripts",)
+        and re.match(r"(?:validate|lint|test|check)(?:[-_.]|$)", name) is not None
+    )
 
 
 def _markdown_frontmatter_bounds(content: str) -> tuple[int, int, int] | None:
@@ -4021,7 +4291,16 @@ def _is_owned_runtime_path(
 def _is_proven_package_context(reference: _PathReference) -> bool:
     if reference.access == "import" and reference.syntax.startswith("markdown.fence."):
         return False
-    return reference.access == "import" or reference.syntax.startswith(("json.", "markdown."))
+    return reference.access == "import" or reference.syntax.startswith(
+        (
+            "json.",
+            "markdown.",
+            "python.repo_tainted.",
+            "python.binding_overflow.",
+            "javascript.repo_tainted.",
+            "javascript.binding_overflow.",
+        )
+    )
 
 
 def _missing_reference_is_package_context(

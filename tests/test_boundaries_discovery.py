@@ -321,6 +321,46 @@ def test_root_skill_local_scripts_are_payload_without_manifest_runtime_declarati
     assert detect_boundaries(inventory)[0].package_kind == "skills_only"
 
 
+def test_root_skill_conventional_payload_directories_remain_skills_only() -> None:
+    inventory = _inventory(
+        {
+            "openclaw.plugin.json": '{"id":"metadata-only"}',
+            "SKILL.md": "---\nname: x\ndescription: x\n---\n",
+            "assets/data.json": "{}",
+            "references/helper.py": "EXAMPLE = True\n",
+            "scripts/tool.ts": "export const run = () => undefined;\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "skills_only"
+
+
+def test_nested_skill_code_payload_does_not_make_root_package_mixed() -> None:
+    inventory = _inventory(
+        {
+            "openclaw.plugin.json": '{"id":"metadata-only"}',
+            "SKILL.md": "---\nname: root\ndescription: root\n---\n",
+            "nested/SKILL.md": "---\nname: nested\ndescription: nested\n---\n",
+            "nested/scripts/tool.py": "print('skill payload')\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "skills_only"
+
+
+@pytest.mark.parametrize("runtime_path", ["index.ts", "main.py"])
+def test_root_skill_undeclared_code_source_keeps_package_mixed(runtime_path: str) -> None:
+    inventory = _inventory(
+        {
+            "openclaw.plugin.json": '{"id":"root-plugin"}',
+            "SKILL.md": "---\nname: x\ndescription: x\n---\n",
+            runtime_path: "PLUGIN_RUNTIME = True\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
 @pytest.mark.parametrize(
     ("runtime_path", "kind"),
     [

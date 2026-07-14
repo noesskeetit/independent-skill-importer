@@ -342,6 +342,37 @@ def test_root_openclaw_plugin_runtime_is_never_published_as_skill_payload(
     assert "SHOULD_NEVER_COPY_CONTENT" not in manifest
 
 
+@pytest.mark.parametrize("runtime_path", ["index.ts", "main.py"])
+def test_undeclared_root_plugin_runtime_is_never_published_as_skill_payload(
+    runtime_path: str,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(
+        source,
+        {
+            "SKILL.md": _skill("root-plugin-skill"),
+            "openclaw.plugin.json": json.dumps({"id": "root-plugin"}),
+            runtime_path: "PLUGIN_RUNTIME_SECRET = 'SHOULD_NEVER_COPY_CONTENT'\n",
+        },
+    )
+    out = tmp_path / "out"
+
+    report = _scan(source)
+    result = _import(source, out)
+
+    assert len(report.skills) == 1
+    analyzed = report.skills[0]
+    assert analyzed.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_RUNTIME_INSIDE_SKILL_ROOT in analyzed.reason_codes
+    assert result.imported == ()
+    assert len(result.skipped) == 1
+    assert list(out.iterdir()) == [out / "import-manifest.json"]
+    manifest = (out / "import-manifest.json").read_text(encoding="utf-8")
+    assert "SHOULD_NEVER_COPY_CONTENT" not in manifest
+
+
 def test_local_source_hardlink_escape_fails_before_publication(tmp_path: Path) -> None:
     outside = tmp_path / "outside-secret.txt"
     outside.write_text("must not be imported", encoding="utf-8")
