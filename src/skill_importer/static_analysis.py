@@ -71,6 +71,10 @@ _MARKDOWN_HEADING_RE = re.compile(
 _MARKDOWN_REFERENCE_DEFINITION_RE = re.compile(
     r"^ {0,3}\[(?P<label>[^\]]+)\]:[ \t]*(?:<(?P<angle>[^>]+)>|(?P<plain>\S+))"
 )
+_MARKDOWN_REFERENCE_LABEL_RE = re.compile(r"^ {0,3}\[(?P<label>[^\]]+)\]:[ \t]*$")
+_MARKDOWN_REFERENCE_DESTINATION_RE = re.compile(
+    r"^[ \t]{1,3}(?:<(?P<angle>[^>]+)>|(?P<plain>\S+))"
+)
 _MARKDOWN_REFERENCE_USAGE_RE = re.compile(
     r"!?\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]"
 )
@@ -1880,6 +1884,57 @@ def _markdown_fences(content: str) -> tuple[_MarkdownFence, ...]:
     return tuple(fences)
 
 
+def _markdown_code_span_ranges(
+    content: str,
+    structural_exclusions: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    """Pair equal-length backtick runs without rescanning source prefixes."""
+    runs: list[tuple[int, int, tuple[int, int]]] = []
+    barrier = 0
+    for match in re.finditer(r"`+", content):
+        while (
+            barrier < len(structural_exclusions)
+            and match.start() >= structural_exclusions[barrier][1]
+        ):
+            barrier += 1
+        if _offset_in_ranges(match.start(), structural_exclusions):
+            continue
+        runs.append(
+            (
+                match.start(),
+                match.end(),
+                (match.end() - match.start(), barrier),
+            )
+        )
+
+    next_run: list[int | None] = [None] * len(runs)
+    next_by_key: dict[tuple[int, int], int] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        key = runs[index][2]
+        next_run[index] = next_by_key.get(key)
+        next_by_key[key] = index
+
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(runs):
+        closing_index = next_run[index]
+        if closing_index is None:
+            index += 1
+            continue
+        spans.append((runs[index][0], runs[closing_index][1]))
+        index = closing_index + 1
+    return tuple(spans)
+
+
+def _markdown_offset_is_escaped(content: str, offset: int) -> bool:
+    backslashes = 0
+    cursor = offset - 1
+    while cursor >= 0 and content[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return backslashes % 2 == 1
+
+
 def _markdown_development_ranges(
     content: str,
     excluded_ranges: Sequence[tuple[int, int]],
@@ -1949,9 +2004,14 @@ def _markdown_path_references(
     structural_exclusions = _merge_offset_ranges(structural_ranges)
     development_ranges = _markdown_development_ranges(content, structural_exclusions)
     excluded_ranges = _merge_offset_ranges((*structural_exclusions, *development_ranges))
+    code_span_ranges = _markdown_code_span_ranges(content, structural_exclusions)
+    reference_exclusions = _merge_offset_ranges((*excluded_ranges, *code_span_ranges))
 
     for match in _MARKDOWN_DESTINATION_RE.finditer(content):
-        if _offset_in_ranges(match.start(), excluded_ranges):
+        if _offset_in_ranges(match.start(), reference_exclusions) or _markdown_offset_is_escaped(
+            content,
+            match.start(),
+        ):
             continue
         group = "angle" if match.group("angle") is not None else "plain"
         yield _PathReference(
@@ -1963,9 +2023,27 @@ def _markdown_path_references(
 
     definitions: dict[str, tuple[str, int]] = {}
     used_labels: set[str] = set()
+    pending_definition: str | None = None
     for offset, line in _iter_lines_with_offsets(content):
-        if _offset_in_ranges(offset, excluded_ranges):
+        if _offset_in_ranges(offset, reference_exclusions):
+            pending_definition = None
             continue
+        if pending_definition is not None:
+            destination = _MARKDOWN_REFERENCE_DESTINATION_RE.match(line)
+            label = pending_definition
+            pending_definition = None
+            if destination is not None:
+                group = "angle" if destination.group("angle") is not None else "plain"
+                destination_offset = offset + destination.start(group)
+                if not _offset_in_ranges(destination_offset, reference_exclusions):
+                    definitions.setdefault(
+                        label,
+                        (
+                            _clean_reference(destination.group(group)),
+                            destination_offset,
+                        ),
+                    )
+                    continue
         definition = _MARKDOWN_REFERENCE_DEFINITION_RE.match(line)
         if definition is not None:
             group = "angle" if definition.group("angle") is not None else "plain"
@@ -1977,10 +2055,28 @@ def _markdown_path_references(
                 ),
             )
             continue
+        definition_label = _MARKDOWN_REFERENCE_LABEL_RE.match(line)
+        if definition_label is not None:
+            pending_definition = _markdown_reference_label(
+                definition_label.group("label")
+            )
+            continue
         for usage in _MARKDOWN_REFERENCE_USAGE_RE.finditer(line):
+            usage_offset = offset + usage.start()
+            if _offset_in_ranges(
+                usage_offset,
+                reference_exclusions,
+            ) or _markdown_offset_is_escaped(content, usage_offset):
+                continue
             label = usage.group("label") or usage.group("text")
             used_labels.add(_markdown_reference_label(label))
         for usage in _MARKDOWN_SHORTCUT_REFERENCE_RE.finditer(line):
+            usage_offset = offset + usage.start()
+            if _offset_in_ranges(
+                usage_offset,
+                reference_exclusions,
+            ) or _markdown_offset_is_escaped(content, usage_offset):
+                continue
             used_labels.add(_markdown_reference_label(usage.group("label")))
     for label in sorted(used_labels):
         resolved_definition = definitions.get(label)

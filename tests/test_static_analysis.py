@@ -3027,6 +3027,67 @@ def test_corrected_review_commonmark_first_reference_definition_wins(
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
 
 
+def test_corrected_review_multiline_commonmark_reference_definition_is_tracked(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/guide.md": "guide\n",
+            "skills/alpha/SKILL.md": _skill(
+                "Read the [shared guide][g].\n\n"
+                "[g]:\n"
+                "  ../shared/guide.md\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [r"Escaped bracket text: \[guide].", "Inline code: `[guide]`.", "Code span: ``[guide]``."],
+)
+def test_corrected_review_escaped_and_code_span_brackets_are_not_references(
+    usage: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/guide.md": "guide\n",
+            "skills/alpha/SKILL.md": _skill(
+                f"{usage}\n\n[guide]: ../shared/guide.md\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_corrected_review_reference_definition_inside_code_span_is_inert(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/guide.md": "guide\n",
+            "skills/alpha/SKILL.md": _skill(
+                "Read the [guide].\n\n"
+                "``\n"
+                "[guide]: ../shared/guide.md\n"
+                "``\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
 def test_corrected_review_tilde_shell_fence_is_tracked(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
