@@ -10,6 +10,7 @@ import warnings
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import PurePosixPath
 from urllib.parse import unquote
 
@@ -66,25 +67,27 @@ _MARKDOWN_FENCE_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<body>[^`\r\n]+)`(?!`)")
-_MARKDOWN_FRONTMATTER_PATH_RE = re.compile(
-    r"^\s*(?:path|file|root|source)\s*:\s*[\"']?(?P<path>[^\s\"']+)",
-    re.IGNORECASE | re.MULTILINE,
+_YAML_FIELD_RE = re.compile(
+    r"^(?P<indent> *)(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(?P<value>.*)$",
 )
 _PYTHON_PATH_CALLS = frozenset(
     {
         "open",
-        "path",
-        "purepath",
         "load",
         "read_file",
-        "read_text",
         "readfile",
         "readfilesync",
         "write_file",
-        "write_text",
         "writefile",
         "writefilesync",
     }
+)
+_PYTHON_PATH_TYPES = frozenset({"path", "purepath"})
+_PYTHON_WRITE_METHODS = frozenset(
+    {"chmod", "mkdir", "rename", "replace", "rmdir", "touch", "unlink", "write_bytes", "write_text"}
+)
+_PYTHON_SUBPROCESS_CALLS = frozenset(
+    {"call", "check_call", "check_output", "popen", "run"}
 )
 _JAVASCRIPT_PATH_CALLS = {
     "import": "import",
@@ -119,13 +122,6 @@ _JAVASCRIPT_SUFFIXES = frozenset(
 )
 _SHELL_SUFFIXES = frozenset({".bash", ".sh", ".zsh"})
 _STRUCTURED_PATH_FIELDS = frozenset({"extends", "files", "include"})
-_JAVASCRIPT_FROM_RE = re.compile(
-    r"\b(?P<keyword>import|export)\b[^;\r\n]{0,512}?\bfrom\s*"
-    r"(?P<quote>[\"'])(?P<path>[^\"'\r\n]+)(?P=quote)"
-)
-_JAVASCRIPT_SIDE_EFFECT_IMPORT_RE = re.compile(
-    r"\b(?P<keyword>import)\b\s*(?P<quote>[\"'])(?P<path>[^\"'\r\n]+)(?P=quote)"
-)
 _MCP_TOOL_RE = re.compile(r"\bmcp__(?P<server>[A-Za-z0-9_.-]+)__(?P<tool>[A-Za-z0-9_.-]+)\b")
 _COMMAND_REFERENCE_RE = re.compile(
     r"(?<![\w-])/(?P<slash>[A-Za-z0-9_.-]+)\b"
@@ -395,6 +391,24 @@ class _PathReference:
 
 
 @dataclass(slots=True)
+class _JavaScriptToken:
+    kind: str
+    value: str
+    start: int
+    end: int
+
+
+@dataclass(slots=True)
+class _JavaScriptContext:
+    kind: str
+    brace_depth: int = 0
+    previous: _JavaScriptToken | None = None
+    parens: list[bool] = dataclass_field(default_factory=list)
+    template_token_index: int | None = None
+    template_dynamic: bool = False
+
+
+@dataclass(slots=True)
 class _OwnedComponents:
     mcp: set[str]
     commands: set[str]
@@ -644,6 +658,103 @@ def _python_open_access(call: ast.Call) -> str:
     return "read"
 
 
+def _python_symbols(
+    tree: ast.AST,
+) -> tuple[set[str], set[str], set[str], set[str]]:
+    path_names = set(_PYTHON_PATH_TYPES)
+    pathlib_modules = {"pathlib"}
+    subprocess_modules = {"subprocess"}
+    subprocess_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "pathlib":
+                    pathlib_modules.add((alias.asname or alias.name).casefold())
+                elif alias.name == "subprocess":
+                    subprocess_modules.add((alias.asname or alias.name).casefold())
+        elif isinstance(node, ast.ImportFrom) and node.module == "pathlib":
+            path_names.update(
+                (alias.asname or alias.name).casefold()
+                for alias in node.names
+                if alias.name.casefold() in _PYTHON_PATH_TYPES
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            subprocess_names.update(
+                (alias.asname or alias.name).casefold()
+                for alias in node.names
+                if alias.name.casefold() in _PYTHON_SUBPROCESS_CALLS
+            )
+    return path_names, pathlib_modules, subprocess_modules, subprocess_names
+
+
+def _python_is_path_constructor(
+    call: ast.Call,
+    path_names: set[str],
+    pathlib_modules: set[str],
+) -> bool:
+    if isinstance(call.func, ast.Name):
+        return call.func.id.casefold() in path_names
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr.casefold() in _PYTHON_PATH_TYPES
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id.casefold() in pathlib_modules
+    )
+
+
+def _python_path_receiver_access(
+    call: ast.Call,
+    parents: Mapping[int, ast.AST],
+) -> str:
+    attribute = parents.get(id(call))
+    parent_call = parents.get(id(attribute)) if attribute is not None else None
+    if not (
+        isinstance(attribute, ast.Attribute)
+        and attribute.value is call
+        and isinstance(parent_call, ast.Call)
+        and parent_call.func is attribute
+    ):
+        return "read"
+    method = attribute.attr.casefold()
+    if method in _PYTHON_WRITE_METHODS:
+        return "write"
+    if method == "open":
+        mode = parent_call.args[0] if parent_call.args else None
+        for keyword in parent_call.keywords:
+            if keyword.arg == "mode":
+                mode = keyword.value
+                break
+        if (
+            isinstance(mode, ast.Constant)
+            and isinstance(mode.value, str)
+            and any(flag in mode.value for flag in "wax+")
+        ):
+            return "write"
+    return "read"
+
+
+def _python_is_subprocess_call(
+    call: ast.Call,
+    subprocess_modules: set[str],
+    subprocess_names: set[str],
+) -> bool:
+    if isinstance(call.func, ast.Name):
+        return call.func.id.casefold() in subprocess_names
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr.casefold() in _PYTHON_SUBPROCESS_CALLS
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id.casefold() in subprocess_modules
+    )
+
+
+def _python_subprocess_argument(call: ast.Call) -> ast.expr | None:
+    argument = _python_call_argument(call)
+    if isinstance(argument, (ast.List, ast.Tuple)):
+        return argument.elts[0] if argument.elts else None
+    return argument
+
+
 def _python_import_reference(
     node: ast.Import | ast.ImportFrom,
     entry_path: str,
@@ -707,18 +818,39 @@ def _python_path_references(
         return
 
     line_starts = tuple([0, *(match.end() for match in re.finditer("\n", content))])
+    parents = {
+        id(child): node
+        for node in ast.walk(tree)
+        for child in ast.iter_child_nodes(node)
+    }
+    path_names, pathlib_modules, subprocess_modules, subprocess_names = _python_symbols(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            name = _python_call_name(node.func)
-            if name not in _PYTHON_PATH_CALLS:
-                continue
-            argument = _python_call_argument(node)
+            access = "read"
+            if _python_is_path_constructor(node, path_names, pathlib_modules):
+                argument = _python_call_argument(node)
+                access = _python_path_receiver_access(node, parents)
+            elif _python_is_subprocess_call(node, subprocess_modules, subprocess_names):
+                argument = _python_subprocess_argument(node)
+                access = "execute"
+            else:
+                name = _python_call_name(node.func)
+                if name not in _PYTHON_PATH_CALLS:
+                    continue
+                receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+                if isinstance(receiver, ast.Call) and _python_is_path_constructor(
+                    receiver,
+                    path_names,
+                    pathlib_modules,
+                ):
+                    continue
+                argument = _python_call_argument(node)
+                access = "write" if name.startswith("write") else "read"
+                if name == "open":
+                    access = _python_open_access(node)
             if argument is None:
                 continue
             value, dynamic = _python_argument_value(content, argument)
-            access = "write" if name.startswith("write") else "read"
-            if name == "open":
-                access = _python_open_access(node)
             syntax = "python.expression" if dynamic else "python.call"
             yield _PathReference(
                 value,
@@ -737,48 +869,165 @@ def _python_path_references(
                 )
 
 
-def _javascript_regex_start(content: str, offset: int) -> bool:
-    previous = offset - 1
-    while previous >= 0 and content[previous].isspace():
-        previous -= 1
-    if previous < 0 or content[previous] in "=(:,![{?;|&\n":
+_JAVASCRIPT_REGEX_PREFIX_KEYWORDS = frozenset(
+    {"case", "delete", "do", "else", "in", "instanceof", "new", "return", "throw", "typeof", "void", "yield"}
+)
+_JAVASCRIPT_CONTROL_KEYWORDS = frozenset({"catch", "for", "if", "switch", "while", "with"})
+_JAVASCRIPT_REGEX_PREFIX_TOKENS = frozenset(
+    {
+        "!",
+        "!=",
+        "!==",
+        "%",
+        "%=",
+        "&",
+        "&&",
+        "(",
+        "*",
+        "*=",
+        "+",
+        "+=",
+        ",",
+        "-",
+        "-=",
+        "/",
+        "/=",
+        ":",
+        ";",
+        "<",
+        "<=",
+        "=",
+        "==",
+        "===",
+        "=>",
+        ">",
+        ">=",
+        "?",
+        "??",
+        "[",
+        "^",
+        "|",
+        "||",
+        "{",
+        "~",
+    }
+)
+
+
+def _javascript_add_token(
+    tokens: list[_JavaScriptToken],
+    context: _JavaScriptContext,
+    kind: str,
+    value: str,
+    start: int,
+    end: int,
+) -> _JavaScriptToken:
+    token = _JavaScriptToken(kind, value, start, end)
+    tokens.append(token)
+    context.previous = token
+    return token
+
+
+def _javascript_regex_allowed(context: _JavaScriptContext) -> bool:
+    previous = context.previous
+    if previous is None or previous.kind == "control_close":
         return True
-    prefix = content[:offset].rstrip()
-    return any(prefix.endswith(keyword) for keyword in ("case", "delete", "return", "throw"))
+    if previous.kind == "identifier":
+        return previous.value in _JAVASCRIPT_REGEX_PREFIX_KEYWORDS
+    return previous.value in _JAVASCRIPT_REGEX_PREFIX_TOKENS
 
 
-def _javascript_code_mask(content: str) -> bytearray:
-    mask = bytearray(b"\x01") * len(content)
+def _javascript_tokens(content: str) -> tuple[list[_JavaScriptToken], bool]:
+    tokens: list[_JavaScriptToken] = []
+    contexts = [_JavaScriptContext("code")]
     offset = 0
     while offset < len(content):
+        context = contexts[-1]
         character = content[offset]
-        if character in {"\"", "'", "`"}:
-            quote = character
-            start = offset
+
+        if context.kind == "template":
+            if character == "\\":
+                offset += 2
+                continue
+            if character == "`":
+                if context.template_token_index is None:
+                    return tokens, True
+                token = tokens[context.template_token_index]
+                token.kind = "template_expression" if context.template_dynamic else "template"
+                token.end = offset
+                contexts.pop()
+                contexts[-1].previous = token
+                offset += 1
+                continue
+            if content.startswith("${", offset):
+                if context.template_token_index is None:
+                    return tokens, True
+                if not context.template_dynamic:
+                    token = tokens[context.template_token_index]
+                    token.value = f"{content[token.start : min(offset, token.start + 512)]}${{...}}"
+                    context.template_dynamic = True
+                contexts.append(_JavaScriptContext("template_expression"))
+                offset += 2
+                continue
             offset += 1
+            continue
+
+        if context.kind == "template_expression" and character == "}":
+            if context.brace_depth == 0:
+                if context.parens:
+                    return tokens, True
+                contexts.pop()
+                offset += 1
+                continue
+            context.brace_depth -= 1
+
+        if character.isspace():
+            offset += 1
+            continue
+        if content.startswith("//", offset):
+            end = content.find("\n", offset + 2)
+            offset = len(content) if end < 0 else end
+            continue
+        if content.startswith("/*", offset):
+            end = content.find("*/", offset + 2)
+            if end < 0:
+                return tokens, True
+            offset = end + 2
+            continue
+        if character in {"\"", "'"}:
+            quote = character
+            start = offset + 1
+            offset = start
             while offset < len(content):
                 if content[offset] == "\\":
                     offset += 2
                     continue
                 if content[offset] == quote:
+                    _javascript_add_token(
+                        tokens,
+                        context,
+                        "string",
+                        content[start:offset],
+                        start,
+                        offset,
+                    )
                     offset += 1
                     break
+                if content[offset] in "\r\n":
+                    return tokens, True
                 offset += 1
-            mask[start:offset] = b"\x00" * (offset - start)
+            else:
+                return tokens, True
             continue
-        if content.startswith("//", offset):
-            end = content.find("\n", offset + 2)
-            end = len(content) if end < 0 else end
-            mask[offset:end] = b"\x00" * (end - offset)
-            offset = end
+        if character == "`":
+            token = _javascript_add_token(tokens, context, "template", "", offset + 1, offset + 1)
+            contexts.append(
+                _JavaScriptContext("template", template_token_index=len(tokens) - 1)
+            )
+            context.previous = token
+            offset += 1
             continue
-        if content.startswith("/*", offset):
-            end = content.find("*/", offset + 2)
-            end = len(content) if end < 0 else end + 2
-            mask[offset:end] = b"\x00" * (end - offset)
-            offset = end
-            continue
-        if character == "/" and _javascript_regex_start(content, offset):
+        if character == "/" and _javascript_regex_allowed(context):
             start = offset
             offset += 1
             in_character_class = False
@@ -794,47 +1043,135 @@ def _javascript_code_mask(content: str) -> bytearray:
                     offset += 1
                     while offset < len(content) and content[offset].isalpha():
                         offset += 1
+                    _javascript_add_token(
+                        tokens,
+                        context,
+                        "regex",
+                        content[start:offset],
+                        start,
+                        offset,
+                    )
                     break
                 elif content[offset] in "\r\n":
-                    break
+                    return tokens, True
                 offset += 1
-            mask[start:offset] = b"\x00" * (offset - start)
+            else:
+                return tokens, True
             continue
-        offset += 1
-    return mask
-
-
-def _javascript_call_argument(
-    content: str,
-    name_end: int,
-) -> tuple[str, int, bool] | None:
-    offset = name_end
-    while offset < len(content) and content[offset].isspace():
-        offset += 1
-    if offset >= len(content) or content[offset] != "(":
-        return None
-    offset += 1
-    while offset < len(content) and content[offset].isspace():
-        offset += 1
-    if offset >= len(content):
-        return None
-    if content[offset] in {"\"", "'", "`"}:
-        quote = content[offset]
-        start = offset + 1
-        offset = start
-        while offset < len(content):
-            if content[offset] == "\\":
-                offset += 2
-                continue
-            if content[offset] == quote:
-                return content[start:offset], start, quote == "`" and "${" in content[start:offset]
+        if character.isalpha() or character in "_$":
+            start = offset
             offset += 1
+            while offset < len(content) and (
+                content[offset].isalnum() or content[offset] in "_$"
+            ):
+                offset += 1
+            _javascript_add_token(
+                tokens,
+                context,
+                "identifier",
+                content[start:offset],
+                start,
+                offset,
+            )
+            continue
+        if character.isdigit():
+            start = offset
+            offset += 1
+            while offset < len(content) and (
+                content[offset].isalnum() or content[offset] in "._"
+            ):
+                offset += 1
+            _javascript_add_token(
+                tokens,
+                context,
+                "number",
+                content[start:offset],
+                start,
+                offset,
+            )
+            continue
+
+        operator = next(
+            (
+                candidate
+                for size in (3, 2)
+                if (candidate := content[offset : offset + size])
+                in {"!=", "!==", "%=", "&&", "*=", "+=", "-=", "/=", "<=", "==", "===", "=>", ">=", "??", "||"}
+            ),
+            character,
+        )
+        kind = "punctuation"
+        if operator == "(":
+            control = (
+                context.previous is not None
+                and context.previous.kind == "identifier"
+                and context.previous.value in _JAVASCRIPT_CONTROL_KEYWORDS
+            )
+            context.parens.append(control)
+        elif operator == ")":
+            control = context.parens.pop() if context.parens else False
+            kind = "control_close" if control else kind
+        elif operator == "{" and context.kind == "template_expression":
+            context.brace_depth += 1
+        _javascript_add_token(tokens, context, kind, operator, offset, offset + len(operator))
+        offset += len(operator)
+
+    if len(contexts) != 1 or contexts[0].parens:
+        return tokens, True
+    return tokens, False
+
+
+def _javascript_static_imports(
+    tokens: list[_JavaScriptToken],
+) -> Iterable[_JavaScriptToken]:
+    declaration_stops = {"class", "const", "default", "function", "let", "var"}
+    for index, token in enumerate(tokens):
+        if token.kind != "identifier" or token.value not in {"export", "import"}:
+            continue
+        following = tokens[index + 1 : index + 34]
+        if not following or following[0].value in {"(", "."}:
+            continue
+        if token.value == "import" and following[0].kind == "string":
+            yield following[0]
+            continue
+        if following[0].kind == "identifier" and following[0].value in declaration_stops:
+            continue
+        for current_index, current in enumerate(following):
+            if current.start - token.start > 512 or current.value == ";":
+                break
+            if (
+                current.kind == "identifier"
+                and current.value == "from"
+                and current_index + 1 < len(following)
+                and following[current_index + 1].kind == "string"
+            ):
+                yield following[current_index + 1]
+                break
+
+
+def _javascript_call_reference(
+    content: str,
+    tokens: list[_JavaScriptToken],
+    index: int,
+) -> tuple[str, int, bool] | None:
+    if index + 2 >= len(tokens) or tokens[index + 1].value != "(":
         return None
-    end = offset
-    while end < len(content) and content[end] not in ",)\r\n" and end - offset < 256:
-        end += 1
-    value = content[offset:end].strip()
-    return (value, offset, True) if value else None
+    argument = tokens[index + 2]
+    if argument.value == ")":
+        return None
+    if argument.kind == "string":
+        return argument.value, argument.start, False
+    if argument.kind == "template":
+        return content[argument.start : argument.end], argument.start, False
+    if argument.kind == "template_expression":
+        return argument.value, argument.start, True
+    end = min(argument.end + 256, len(content))
+    for current in tokens[index + 3 : index + 35]:
+        if current.value in {",", ")"}:
+            end = min(end, current.start)
+            break
+    value = content[argument.start:end].strip()
+    return (value, argument.start, True) if value else None
 
 
 def _javascript_path_references(
@@ -842,23 +1179,28 @@ def _javascript_path_references(
     *,
     base_offset: int = 0,
 ) -> Iterable[_PathReference]:
-    code = _javascript_code_mask(content)
-    for pattern in (_JAVASCRIPT_FROM_RE, _JAVASCRIPT_SIDE_EFFECT_IMPORT_RE):
-        for match in pattern.finditer(content):
-            if not code[match.start("keyword")]:
-                continue
-            yield _PathReference(
-                match.group("path"),
-                base_offset + match.start("path"),
-                "import",
-                "javascript.import",
-            )
+    tokens, failed = _javascript_tokens(content)
+    if failed:
+        yield _PathReference(
+            "unparseable JavaScript/TypeScript source",
+            base_offset,
+            "unknown",
+            "javascript.parse_failure",
+        )
+        return
+    for path in _javascript_static_imports(tokens):
+        yield _PathReference(
+            path.value,
+            base_offset + path.start,
+            "import",
+            "javascript.import",
+        )
 
-    names = "|".join(sorted(_JAVASCRIPT_PATH_CALLS, key=len, reverse=True))
-    for match in re.finditer(rf"\b(?P<name>{names})\b", content, re.IGNORECASE):
-        if not code[match.start("name")]:
+    for index, token in enumerate(tokens):
+        name = token.value.casefold()
+        if token.kind != "identifier" or name not in _JAVASCRIPT_PATH_CALLS:
             continue
-        argument = _javascript_call_argument(content, match.end("name"))
+        argument = _javascript_call_reference(content, tokens, index)
         if argument is None:
             continue
         value, offset, dynamic = argument
@@ -866,7 +1208,7 @@ def _javascript_path_references(
         yield _PathReference(
             value,
             base_offset + offset,
-            _JAVASCRIPT_PATH_CALLS[match.group("name").casefold()],
+            _JAVASCRIPT_PATH_CALLS[name],
             syntax,
         )
 
@@ -892,6 +1234,42 @@ def _shell_token_offsets(line: str, tokens: list[str]) -> list[int]:
         offsets.append(position)
         cursor = position + len(token)
     return offsets
+
+
+def _shell_logical_lines(content: str) -> Iterable[tuple[str, tuple[int, ...]]]:
+    buffer: list[str] = []
+    source_offsets: list[int] = []
+    physical_offset = 0
+    for physical_line in content.splitlines(keepends=True):
+        body = physical_line.rstrip("\r\n")
+        newline_length = len(physical_line) - len(body)
+        trailing_backslashes = len(body) - len(body.rstrip("\\"))
+        continued = newline_length > 0 and trailing_backslashes % 2 == 1
+        kept = body[:-1] if continued else body
+        buffer.append(kept)
+        source_offsets.extend(range(physical_offset, physical_offset + len(kept)))
+        physical_offset += len(physical_line)
+        if continued:
+            continue
+        yield "".join(buffer), tuple(source_offsets)
+        buffer.clear()
+        source_offsets.clear()
+    if buffer:
+        yield "".join(buffer), tuple(source_offsets)
+
+
+def _shell_heredoc_markers(tokens: list[str]) -> tuple[tuple[str, bool], ...]:
+    markers: list[tuple[str, bool]] = []
+    for index, token in enumerate(tokens[:-1]):
+        if token not in {"<<", "<<-"}:
+            continue
+        delimiter = tokens[index + 1]
+        strip_tabs = token == "<<-" or delimiter.startswith("-")
+        if strip_tabs:
+            delimiter = delimiter.removeprefix("-")
+        if delimiter:
+            markers.append((delimiter, strip_tabs))
+    return tuple(markers)
 
 
 def _looks_shell_path(value: str) -> bool:
@@ -974,7 +1352,15 @@ def _shell_path_references(
     base_offset: int = 0,
     fail_closed: bool = True,
 ) -> Iterable[_PathReference]:
-    for line_offset, line in _iter_lines_with_offsets(content):
+    heredocs: list[tuple[str, bool]] = []
+    for line, source_map in _shell_logical_lines(content):
+        line_offset = source_map[0] if source_map else 0
+        if heredocs:
+            delimiter, strip_tabs = heredocs[0]
+            comparable = line.lstrip("\t") if strip_tabs else line
+            if comparable == delimiter:
+                heredocs.pop(0)
+            continue
         if line_offset == 0 and line.startswith("#!"):
             tokens, failed = _shell_tokens(line[2:])
             if failed:
@@ -986,12 +1372,16 @@ def _shell_path_references(
                         "shell.parse_failure",
                     )
                 return
-            offsets = _shell_token_offsets(line[2:], tokens)
+            logical_offsets = _shell_token_offsets(line[2:], tokens)
+            offsets = [
+                source_map[min(offset + 2, len(source_map) - 1)]
+                for offset in logical_offsets
+            ]
             for index in range(1, len(tokens)):
                 if _looks_shell_path(tokens[index]):
                     yield _PathReference(
                         tokens[index],
-                        base_offset + 2 + offsets[index],
+                        base_offset + offsets[index],
                         "execute",
                         "shell.shebang",
                     )
@@ -1006,7 +1396,11 @@ def _shell_path_references(
                     "shell.parse_failure",
                 )
             continue
-        offsets = _shell_token_offsets(line, tokens)
+        logical_offsets = _shell_token_offsets(line, tokens)
+        offsets = [
+            source_map[min(offset, len(source_map) - 1)] if source_map else line_offset
+            for offset in logical_offsets
+        ]
         segment_start = 0
         for index in range(len(tokens) + 1):
             if index < len(tokens) and tokens[index] not in {"&", "&&", ";", "|", "||"}:
@@ -1014,9 +1408,17 @@ def _shell_path_references(
             yield from _shell_segment_references(
                 tokens[segment_start:index],
                 offsets[segment_start:index],
-                base_offset=base_offset + line_offset,
+                base_offset=base_offset,
             )
             segment_start = index + 1
+        heredocs.extend(_shell_heredoc_markers(tokens))
+    if heredocs and fail_closed:
+        yield _PathReference(
+            "unclosed shell heredoc",
+            base_offset,
+            "unknown",
+            "shell.parse_failure",
+        )
 
 
 def _glob_pattern_variants(pattern: str) -> tuple[str, ...]:
@@ -1041,10 +1443,14 @@ def _inventory_glob_references(
     candidate_root: str,
     by_path: Mapping[str, InventoryEntry],
 ) -> tuple[str, ...]:
-    if _is_unsafe_host_reference(_decode_reference(value)):
+    decoded = _decode_reference(value)
+    if _is_unsafe_host_reference(decoded) or (
+        decoded != value and ".." in PurePosixPath(decoded).parts
+    ):
         return (value,)
-    bases = (PurePosixPath(entry_path).parent, PurePosixPath(candidate_root), PurePosixPath("."))
+    bases = (PurePosixPath(entry_path).parent, PurePosixPath(candidate_root))
     seen_bases: set[str] = set()
+    saw_escape = False
     for base in bases:
         base_value = base.as_posix()
         if base_value in seen_bases:
@@ -1052,6 +1458,7 @@ def _inventory_glob_references(
         seen_bases.add(base_value)
         pattern, escaped = _collapse_path(base, value)
         if escaped or pattern is None:
+            saw_escape = True
             continue
         variants = _glob_pattern_variants(pattern)
         matches = tuple(
@@ -1062,10 +1469,8 @@ def _inventory_glob_references(
         )
         if not matches:
             continue
-        if base_value == ".":
-            return matches
         return tuple(path.removeprefix(f"{base_value}/") for path in matches)
-    return (value,)
+    return (value,) if saw_escape else ()
 
 
 def _structured_path_references(
@@ -1148,12 +1553,71 @@ def _fenced_code_path_references(
         )
     elif language in {"javascript", "js", "jsx", "node", "ts", "tsx", "typescript"}:
         yield from _javascript_path_references(body, base_offset=base_offset)
-    else:
+    elif language in {"bash", "sh", "shell", "zsh"}:
         yield from _shell_path_references(
             body,
             base_offset=base_offset,
-            fail_closed=language in {"bash", "sh", "shell", "zsh"},
+            fail_closed=True,
         )
+
+
+def _markdown_frontmatter_bounds(content: str) -> tuple[int, int, int] | None:
+    if not content.startswith("---"):
+        return None
+    opening_end = content.find("\n")
+    if opening_end < 0:
+        return None
+    body_start = opening_end + 1
+    closing = re.search(r"^---[ \t]*\r?$", content[body_start:], re.MULTILINE)
+    if closing is None:
+        return None
+    body_end = body_start + closing.start()
+    closing_end = body_start + closing.end()
+    return body_start, body_end, closing_end
+
+
+def _frontmatter_path_references(
+    content: str,
+    *,
+    base_offset: int,
+) -> Iterable[_PathReference]:
+    scalar_indent: int | None = None
+    for line_offset, line in _iter_lines_with_offsets(content):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if scalar_indent is not None:
+            if indent > scalar_indent:
+                continue
+            scalar_indent = None
+        match = _YAML_FIELD_RE.match(line)
+        if match is None:
+            continue
+        value = match.group("value").strip()
+        if re.fullmatch(r"[|>](?:[+-][1-9]?|[1-9][+-]?)?", value):
+            scalar_indent = len(match.group("indent"))
+            continue
+        if match.group("key").casefold() not in {"file", "path", "root", "source"}:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"\"", "'"}:
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].strip()
+        if not value:
+            continue
+        value_column = line.find(match.group("value")) + len(match.group("value")) - len(
+            match.group("value").lstrip()
+        )
+        yield _PathReference(
+            _clean_reference(value),
+            base_offset + line_offset + max(value_column, 0),
+            "read",
+            "markdown.frontmatter",
+        )
+
+
+def _offset_in_ranges(offset: int, ranges: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= offset < end for start, end in ranges)
 
 
 def _markdown_path_references(
@@ -1163,7 +1627,20 @@ def _markdown_path_references(
     candidate_root: str,
     by_path: Mapping[str, InventoryEntry],
 ) -> Iterable[_PathReference]:
+    frontmatter = _markdown_frontmatter_bounds(content)
+    fences = tuple(_MARKDOWN_FENCE_RE.finditer(content))
+    excluded_ranges = tuple((match.start(), match.end()) for match in fences)
+    if frontmatter is not None:
+        body_start, body_end, closing_end = frontmatter
+        excluded_ranges = ((0, closing_end), *excluded_ranges)
+        yield from _frontmatter_path_references(
+            content[body_start:body_end],
+            base_offset=body_start,
+        )
+
     for match in _MARKDOWN_DESTINATION_RE.finditer(content):
+        if _offset_in_ranges(match.start(), excluded_ranges):
+            continue
         group = "angle" if match.group("angle") is not None else "plain"
         yield _PathReference(
             _clean_reference(match.group(group)),
@@ -1172,18 +1649,7 @@ def _markdown_path_references(
             "markdown.link",
         )
 
-    if content.startswith("---"):
-        frontmatter_end = content.find("\n---", 3)
-        if frontmatter_end >= 0:
-            for match in _MARKDOWN_FRONTMATTER_PATH_RE.finditer(content, 0, frontmatter_end):
-                yield _PathReference(
-                    _clean_reference(match.group("path")),
-                    match.start("path"),
-                    "read",
-                    "markdown.frontmatter",
-                )
-
-    for match in _MARKDOWN_FENCE_RE.finditer(content):
+    for match in fences:
         yield from _fenced_code_path_references(
             match.group("language").casefold(),
             match.group("body"),
@@ -1194,6 +1660,8 @@ def _markdown_path_references(
         )
 
     for match in _MARKDOWN_INLINE_CODE_RE.finditer(content):
+        if _offset_in_ranges(match.start(), excluded_ranges):
+            continue
         yield from _shell_path_references(
             match.group("body"),
             base_offset=match.start("body"),
@@ -2161,7 +2629,12 @@ def _analyze_forward_paths(
                 ),
             )
 
-        for reference in _path_references(entry, candidate.root, by_path):
+        written_values: set[str] = set()
+        references = sorted(
+            _path_references(entry, candidate.root, by_path),
+            key=lambda item: (item.offset, item.access != "write"),
+        )
+        for reference in references:
             raw = reference.value
             offset = reference.offset
             if reference.syntax.endswith(".parse_failure"):
@@ -2194,6 +2667,11 @@ def _analyze_forward_paths(
                     )
                 continue
             if not _is_candidate_local_reference(decoded):
+                continue
+            if reference.access == "write":
+                written_values.add(decoded)
+                continue
+            if reference.access == "read" and decoded in written_values:
                 continue
             if _PLUGIN_VARIABLE_RE.search(decoded) is not None:
                 continue

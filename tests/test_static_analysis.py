@@ -773,6 +773,260 @@ def test_known_source_parse_failure_is_fail_closed(tmp_path: Path) -> None:
     assert evidence.field == "source"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        'const value = `${require("../../../runtime/engine.js")}`;\n',
+        'const value = noreturn / require("../../../runtime/engine.js") / 2;\n',
+    ],
+)
+def test_review_javascript_code_context_sinks_remain_nonportable(
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.js": "export {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/tests/context.test.js": content,
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "export const note = 'from \"../../../runtime/not-real.js\"';\n",
+        'export const note = `require("../../../runtime/not-real.js")`;\n',
+        r'if (ready) /require("..\/..\/..\/runtime\/not-real.js")/.test(text);' "\n",
+    ],
+)
+def test_review_javascript_inert_lexical_contexts_have_no_path_evidence(
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/tests/context.test.js": content,
+        },
+    )
+
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
+
+
+def test_review_javascript_unclosed_string_is_fail_closed(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/broken.js": (
+                'const note = "unterminated\n'
+                'require("../../../runtime/engine.js");\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    evidence = _reason(result, ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED).evidence[0]
+    assert evidence.path == "skills/alpha/scripts/broken.js"
+    assert evidence.field == "source"
+
+
+def test_review_python_path_alias_receiver_remains_nonportable(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.py": "pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/tests/test_alias.py": (
+                "from pathlib import Path as P\n"
+                'P("../../../runtime/engine.py").read_text()\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_review_python_subprocess_argv_sink_remains_nonportable(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.sh": "exit 0\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/tests/test_runner.py": (
+                "import subprocess\n"
+                'subprocess.run(["../../../runtime/tool.sh"], check=True)\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_review_python_write_receiver_content_is_not_an_input_dependency(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/render.py": (
+                "import json\n"
+                "from pathlib import Path\n"
+                'Path("session.html").write_text(json.dumps({"ok": True}))\n'
+            ),
+        },
+    )
+
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
+
+
+def test_review_generated_output_read_is_not_an_input_dependency(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/tests/output.test.js": (
+                'const output = "session.html";\n'
+                "writeFileSync(output, html);\n"
+                'readFileSync(output, "utf8");\n'
+            ),
+        },
+    )
+
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+    } & result.reason_codes
+
+
+def test_review_shell_backslash_continuation_preserves_source_sink(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/env.sh": "export READY=1\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/check.sh": "source \\\n  ../shared/env.sh\n",
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED not in result.reason_codes
+
+
+def test_review_shell_heredoc_body_is_inert(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/env.sh": "export READY=1\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/check.sh": (
+                "cat <<'EOF'\n"
+                "source ../shared/env.sh\n"
+                "EOF\n"
+            ),
+        },
+    )
+
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "```text\n[fixture](../../../runtime/not-real.js)\n```\n",
+        "```text\nsource ../shared/env.sh\n```\n",
+    ],
+)
+def test_review_markdown_unknown_fence_content_is_inert(
+    body: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/env.sh": "export READY=1\n",
+            "skills/alpha/SKILL.md": _skill(body),
+        },
+    )
+
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
+
+
+def test_review_markdown_frontmatter_block_scalar_is_not_a_path_field(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": (
+                "---\n"
+                "name: alpha\n"
+                "description: |\n"
+                "  path: ../../../runtime/not-real.js\n"
+                "---\n"
+            )
+        },
+    )
+
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
+
+
+def test_review_tsconfig_glob_does_not_fall_back_to_repository_siblings(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/tsconfig.json": json.dumps({"include": ["**/*.ts"]}),
+            "skills/beta/only.ts": "export {};\n",
+        },
+    )
+
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
+
+
 def test_existing_parent_resource_is_outside_skill_and_nonportable(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
