@@ -69,8 +69,9 @@ _MARKDOWN_DESTINATION_RE = re.compile(
 )
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<body>[^`\r\n]+)`(?!`)")
 _MARKDOWN_INLINE_DESTINATION_BEFORE_RE = re.compile(
-    r"(?:\b(?:destination|output\s+path|write\s+target|source\.path|"
+    r"(?:\b(?:destination|output\s+path|write\s+target|"
     r"marketplace\s+config)\s*(?:is|=|:|as)"
+    r"|\bsource\.path\b[^`\r\n]{0,120}\bas"
     r"|\b(?:write|save|export)\s+(?:the\s+)?(?:result|output|report)\s+to)\s*$",
     re.IGNORECASE,
 )
@@ -81,6 +82,14 @@ _MARKDOWN_INLINE_DESTINATION_AFTER_RE = re.compile(
 )
 _MARKDOWN_INLINE_OPTIONAL_WORKSPACE_RE = re.compile(
     r"\bif\s+the\s+current\s+git\s+repo\s+already\s+has\b",
+    re.IGNORECASE,
+)
+_MARKDOWN_INLINE_DEPENDENCY_ACTION_RE = re.compile(
+    r"\b(?P<verb>call|execute|invoke|load|read|run|source|use)\b[^`\r\n]{0,120}$",
+    re.IGNORECASE,
+)
+_MARKDOWN_INLINE_OUTPUT_ROOT_PLACEHOLDER_RE = re.compile(
+    r"^<(?:plugin-path|repo-root)>(?:/|$)",
     re.IGNORECASE,
 )
 _MARKDOWN_HEADING_RE = re.compile(
@@ -147,6 +156,10 @@ _SHELL_PATH_COMMANDS = frozenset(
 )
 _SCRIPT_INTERPRETERS = frozenset({"bash", "bun", "deno", "node", "python", "python3", "sh"})
 _JAVASCRIPT_SUFFIXES = frozenset({".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"})
+_JAVASCRIPT_REPOSITORY_URL_RE = re.compile(r"\bimport\s*\.\s*meta\b")
+_JAVASCRIPT_ASSIGNMENT_OPERATORS = frozenset(
+    {"=", "%=", "&&=", "*=", "**=", "+=", "-=", "/=", "??=", "||="}
+)
 _SHELL_SUFFIXES = frozenset({".bash", ".sh", ".zsh"})
 _STRUCTURED_PATH_FIELDS = frozenset({"extends", "files", "include"})
 _MCP_TOOL_RE = re.compile(r"\bmcp__(?P<server>[A-Za-z0-9_.-]+)__(?P<tool>[A-Za-z0-9_.-]+)\b")
@@ -433,6 +446,7 @@ class _PathTaint:
     repository: bool = False
     plugin_value: str | None = None
     plugin_offset: int | None = None
+    uncertain: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,18 +665,67 @@ def _looks_explicit_path(value: str) -> bool:
     return bool(path.parts) and _normalized_component(path.parts[0]) in _EXPLICIT_LOCAL_DIRECTORIES
 
 
-def _node_offset(content: str, node: ast.AST, line_starts: tuple[int, ...]) -> int:
-    line_index = max(getattr(node, "lineno", 1) - 1, 0)
+def _python_position_offset(
+    content: str,
+    line_starts: tuple[int, ...],
+    line_number: int,
+    byte_column: int,
+    *,
+    source_is_ascii: bool,
+) -> int:
+    line_index = max(line_number - 1, 0)
     if line_index >= len(line_starts):
         return 0
     line_start = line_starts[line_index]
-    line_end = content.find("\n", line_start)
-    if line_end < 0:
-        line_end = len(content)
+    line_end = line_starts[line_index + 1] if line_index + 1 < len(line_starts) else len(content)
+    if source_is_ascii:
+        return min(line_start + max(byte_column, 0), line_end)
     line = content[line_start:line_end]
-    byte_column = max(getattr(node, "col_offset", 0), 0)
-    character_column = len(line.encode("utf-8")[:byte_column].decode("utf-8", "ignore"))
+    character_column = len(line.encode("utf-8")[: max(byte_column, 0)].decode("utf-8", "ignore"))
     return line_start + character_column
+
+
+def _node_offset(
+    content: str,
+    node: ast.AST,
+    line_starts: tuple[int, ...],
+    *,
+    source_is_ascii: bool,
+) -> int:
+    return _python_position_offset(
+        content,
+        line_starts,
+        getattr(node, "lineno", 1),
+        getattr(node, "col_offset", 0),
+        source_is_ascii=source_is_ascii,
+    )
+
+
+def _python_source_segment(
+    content: str,
+    node: ast.AST,
+    line_starts: tuple[int, ...],
+    *,
+    source_is_ascii: bool,
+) -> str | None:
+    end_line = getattr(node, "end_lineno", None)
+    end_column = getattr(node, "end_col_offset", None)
+    if end_line is None or end_column is None:
+        return None
+    start = _node_offset(
+        content,
+        node,
+        line_starts,
+        source_is_ascii=source_is_ascii,
+    )
+    end = _python_position_offset(
+        content,
+        line_starts,
+        end_line,
+        end_column,
+        source_is_ascii=source_is_ascii,
+    )
+    return content[start:end]
 
 
 def _python_call_name(node: ast.expr) -> str | None:
@@ -673,7 +736,13 @@ def _python_call_name(node: ast.expr) -> str | None:
     return None
 
 
-def _python_argument_value(content: str, node: ast.expr) -> tuple[str, bool]:
+def _python_argument_value(
+    content: str,
+    node: ast.expr,
+    line_starts: tuple[int, ...],
+    *,
+    source_is_ascii: bool,
+) -> tuple[str, bool]:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value, False
     if isinstance(node, ast.JoinedStr):
@@ -682,10 +751,27 @@ def _python_argument_value(content: str, node: ast.expr) -> tuple[str, bool]:
             if isinstance(part, ast.Constant) and isinstance(part.value, str):
                 parts.append(part.value)
             elif isinstance(part, ast.FormattedValue):
-                expression = ast.get_source_segment(content, part.value) or "expression"
+                expression = (
+                    _python_source_segment(
+                        content,
+                        part.value,
+                        line_starts,
+                        source_is_ascii=source_is_ascii,
+                    )
+                    or "expression"
+                )
                 parts.append(f"{{{expression}}}")
         return "".join(parts), True
-    return ast.get_source_segment(content, node) or type(node).__name__, True
+    return (
+        _python_source_segment(
+            content,
+            node,
+            line_starts,
+            source_is_ascii=source_is_ascii,
+        )
+        or type(node).__name__,
+        True,
+    )
 
 
 def _python_call_argument(call: ast.Call) -> ast.expr | None:
@@ -934,6 +1020,32 @@ def _static_reference_value(value: _StaticPathValue, entry_path: str) -> str:
     return posixpath.relpath(posixpath.normpath(value.value), start=source_parent)
 
 
+def _python_target_bindings(
+    target: ast.expr,
+    value: ast.expr,
+) -> Iterable[tuple[ast.Name, ast.expr]]:
+    if isinstance(target, ast.Name):
+        yield target, value
+        return
+    if not isinstance(target, (ast.List, ast.Tuple)):
+        return
+    if isinstance(value, (ast.List, ast.Tuple)) and len(target.elts) == len(value.elts):
+        for child_target, child_value in zip(target.elts, value.elts, strict=True):
+            yield from _python_target_bindings(child_target, child_value)
+        return
+    for child in ast.walk(target):
+        if isinstance(child, ast.Name):
+            yield child, value
+
+
+def _python_node_bindings(node: ast.AST) -> Iterable[tuple[ast.Name, ast.expr]]:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            yield from _python_target_bindings(target, node.value)
+    elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+        yield from _python_target_bindings(node.target, node.value)
+
+
 def _python_static_bindings(
     tree: ast.AST,
 ) -> tuple[dict[str, ast.expr], dict[str, tuple[ast.expr, ...]], bool]:
@@ -950,21 +1062,14 @@ def _python_static_bindings(
         ),
     )
     for node in assignments:
-        target: ast.expr | None = None
-        value: ast.expr | None = None
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target, value = node.targets[0], node.value
-        elif isinstance(node, ast.AnnAssign):
-            target, value = node.target, node.value
-        if not isinstance(target, ast.Name) or value is None:
-            continue
-        name = target.id
-        if stored_assignments >= _MAX_STATIC_BINDINGS:
-            overflow = True
-            continue
-        bindings[name] = value
-        values_by_name.setdefault(name, []).append(value)
-        stored_assignments += 1
+        for target, value in _python_node_bindings(node):
+            name = target.id
+            if stored_assignments >= _MAX_STATIC_BINDINGS:
+                overflow = True
+                continue
+            bindings[name] = value
+            values_by_name.setdefault(name, []).append(value)
+            stored_assignments += 1
     return (
         bindings,
         {name: tuple(values) for name, values in values_by_name.items()},
@@ -976,8 +1081,10 @@ def _merge_path_taints(taints: Iterable[_PathTaint]) -> _PathTaint:
     repository = False
     plugin_value: str | None = None
     plugin_offset: int | None = None
+    uncertain = False
     for taint in taints:
         repository = repository or taint.repository
+        uncertain = uncertain or taint.uncertain
         if taint.plugin_offset is not None and (
             plugin_offset is None or taint.plugin_offset < plugin_offset
         ):
@@ -987,6 +1094,7 @@ def _merge_path_taints(taints: Iterable[_PathTaint]) -> _PathTaint:
         repository=repository,
         plugin_value=plugin_value,
         plugin_offset=plugin_offset,
+        uncertain=uncertain,
     )
 
 
@@ -995,21 +1103,36 @@ def _python_path_taint(
     *,
     content: str,
     line_starts: tuple[int, ...],
+    source_is_ascii: bool,
     bindings: Mapping[str, tuple[ast.expr, ...]],
     memo: dict[str, _PathTaint],
     resolving: set[str],
     depth: int = 0,
 ) -> _PathTaint:
     if depth >= _MAX_STATIC_PROPAGATION_DEPTH:
-        return _PathTaint()
+        return _PathTaint(uncertain=True)
 
-    source = ast.get_source_segment(content, node) or ""
+    source = (
+        _python_source_segment(
+            content,
+            node,
+            line_starts,
+            source_is_ascii=source_is_ascii,
+        )
+        or ""
+    )
     plugin_match = _PLUGIN_VARIABLE_RE.search(source)
     direct = _PathTaint(
         repository=isinstance(node, ast.Name) and node.id == "__file__",
         plugin_value=plugin_match.group(0) if plugin_match is not None else None,
         plugin_offset=(
-            _node_offset(content, node, line_starts) + plugin_match.start()
+            _node_offset(
+                content,
+                node,
+                line_starts,
+                source_is_ascii=source_is_ascii,
+            )
+            + plugin_match.start()
             if plugin_match is not None
             else None
         ),
@@ -1029,6 +1152,7 @@ def _python_path_taint(
                 value,
                 content=content,
                 line_starts=line_starts,
+                source_is_ascii=source_is_ascii,
                 bindings=bindings,
                 memo=memo,
                 resolving=resolving,
@@ -1051,6 +1175,7 @@ def _python_path_taint(
                     child,
                     content=content,
                     line_starts=line_starts,
+                    source_is_ascii=source_is_ascii,
                     bindings=bindings,
                     memo=memo,
                     resolving=resolving,
@@ -1287,6 +1412,7 @@ def _python_static_consumed_path_references(
     *,
     entry_path: str,
     line_starts: tuple[int, ...],
+    source_is_ascii: bool,
     path_names: set[str],
     pathlib_modules: set[str],
     subprocess_modules: set[str],
@@ -1339,6 +1465,7 @@ def _python_static_consumed_path_references(
                 expression,
                 content=content,
                 line_starts=line_starts,
+                source_is_ascii=source_is_ascii,
                 bindings=taint_bindings,
                 memo=taint_memo,
                 resolving=set(),
@@ -1358,18 +1485,33 @@ def _python_static_consumed_path_references(
             uncertain_repository_value = (
                 value is not None
                 and not value.anchored_to_repository
-                and (taint.repository or (binding_overflow and value.propagated))
+                and (taint.repository or taint.uncertain or (binding_overflow and value.propagated))
             )
             if value is None or uncertain_repository_value:
-                if taint.repository or binding_overflow:
+                if taint.repository or taint.uncertain or binding_overflow:
                     reference = (
-                        ast.get_source_segment(content, expression) or type(expression).__name__
+                        _python_source_segment(
+                            content,
+                            expression,
+                            line_starts,
+                            source_is_ascii=source_is_ascii,
+                        )
+                        or type(expression).__name__
                     )
-                    offset = base_offset + _node_offset(content, expression, line_starts)
+                    offset = base_offset + _node_offset(
+                        content,
+                        expression,
+                        line_starts,
+                        source_is_ascii=source_is_ascii,
+                    )
                     syntax = (
                         "python.repo_tainted.expression"
                         if taint.repository
-                        else "python.binding_overflow.expression"
+                        else (
+                            "python.taint_limit.expression"
+                            if taint.uncertain
+                            else "python.binding_overflow.expression"
+                        )
                     )
                     identity = (reference, offset, access)
                     if identity not in emitted:
@@ -1380,7 +1522,12 @@ def _python_static_consumed_path_references(
             has_plugin_variable = _PLUGIN_VARIABLE_RE.search(reference) is not None
             if not value.propagated and not has_plugin_variable:
                 continue
-            offset = base_offset + _node_offset(content, expression, line_starts)
+            offset = base_offset + _node_offset(
+                content,
+                expression,
+                line_starts,
+                source_is_ascii=source_is_ascii,
+            )
             identity = (reference, offset, access)
             if identity in emitted:
                 continue
@@ -1451,6 +1598,7 @@ def _python_path_references(
         return
 
     line_starts = tuple([0, *(match.end() for match in re.finditer("\n", content))])
+    source_is_ascii = content.isascii()
     parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     path_names, pathlib_modules, subprocess_modules, subprocess_names = _python_symbols(tree)
     indirect_accesses = _python_indirect_path_accesses(
@@ -1490,11 +1638,22 @@ def _python_path_references(
             for argument in arguments:
                 if argument is None:
                     continue
-                value, dynamic = _python_argument_value(content, argument)
+                value, dynamic = _python_argument_value(
+                    content,
+                    argument,
+                    line_starts,
+                    source_is_ascii=source_is_ascii,
+                )
                 syntax = "python.expression" if dynamic else "python.call"
                 yield _PathReference(
                     value,
-                    base_offset + _node_offset(content, argument, line_starts),
+                    base_offset
+                    + _node_offset(
+                        content,
+                        argument,
+                        line_starts,
+                        source_is_ascii=source_is_ascii,
+                    ),
                     access,
                     syntax,
                 )
@@ -1503,7 +1662,13 @@ def _python_path_references(
             if import_value is not None:
                 yield _PathReference(
                     import_value,
-                    base_offset + _node_offset(content, node, line_starts),
+                    base_offset
+                    + _node_offset(
+                        content,
+                        node,
+                        line_starts,
+                        source_is_ascii=source_is_ascii,
+                    ),
                     "import",
                     "python.import",
                 )
@@ -1512,6 +1677,7 @@ def _python_path_references(
         content,
         entry_path=entry_path,
         line_starts=line_starts,
+        source_is_ascii=source_is_ascii,
         path_names=path_names,
         pathlib_modules=pathlib_modules,
         subprocess_modules=subprocess_modules,
@@ -1537,44 +1703,47 @@ _JAVASCRIPT_REGEX_PREFIX_KEYWORDS = frozenset(
     }
 )
 _JAVASCRIPT_CONTROL_KEYWORDS = frozenset({"catch", "for", "if", "switch", "while", "with"})
-_JAVASCRIPT_REGEX_PREFIX_TOKENS = frozenset(
-    {
-        "!",
-        "!=",
-        "!==",
-        "%",
-        "%=",
-        "&",
-        "&&",
-        "(",
-        "*",
-        "*=",
-        "+",
-        "+=",
-        ",",
-        "-",
-        "-=",
-        "/",
-        "/=",
-        ":",
-        ";",
-        "<",
-        "<=",
-        "=",
-        "==",
-        "===",
-        "=>",
-        ">",
-        ">=",
-        "?",
-        "??",
-        "[",
-        "^",
-        "|",
-        "||",
-        "{",
-        "~",
-    }
+_JAVASCRIPT_REGEX_PREFIX_TOKENS = (
+    frozenset(
+        {
+            "!",
+            "!=",
+            "!==",
+            "%",
+            "%=",
+            "&",
+            "&&",
+            "(",
+            "*",
+            "*=",
+            "+",
+            "+=",
+            ",",
+            "-",
+            "-=",
+            "/",
+            "/=",
+            ":",
+            ";",
+            "<",
+            "<=",
+            "=",
+            "==",
+            "===",
+            "=>",
+            ">",
+            ">=",
+            "?",
+            "??",
+            "[",
+            "^",
+            "|",
+            "||",
+            "{",
+            "~",
+        }
+    )
+    | _JAVASCRIPT_ASSIGNMENT_OPERATORS
 )
 
 
@@ -1759,6 +1928,8 @@ def _javascript_tokens(content: str) -> tuple[list[_JavaScriptToken], bool]:
                     "!==",
                     "%=",
                     "&&",
+                    "&&=",
+                    "**=",
                     "*=",
                     "+=",
                     "-=",
@@ -1769,7 +1940,9 @@ def _javascript_tokens(content: str) -> tuple[list[_JavaScriptToken], bool]:
                     "=>",
                     ">=",
                     "??",
+                    "??=",
                     "||",
+                    "||=",
                 }
             ),
             character,
@@ -1874,6 +2047,8 @@ def _javascript_expression_end(
             continue
         if tokens[index].value in {",", ";"}:
             return index
+        if index > start and tokens[index].value in {"const", "let", "var"}:
+            return index
         if index > start and "\n" in content[tokens[index - 1].end : tokens[index].start]:
             previous = tokens[index - 1]
             current = tokens[index]
@@ -1906,7 +2081,15 @@ def _javascript_expression_end(
                 ":",
                 "=>",
             }
-            incomplete_previous = continuation_tokens | {",", "=", "!", "~"}
+            incomplete_previous = (
+                continuation_tokens
+                | _JAVASCRIPT_ASSIGNMENT_OPERATORS
+                | {
+                    ",",
+                    "!",
+                    "~",
+                }
+            )
             if (
                 current.value not in continuation_tokens
                 and previous.value not in incomplete_previous
@@ -1953,21 +2136,59 @@ def _javascript_static_bindings(
     spans_by_name: dict[str, list[tuple[int, int]]] = {}
     overflow = False
     stored_bindings = 0
-    for index, token in enumerate(tokens):
-        if token.value not in {"const", "let", "var"} or index + 3 >= len(tokens):
-            continue
-        name = tokens[index + 1]
-        if name.kind != "identifier" or tokens[index + 2].value != "=":
-            continue
-        end = _javascript_expression_end(content, tokens, index + 3, len(tokens), pairs)
-        identifier = name.value
+    consumed_assignments: set[int] = set()
+
+    def store(identifier: str, assignment: int) -> None:
+        nonlocal overflow, stored_bindings
         if stored_bindings >= _MAX_STATIC_BINDINGS:
             overflow = True
-            continue
-        span = (index + 3, end)
+            return
+        start = assignment + 1
+        end = _javascript_expression_end(content, tokens, start, len(tokens), pairs)
+        span = (start, end)
         bindings[identifier] = span
         spans_by_name.setdefault(identifier, []).append(span)
+        consumed_assignments.add(assignment)
         stored_bindings += 1
+
+    for index, token in enumerate(tokens):
+        if token.value in {"const", "let", "var"} and index + 2 < len(tokens):
+            target = tokens[index + 1]
+            identifiers: tuple[str, ...]
+            if target.kind == "identifier":
+                identifiers = (target.value,)
+                cursor = index + 2
+            elif target.value in {"{", "["} and index + 1 in pairs:
+                closing = pairs[index + 1]
+                identifiers = tuple(
+                    item.value for item in tokens[index + 2 : closing] if item.kind == "identifier"
+                )
+                cursor = closing + 1
+            else:
+                continue
+            while cursor < len(tokens):
+                current = tokens[cursor]
+                if current.value in {"(", "[", "{"} and cursor in pairs:
+                    cursor = pairs[cursor] + 1
+                    continue
+                if current.value == "=":
+                    for identifier in identifiers:
+                        store(identifier, cursor)
+                    break
+                if current.value in {",", ";"}:
+                    break
+                if cursor > index + 2 and current.value in {"const", "let", "var"}:
+                    break
+                cursor += 1
+            continue
+        if (
+            token.kind == "identifier"
+            and index + 1 < len(tokens)
+            and tokens[index + 1].value in _JAVASCRIPT_ASSIGNMENT_OPERATORS
+            and index + 1 not in consumed_assignments
+            and (index == 0 or tokens[index - 1].value not in {".", "?."})
+        ):
+            store(token.value, index + 1)
     return (
         bindings,
         {name: tuple(spans) for name, spans in spans_by_name.items()},
@@ -1987,7 +2208,7 @@ def _javascript_path_taint(
     depth: int = 0,
 ) -> _PathTaint:
     if depth >= _MAX_STATIC_PROPAGATION_DEPTH or start >= end:
-        return _PathTaint()
+        return _PathTaint(uncertain=depth >= _MAX_STATIC_PROPAGATION_DEPTH)
 
     source_start = tokens[start].start
     source_end = tokens[end - 1].end
@@ -1995,8 +2216,10 @@ def _javascript_path_taint(
     plugin_match = _PLUGIN_VARIABLE_RE.search(source)
     direct = _PathTaint(
         repository=any(
-            token.kind == "identifier" and token.value == "__dirname" for token in tokens[start:end]
-        ),
+            token.kind == "identifier" and token.value in {"__dirname", "__filename"}
+            for token in tokens[start:end]
+        )
+        or _JAVASCRIPT_REPOSITORY_URL_RE.search(source) is not None,
         plugin_value=plugin_match.group(0) if plugin_match is not None else None,
         plugin_offset=source_start + plugin_match.start() if plugin_match is not None else None,
     )
@@ -2285,12 +2508,16 @@ def _javascript_path_references(
             uncertain_repository_value = (
                 static_value is not None
                 and not static_value.anchored_to_repository
-                and (taint.repository or (binding_overflow and static_value.propagated))
+                and (
+                    taint.repository
+                    or taint.uncertain
+                    or (binding_overflow and static_value.propagated)
+                )
             )
             if static_value is not None and not uncertain_repository_value:
                 value = _static_reference_value(static_value, entry_path)
                 dynamic = False
-            elif taint.repository or binding_overflow:
+            elif taint.repository or taint.uncertain or binding_overflow:
                 source_start = tokens[span[0]].start
                 source_end = tokens[span[1] - 1].end
                 value = content[source_start:source_end]
@@ -2299,7 +2526,11 @@ def _javascript_path_references(
                 syntax = (
                     "javascript.repo_tainted.expression"
                     if taint.repository
-                    else "javascript.binding_overflow.expression"
+                    else (
+                        "javascript.taint_limit.expression"
+                        if taint.uncertain
+                        else "javascript.binding_overflow.expression"
+                    )
                 )
                 yield _PathReference(
                     value,
@@ -2731,11 +2962,27 @@ def _markdown_inline_code_has_dependency_context(
     suffix = content[match.end() : line_end]
     body = match.group("body").strip()
     if not any(character.isspace() for character in body) and _looks_shell_path(body):
-        proven_output_context = (
-            re.search(r"<[^>]+>", body) is not None
-            or _MARKDOWN_INLINE_DESTINATION_BEFORE_RE.search(prefix) is not None
+        local_prefix = prefix.rsplit("`", 1)[-1]
+        plain_prefix = prefix.replace("`", "")
+        explicit_output_context = (
+            _MARKDOWN_INLINE_DESTINATION_BEFORE_RE.search(plain_prefix) is not None
             or _MARKDOWN_INLINE_DESTINATION_AFTER_RE.search(suffix) is not None
-            or _MARKDOWN_INLINE_OPTIONAL_WORKSPACE_RE.search(prefix) is not None
+        )
+        dependency_action = _MARKDOWN_INLINE_DEPENDENCY_ACTION_RE.search(local_prefix)
+        has_placeholder = re.search(r"<[^>]+>", body) is not None
+        output_root_placeholder = (
+            _MARKDOWN_INLINE_OUTPUT_ROOT_PLACEHOLDER_RE.match(body) is not None
+        )
+        if (
+            not explicit_output_context
+            and dependency_action is not None
+            and (not output_root_placeholder or dependency_action.group("verb").casefold() != "use")
+        ):
+            return True
+        if has_placeholder:
+            return False
+        proven_output_context = explicit_output_context or (
+            "`" not in prefix and _MARKDOWN_INLINE_OPTIONAL_WORKSPACE_RE.search(prefix) is not None
         )
         return not proven_output_context
     tokens, failed = _shell_tokens(body)
@@ -2747,11 +2994,8 @@ def _development_fence_reference_is_relevant(reference: _PathReference) -> bool:
     path = PurePosixPath(decoded)
     if _PLUGIN_VARIABLE_RE.search(decoded) is not None or ".." in path.parts:
         return True
-    name = path.name.casefold()
     return not (
-        reference.access == "execute"
-        and path.parts[:1] == ("scripts",)
-        and re.match(r"(?:validate|lint|test|check)(?:[-_.]|$)", name) is not None
+        reference.access == "execute" and path.as_posix().casefold() == "scripts/validate-skills"
     )
 
 
@@ -3094,11 +3338,19 @@ def _markdown_path_references(
             continue
         if not _markdown_inline_code_has_dependency_context(content, match):
             continue
-        yield from _shell_path_references(
-            match.group("body"),
-            base_offset=match.start("body"),
-            fail_closed=False,
-        )
+        body = match.group("body").strip()
+        if (
+            not any(character.isspace() for character in body)
+            and _looks_shell_path(body)
+            and re.search(r"<[^>]+>", body) is not None
+        ):
+            yield _PathReference(body, match.start("body"), "read", "markdown.inline")
+        else:
+            yield from _shell_path_references(
+                match.group("body"),
+                base_offset=match.start("body"),
+                fail_closed=False,
+            )
 
 
 def _path_references(
@@ -4329,8 +4581,10 @@ def _is_proven_package_context(reference: _PathReference) -> bool:
             "markdown.",
             "python.repo_tainted.",
             "python.binding_overflow.",
+            "python.taint_limit.",
             "javascript.repo_tainted.",
             "javascript.binding_overflow.",
+            "javascript.taint_limit.",
         )
     )
 

@@ -570,7 +570,11 @@ def test_markdown_bare_inline_destination_paths_are_not_dependencies(
                 "If the current Git repo already has `.agents/plugins/marketplace.json`, ask "
                 "which marketplace to update.\n"
                 "Generated plugin packages use `./plugins/` as their destination.\n"
+                "Open `<plugin-path>/.codex-plugin/plugin.json` after generation.\n"
+                "Repo plugins use `<repo-root>/.agents/plugins/marketplace.json`.\n"
                 "Keep source.path as `./plugins/<plugin-name>`.\n"
+                "Keep marketplace `source.path` relative to the selected marketplace root as "
+                "`./plugins/<plugin-name>`.\n"
                 "- Repo/team plugin: `./plugins/<plugin-name>`\n"
                 "- Example: with `~/.agents/plugins/marketplace.json`, "
                 "`./plugins/<plugin-name>` resolves under the selected destination.\n"
@@ -578,6 +582,26 @@ def test_markdown_bare_inline_destination_paths_are_not_dependencies(
         },
         root=".agents/skills/plugin-creator",
         directories=frozenset({"plugins"}),
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert result.reason_codes == frozenset({ReasonCode.STANDALONE_NO_PLUGIN_BOUNDARY})
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "Output names are `image_1.<ext>` and `image_2.<ext>`.\n",
+        "Installs into `$CODEX_HOME/skills/<skill-name>`.\n",
+    ],
+)
+def test_markdown_output_templates_are_not_local_dependencies(
+    instruction: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill(instruction)},
     )
 
     assert result.classification is Classification.PORTABLE
@@ -678,6 +702,38 @@ def test_markdown_output_words_do_not_hide_runtime_dependencies(
 
     assert result.classification is Classification.PLUGIN_BOUND
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "Load `../../plugins/<plugin-name>/runtime.js`.",
+        "Load `<repo-root>/runtime/tool.py`.",
+        "Execute `<plugin-path>/scripts/tool.py`.",
+        (
+            "If the current Git repo already has `.agents/plugins/marketplace.json`, "
+            "load `../../runtime/tool.py`."
+        ),
+    ],
+)
+def test_markdown_templates_and_optional_context_do_not_hide_explicit_loads(
+    instruction: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.py": "pass\n",
+            ".agents/plugins/marketplace.json": "{}\n",
+            "skills/alpha/SKILL.md": _skill(f"{instruction}\n"),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
 
 
 def test_repository_root_relative_escape_without_inventory_target_is_external(
@@ -3136,6 +3192,32 @@ def test_development_fence_tracks_bare_plugin_runtime_paths(
     assert any(runtime_path in evidence.value for evidence in reason.evidence)
 
 
+@pytest.mark.parametrize(
+    "runtime_path",
+    [
+        "scripts/check-runtime.js",
+        "scripts/validate-plugin.py",
+        "scripts/lint-server.sh",
+        "scripts/test-agent.js",
+    ],
+)
+def test_development_fence_only_ignores_the_known_repository_validator(
+    runtime_path: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            runtime_path: "exit 0\n",
+            "skills/alpha/SKILL.md": _skill(f"## Development\n```bash\n{runtime_path}\n```\n"),
+        },
+        executables=frozenset({runtime_path}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
 def test_corrected_review_real_session_viewer_validate_section_is_inert(
     tmp_path: Path,
 ) -> None:
@@ -3576,6 +3658,49 @@ def test_python_repo_root_in_one_function_survives_same_local_name_elsewhere(
 
 
 @pytest.mark.parametrize(
+    "binding",
+    [
+        "if root := Path(__file__).resolve().parents[2]:\n"
+        '    (root / "runtime/engine.py").read_text()\n',
+        "root, label = (Path(__file__).resolve().parents[2], 'runtime')\n"
+        '(root / "runtime/engine.py").read_text()\n',
+    ],
+)
+def test_python_assignment_forms_preserve_repository_taint(
+    binding: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.py": "def run(): pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runner.py": "from pathlib import Path\n" + binding,
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_python_alias_depth_limit_fails_closed(tmp_path: Path) -> None:
+    aliases = ["root0 = Path(__file__).resolve().parents[2]"]
+    aliases.extend(f"root{index} = root{index - 1}" for index in range(1, 40))
+    aliases.append('(root39 / "runtime/engine.py").read_text()')
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.py": "def run(): pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runner.py": "from pathlib import Path\n" + "\n".join(aliases),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
+@pytest.mark.parametrize(
     "expression",
     [
         "root / ('runtime/' + 'engine.py')",
@@ -3713,6 +3838,152 @@ def test_javascript_repo_root_in_one_function_survives_same_local_name_elsewhere
 
     assert result.classification is Classification.PLUGIN_BOUND
     assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        'const root: string = path.join(__dirname, "../../../runtime/engine.js");',
+        'let root; root = path.join(__dirname, "../../../runtime/engine.js");',
+        ('let root = "local-output"; root = path.join(__dirname, "../../../runtime/engine.js");'),
+    ],
+)
+def test_javascript_assignment_forms_preserve_repository_taint(
+    binding: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.js": "export const run = () => {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/runner.ts": (
+                'const path = require("node:path");\n'
+                'const { readFileSync } = require("node:fs");\n'
+                f"{binding}\n"
+                'readFileSync(root, "utf8");\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_javascript_esm_import_meta_url_is_repository_tainted(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.js": "export const run = () => {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/runner.mjs": (
+                'import { fileURLToPath } from "node:url";\n'
+                'import { readFileSync } from "node:fs";\n'
+                "const root = fileURLToPath(import.meta.url);\n"
+                'const target = new URL("../../../runtime/engine.js", root);\n'
+                'readFileSync(target, "utf8");\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        (
+            "const meta = import.meta;\n"
+            'const target = new URL("../../../runtime/engine.js", meta.url);\n'
+        ),
+        (
+            "const { url } = import.meta;\n"
+            'const target = new URL("../../../runtime/engine.js", url);\n'
+        ),
+        ('let target;\ntarget ??= new URL("../../../runtime/engine.js", import.meta.url);\n'),
+    ],
+)
+def test_javascript_esm_alias_and_deferred_assignments_fail_closed(
+    binding: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.js": "export const run = () => {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/runner.mjs": (
+                'import { readFileSync } from "node:fs";\n'
+                f"{binding}"
+                'readFileSync(target, "utf8");\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
+def test_javascript_nested_assignment_does_not_truncate_initializer_taint(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.js": "export const run = () => {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runner.js": (
+                'const path = require("node:path");\n'
+                'const { readFileSync } = require("node:fs");\n'
+                "const ok = true;\n"
+                "let nested;\n"
+                "const target = ok "
+                '? (nested = path.join(__dirname, "../../runtime/engine.js")) '
+                ': "local";\n'
+                'readFileSync(target, "utf8");\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
+def test_javascript_alias_depth_limit_fails_closed(tmp_path: Path) -> None:
+    aliases = ['const root0 = path.resolve(__dirname, "../..");']
+    aliases.extend(f"const root{index} = root{index - 1};" for index in range(1, 40))
+    aliases.append('readFileSync(path.join(root39, "runtime/engine.js"), "utf8");')
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.js": "export const run = () => {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runner.js": (
+                'const path = require("node:path");\n'
+                'const { readFileSync } = require("node:fs");\n' + "\n".join(aliases)
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
+def test_javascript_expression_boundaries_stop_at_next_declaration() -> None:
+    content = " ".join(f"const value{index} = 'x'" for index in range(64))
+    tokens, failed = static_analysis_module._javascript_tokens(content)
+    pairs = static_analysis_module._javascript_matching_pairs(tokens)
+
+    bindings, _, _ = static_analysis_module._javascript_static_bindings(
+        content,
+        tokens,
+        pairs,
+    )
+
+    first_end = bindings["value0"][1]
+    assert failed is False
+    assert tokens[first_end].value == "const"
 
 
 def test_javascript_semicolonless_repo_relative_read_is_nonportable(tmp_path: Path) -> None:

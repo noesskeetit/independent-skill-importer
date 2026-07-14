@@ -104,9 +104,14 @@ _ROOT_SKILL_PAYLOAD_DIRECTORY_NAMES = frozenset(
 _CODE_SOURCE_SUFFIXES = frozenset(
     {
         ".c",
+        ".bash",
+        ".bat",
         ".cc",
+        ".cjs",
         ".cpp",
         ".cs",
+        ".cts",
+        ".cmd",
         ".cxx",
         ".go",
         ".h",
@@ -118,8 +123,10 @@ _CODE_SOURCE_SUFFIXES = frozenset(
         ".kts",
         ".lua",
         ".mjs",
+        ".mts",
         ".php",
         ".pl",
+        ".ps1",
         ".py",
         ".rb",
         ".rs",
@@ -127,6 +134,8 @@ _CODE_SOURCE_SUFFIXES = frozenset(
         ".swift",
         ".ts",
         ".tsx",
+        ".fish",
+        ".zsh",
     }
 )
 _MAX_MANIFEST_NODES = 4096
@@ -293,6 +302,8 @@ def _classify_package(
             _is_within(entry.path, skill_root) for skill_root in nested_skill_roots
         ):
             continue
+        if _is_documentation_or_marketplace(entry.path, root):
+            continue
         if (
             root_is_skill
             and _is_known_runtime_directory(entry.path, root)
@@ -302,8 +313,6 @@ def _classify_package(
         if root_is_skill and _is_undeclared_root_runtime_source(entry, root):
             return "mixed"
         if any(_is_within(entry.path, skill_root) for skill_root in enclosed_skill_roots):
-            continue
-        if _is_documentation_or_marketplace(entry.path, root):
             continue
         if entry.kind == "directory":
             if _is_known_runtime_directory(entry.path, root):

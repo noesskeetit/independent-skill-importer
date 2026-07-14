@@ -348,7 +348,22 @@ def test_nested_skill_code_payload_does_not_make_root_package_mixed() -> None:
     assert detect_boundaries(inventory)[0].package_kind == "skills_only"
 
 
-@pytest.mark.parametrize("runtime_path", ["index.ts", "main.py"])
+@pytest.mark.parametrize(
+    "runtime_path",
+    [
+        "index.ts",
+        "main.py",
+        "index.cjs",
+        "index.cts",
+        "index.mts",
+        "run.bash",
+        "run.bat",
+        "run.cmd",
+        "run.fish",
+        "run.ps1",
+        "run.zsh",
+    ],
+)
 def test_root_skill_undeclared_code_source_keeps_package_mixed(runtime_path: str) -> None:
     inventory = _inventory(
         {
@@ -359,6 +374,21 @@ def test_root_skill_undeclared_code_source_keeps_package_mixed(runtime_path: str
     )
 
     assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
+@pytest.mark.parametrize("documentation_path", ["docs/example.py", "examples/demo.py"])
+def test_root_skill_documentation_code_examples_remain_skills_only(
+    documentation_path: str,
+) -> None:
+    inventory = _inventory(
+        {
+            "openclaw.plugin.json": '{"id":"metadata-only"}',
+            "SKILL.md": "---\nname: x\ndescription: x\n---\n",
+            documentation_path: "EXAMPLE_ONLY = True\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "skills_only"
 
 
 @pytest.mark.parametrize(

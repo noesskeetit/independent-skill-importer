@@ -342,7 +342,22 @@ def test_root_openclaw_plugin_runtime_is_never_published_as_skill_payload(
     assert "SHOULD_NEVER_COPY_CONTENT" not in manifest
 
 
-@pytest.mark.parametrize("runtime_path", ["index.ts", "main.py"])
+@pytest.mark.parametrize(
+    "runtime_path",
+    [
+        "index.ts",
+        "main.py",
+        "index.cjs",
+        "index.cts",
+        "index.mts",
+        "run.bash",
+        "run.bat",
+        "run.cmd",
+        "run.fish",
+        "run.ps1",
+        "run.zsh",
+    ],
+)
 def test_undeclared_root_plugin_runtime_is_never_published_as_skill_payload(
     runtime_path: str,
     tmp_path: Path,
