@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
+import shlex
+import warnings
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -58,31 +61,70 @@ _DYNAMIC_RE = re.compile(r"\$(?:\{[^}]+\}|[A-Za-z_][A-Za-z0-9_]*)|[*?]|\{[^}]+\}
 _MARKDOWN_DESTINATION_RE = re.compile(
     r"!?\[[^\]]*\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<plain>[^)\s]+))",
 )
-_PATH_TOKEN_RE = re.compile(
-    r"(?<![\w:/.-])"
-    r"(?P<path>(?:(?:\.\.?/)+|\$\{[A-Za-z_][A-Za-z0-9_]*\}/|"
-    r"[A-Za-z0-9_.-]+/)[A-Za-z0-9_.$/{}/?*+-]+)"
+_MARKDOWN_FENCE_RE = re.compile(
+    r"^```(?P<language>[A-Za-z0-9_+-]*)[^\r\n]*\r?\n(?P<body>.*?)(?:^```\s*$|\Z)",
+    re.MULTILINE | re.DOTALL,
 )
-_HOST_PATH_TOKEN_RE = re.compile(
-    r"(?P<file>file://[^\s`'\"<>]+)"
-    r"|(?P<windows>(?<![A-Za-z0-9])[A-Za-z]:(?:\\|/(?!/))[^\s`'\"<>]+)"
-    r"|(?P<posix>(?<![\w:/.$}%])/(?!/)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)"
-    r"|(?P<encoded>(?<![A-Za-z0-9:/])(?:%2e|%2f|%5c)[^\s`'\"<>]+)",
-    re.IGNORECASE,
-)
-_BACKSLASH_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])(?P<path>(?:\.\.\\|\.\\|~\\)[^\s`'\"<>]+)")
-_HOME_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_./:])(?P<path>~/[^\s`'\"<>]{1,1024})")
-_FILE_API_ONE_SEGMENT_PATH_RE = re.compile(
-    r"\b(?:open|path|readFile|readFileSync|load)\s*\(\s*[\"']"
-    r"(?P<path>/(?!/)[A-Za-z0-9_.-]{1,256}|~/[A-Za-z0-9_.-]{1,256})[\"']",
-    re.IGNORECASE,
-)
-_SHELL_ONE_SEGMENT_PATH_RE = re.compile(
-    r"^\s*(?:[-*+]\s+|\$\s+|>\s+)?"
-    r"(?:source|cat|less|head|tail|stat|ls|cd|rm|cp|mv|chmod|chown)\s+"
-    r"(?:-[A-Za-z0-9_.-]+\s+)*"
-    r"(?P<path>/(?!/)[A-Za-z0-9_.-]{1,256}|~/[A-Za-z0-9_.-]{1,256})(?:\s|$)",
+_MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<body>[^`\r\n]+)`(?!`)")
+_MARKDOWN_FRONTMATTER_PATH_RE = re.compile(
+    r"^\s*(?:path|file|root|source)\s*:\s*[\"']?(?P<path>[^\s\"']+)",
     re.IGNORECASE | re.MULTILINE,
+)
+_PYTHON_PATH_CALLS = frozenset(
+    {
+        "open",
+        "path",
+        "purepath",
+        "load",
+        "read_file",
+        "read_text",
+        "readfile",
+        "readfilesync",
+        "write_file",
+        "write_text",
+        "writefile",
+        "writefilesync",
+    }
+)
+_JAVASCRIPT_PATH_CALLS = {
+    "import": "import",
+    "require": "import",
+    "load": "read",
+    "open": "read",
+    "readfile": "read",
+    "readfilesync": "read",
+    "writefile": "write",
+    "writefilesync": "write",
+}
+_SHELL_PATH_COMMANDS = frozenset(
+    {
+        ".",
+        "cat",
+        "cd",
+        "chmod",
+        "chown",
+        "cp",
+        "head",
+        "less",
+        "ls",
+        "mv",
+        "rm",
+        "source",
+        "stat",
+        "tail",
+    }
+)
+_JAVASCRIPT_SUFFIXES = frozenset(
+    {".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"}
+)
+_SHELL_SUFFIXES = frozenset({".bash", ".sh", ".zsh"})
+_STRUCTURED_PATH_FIELDS = frozenset({"extends", "files", "include"})
+_JAVASCRIPT_FROM_RE = re.compile(
+    r"\b(?P<keyword>import|export)\b[^;\r\n]{0,512}?\bfrom\s*"
+    r"(?P<quote>[\"'])(?P<path>[^\"'\r\n]+)(?P=quote)"
+)
+_JAVASCRIPT_SIDE_EFFECT_IMPORT_RE = re.compile(
+    r"\b(?P<keyword>import)\b\s*(?P<quote>[\"'])(?P<path>[^\"'\r\n]+)(?P=quote)"
 )
 _MCP_TOOL_RE = re.compile(r"\bmcp__(?P<server>[A-Za-z0-9_.-]+)__(?P<tool>[A-Za-z0-9_.-]+)\b")
 _COMMAND_REFERENCE_RE = re.compile(
@@ -344,6 +386,14 @@ class StaticAnalysisResult:
         return frozenset(reason.code for reason in self.reasons)
 
 
+@dataclass(frozen=True, slots=True)
+class _PathReference:
+    value: str
+    offset: int
+    access: str
+    syntax: str
+
+
 @dataclass(slots=True)
 class _OwnedComponents:
     mcp: set[str]
@@ -533,37 +583,661 @@ def _looks_explicit_path(value: str) -> bool:
     return bool(path.parts) and _normalized_component(path.parts[0]) in _EXPLICIT_LOCAL_DIRECTORIES
 
 
-def _is_first_line_shebang_interpreter(content: str, match: re.Match[str]) -> bool:
-    start = match.start()
+def _node_offset(content: str, node: ast.AST, line_starts: tuple[int, ...]) -> int:
+    line_index = max(getattr(node, "lineno", 1) - 1, 0)
+    if line_index >= len(line_starts):
+        return 0
+    line_start = line_starts[line_index]
+    line_end = content.find("\n", line_start)
+    if line_end < 0:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    byte_column = max(getattr(node, "col_offset", 0), 0)
+    character_column = len(line.encode("utf-8")[:byte_column].decode("utf-8", "ignore"))
+    return line_start + character_column
+
+
+def _python_call_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id.casefold()
+    if isinstance(node, ast.Attribute):
+        return node.attr.casefold()
+    return None
+
+
+def _python_argument_value(content: str, node: ast.expr) -> tuple[str, bool]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value, False
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                parts.append(part.value)
+            elif isinstance(part, ast.FormattedValue):
+                expression = ast.get_source_segment(content, part.value) or "expression"
+                parts.append(f"{{{expression}}}")
+        return "".join(parts), True
+    return ast.get_source_segment(content, node) or type(node).__name__, True
+
+
+def _python_call_argument(call: ast.Call) -> ast.expr | None:
+    if call.args:
+        return call.args[0]
+    for keyword in call.keywords:
+        if keyword.arg in {"file", "filename", "name", "path"}:
+            return keyword.value
+    return None
+
+
+def _python_open_access(call: ast.Call) -> str:
+    mode_node: ast.expr | None = call.args[1] if len(call.args) > 1 else None
+    for keyword in call.keywords:
+        if keyword.arg == "mode":
+            mode_node = keyword.value
+            break
+    if (
+        isinstance(mode_node, ast.Constant)
+        and isinstance(mode_node.value, str)
+        and any(flag in mode_node.value for flag in "wax+")
+    ):
+        return "write"
+    return "read"
+
+
+def _python_import_reference(
+    node: ast.Import | ast.ImportFrom,
+    entry_path: str,
+    candidate_root: str,
+    by_path: Mapping[str, InventoryEntry],
+) -> str | None:
+    relative = isinstance(node, ast.ImportFrom) and node.level > 0
+    prefix = "../" * max(node.level - 1, 0) if isinstance(node, ast.ImportFrom) else ""
+    modules: list[str] = []
+    if isinstance(node, ast.Import):
+        modules.extend(alias.name for alias in node.names)
+    else:
+        if node.module:
+            modules.append(node.module)
+        elif relative:
+            modules.extend(alias.name for alias in node.names if alias.name != "*")
+
+    candidates: list[str] = []
+    for module in modules:
+        module_path = module.replace(".", "/")
+        candidates.extend((f"{prefix}{module_path}.py", f"{prefix}{module_path}/__init__.py"))
+        if isinstance(node, ast.ImportFrom) and node.module:
+            candidates.extend(
+                f"{prefix}{module_path}/{alias.name}.py"
+                for alias in node.names
+                if alias.name != "*"
+            )
+    for candidate in candidates:
+        resolved, escaped = _resolve_local_reference(
+            entry_path,
+            candidate_root,
+            candidate,
+            by_path,
+        )
+        if not escaped and resolved in by_path:
+            return candidate
+    return candidates[0] if relative and candidates else None
+
+
+def _python_path_references(
+    content: str,
+    *,
+    entry_path: str,
+    candidate_root: str,
+    by_path: Mapping[str, InventoryEntry],
+    base_offset: int = 0,
+    fail_closed: bool = True,
+) -> Iterable[_PathReference]:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(content)
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        if fail_closed:
+            yield _PathReference(
+                "unparseable Python source",
+                base_offset,
+                "unknown",
+                "python.parse_failure",
+            )
+        return
+
+    line_starts = tuple([0, *(match.end() for match in re.finditer("\n", content))])
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = _python_call_name(node.func)
+            if name not in _PYTHON_PATH_CALLS:
+                continue
+            argument = _python_call_argument(node)
+            if argument is None:
+                continue
+            value, dynamic = _python_argument_value(content, argument)
+            access = "write" if name.startswith("write") else "read"
+            if name == "open":
+                access = _python_open_access(node)
+            syntax = "python.expression" if dynamic else "python.call"
+            yield _PathReference(
+                value,
+                base_offset + _node_offset(content, argument, line_starts),
+                access,
+                syntax,
+            )
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            import_value = _python_import_reference(node, entry_path, candidate_root, by_path)
+            if import_value is not None:
+                yield _PathReference(
+                    import_value,
+                    base_offset + _node_offset(content, node, line_starts),
+                    "import",
+                    "python.import",
+                )
+
+
+def _javascript_regex_start(content: str, offset: int) -> bool:
+    previous = offset - 1
+    while previous >= 0 and content[previous].isspace():
+        previous -= 1
+    if previous < 0 or content[previous] in "=(:,![{?;|&\n":
+        return True
+    prefix = content[:offset].rstrip()
+    return any(prefix.endswith(keyword) for keyword in ("case", "delete", "return", "throw"))
+
+
+def _javascript_code_mask(content: str) -> bytearray:
+    mask = bytearray(b"\x01") * len(content)
+    offset = 0
+    while offset < len(content):
+        character = content[offset]
+        if character in {"\"", "'", "`"}:
+            quote = character
+            start = offset
+            offset += 1
+            while offset < len(content):
+                if content[offset] == "\\":
+                    offset += 2
+                    continue
+                if content[offset] == quote:
+                    offset += 1
+                    break
+                offset += 1
+            mask[start:offset] = b"\x00" * (offset - start)
+            continue
+        if content.startswith("//", offset):
+            end = content.find("\n", offset + 2)
+            end = len(content) if end < 0 else end
+            mask[offset:end] = b"\x00" * (end - offset)
+            offset = end
+            continue
+        if content.startswith("/*", offset):
+            end = content.find("*/", offset + 2)
+            end = len(content) if end < 0 else end + 2
+            mask[offset:end] = b"\x00" * (end - offset)
+            offset = end
+            continue
+        if character == "/" and _javascript_regex_start(content, offset):
+            start = offset
+            offset += 1
+            in_character_class = False
+            while offset < len(content):
+                if content[offset] == "\\":
+                    offset += 2
+                    continue
+                if content[offset] == "[":
+                    in_character_class = True
+                elif content[offset] == "]":
+                    in_character_class = False
+                elif content[offset] == "/" and not in_character_class:
+                    offset += 1
+                    while offset < len(content) and content[offset].isalpha():
+                        offset += 1
+                    break
+                elif content[offset] in "\r\n":
+                    break
+                offset += 1
+            mask[start:offset] = b"\x00" * (offset - start)
+            continue
+        offset += 1
+    return mask
+
+
+def _javascript_call_argument(
+    content: str,
+    name_end: int,
+) -> tuple[str, int, bool] | None:
+    offset = name_end
+    while offset < len(content) and content[offset].isspace():
+        offset += 1
+    if offset >= len(content) or content[offset] != "(":
+        return None
+    offset += 1
+    while offset < len(content) and content[offset].isspace():
+        offset += 1
+    if offset >= len(content):
+        return None
+    if content[offset] in {"\"", "'", "`"}:
+        quote = content[offset]
+        start = offset + 1
+        offset = start
+        while offset < len(content):
+            if content[offset] == "\\":
+                offset += 2
+                continue
+            if content[offset] == quote:
+                return content[start:offset], start, quote == "`" and "${" in content[start:offset]
+            offset += 1
+        return None
+    end = offset
+    while end < len(content) and content[end] not in ",)\r\n" and end - offset < 256:
+        end += 1
+    value = content[offset:end].strip()
+    return (value, offset, True) if value else None
+
+
+def _javascript_path_references(
+    content: str,
+    *,
+    base_offset: int = 0,
+) -> Iterable[_PathReference]:
+    code = _javascript_code_mask(content)
+    for pattern in (_JAVASCRIPT_FROM_RE, _JAVASCRIPT_SIDE_EFFECT_IMPORT_RE):
+        for match in pattern.finditer(content):
+            if not code[match.start("keyword")]:
+                continue
+            yield _PathReference(
+                match.group("path"),
+                base_offset + match.start("path"),
+                "import",
+                "javascript.import",
+            )
+
+    names = "|".join(sorted(_JAVASCRIPT_PATH_CALLS, key=len, reverse=True))
+    for match in re.finditer(rf"\b(?P<name>{names})\b", content, re.IGNORECASE):
+        if not code[match.start("name")]:
+            continue
+        argument = _javascript_call_argument(content, match.end("name"))
+        if argument is None:
+            continue
+        value, offset, dynamic = argument
+        syntax = "javascript.expression" if dynamic else "javascript.call"
+        yield _PathReference(
+            value,
+            base_offset + offset,
+            _JAVASCRIPT_PATH_CALLS[match.group("name").casefold()],
+            syntax,
+        )
+
+
+def _shell_tokens(line: str) -> tuple[list[str], bool]:
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|<>")
+    lexer.commenters = "#"
+    lexer.whitespace_split = True
+    try:
+        return list(lexer), False
+    except ValueError:
+        return [], True
+
+
+def _shell_token_offsets(line: str, tokens: list[str]) -> list[int]:
+    offsets: list[int] = []
+    cursor = 0
+    for token in tokens:
+        position = line.find(token, cursor)
+        if position < 0:
+            position = line.find(token)
+        position = max(position, cursor)
+        offsets.append(position)
+        cursor = position + len(token)
+    return offsets
+
+
+def _looks_shell_path(value: str) -> bool:
+    decoded = _decode_reference(value)
     return (
-        match.group("posix") is not None
-        and content.startswith("#!")
-        and all(character in " \t" for character in content[2:start])
+        _is_unsafe_host_reference(decoded)
+        or _looks_explicit_path(decoded)
+        or ("/" in decoded and _DYNAMIC_RE.search(decoded) is not None)
     )
 
 
-def _path_references(content: str) -> Iterable[tuple[str, int]]:
-    for match in _MARKDOWN_DESTINATION_RE.finditer(content):
-        value = match.group("angle") or match.group("plain")
-        yield _clean_reference(value), match.start()
-    for match in _PATH_TOKEN_RE.finditer(content):
-        value = _clean_reference(match.group("path"))
-        if _looks_explicit_path(value):
-            yield value, match.start("path")
-    for match in _HOST_PATH_TOKEN_RE.finditer(content):
-        if _is_first_line_shebang_interpreter(content, match):
+def _looks_shell_command_path(value: str) -> bool:
+    decoded = _decode_reference(value)
+    if re.fullmatch(r"/[A-Za-z0-9_.-]+", decoded):
+        return False
+    return ("/" in decoded or "\\" in decoded) and _looks_shell_path(decoded)
+
+
+def _shell_segment_references(
+    tokens: list[str],
+    offsets: list[int],
+    *,
+    base_offset: int,
+) -> Iterable[_PathReference]:
+    if not tokens:
+        return
+    index = 0
+    if tokens[0] == "$":
+        index += 1
+    while index < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+        index += 1
+    while index < len(tokens) and tokens[index] in {"env", "sudo"}:
+        index += 1
+    if index >= len(tokens):
+        return
+    command = tokens[index]
+    operands = list(range(index + 1, len(tokens)))
+
+    if _looks_shell_command_path(command):
+        yield _PathReference(command, base_offset + offsets[index], "execute", "shell.command")
+
+    for operand_index in operands:
+        operand = tokens[operand_index]
+        if operand in {"-o", "--out", "--output"} and operand_index + 1 < len(tokens):
+            value_index = operand_index + 1
+            yield _PathReference(
+                tokens[value_index],
+                base_offset + offsets[value_index],
+                "write",
+                "shell.output",
+            )
+        elif operand.startswith(("--out=", "--output=")):
+            value = operand.split("=", 1)[1]
+            yield _PathReference(
+                value,
+                base_offset + offsets[operand_index] + operand.find(value),
+                "write",
+                "shell.output",
+            )
+
+    if command.casefold() not in _SHELL_PATH_COMMANDS:
+        return
+    for operand_index in operands:
+        operand = tokens[operand_index]
+        if operand.startswith("-") or not _looks_shell_path(operand):
             continue
-        value = next(item for item in match.groups() if item is not None)
-        yield _clean_reference(value), match.start()
-    for match in _BACKSLASH_PATH_TOKEN_RE.finditer(content):
-        yield _clean_reference(match.group("path")), match.start("path")
-    for pattern in (
-        _HOME_PATH_TOKEN_RE,
-        _FILE_API_ONE_SEGMENT_PATH_RE,
-        _SHELL_ONE_SEGMENT_PATH_RE,
+        yield _PathReference(
+            operand,
+            base_offset + offsets[operand_index],
+            "read",
+            "shell.operand",
+        )
+        if command in {".", "source"}:
+            return
+
+
+def _shell_path_references(
+    content: str,
+    *,
+    base_offset: int = 0,
+    fail_closed: bool = True,
+) -> Iterable[_PathReference]:
+    for line_offset, line in _iter_lines_with_offsets(content):
+        if line_offset == 0 and line.startswith("#!"):
+            tokens, failed = _shell_tokens(line[2:])
+            if failed:
+                if fail_closed:
+                    yield _PathReference(
+                        "unparseable shell source",
+                        base_offset,
+                        "unknown",
+                        "shell.parse_failure",
+                    )
+                return
+            offsets = _shell_token_offsets(line[2:], tokens)
+            for index in range(1, len(tokens)):
+                if _looks_shell_path(tokens[index]):
+                    yield _PathReference(
+                        tokens[index],
+                        base_offset + 2 + offsets[index],
+                        "execute",
+                        "shell.shebang",
+                    )
+            continue
+        tokens, failed = _shell_tokens(line)
+        if failed:
+            if fail_closed:
+                yield _PathReference(
+                    "unparseable shell source",
+                    base_offset + line_offset,
+                    "unknown",
+                    "shell.parse_failure",
+                )
+            continue
+        offsets = _shell_token_offsets(line, tokens)
+        segment_start = 0
+        for index in range(len(tokens) + 1):
+            if index < len(tokens) and tokens[index] not in {"&", "&&", ";", "|", "||"}:
+                continue
+            yield from _shell_segment_references(
+                tokens[segment_start:index],
+                offsets[segment_start:index],
+                base_offset=base_offset + line_offset,
+            )
+            segment_start = index + 1
+
+
+def _glob_pattern_variants(pattern: str) -> tuple[str, ...]:
+    variants = {pattern}
+    pending = [pattern]
+    while pending:
+        current = pending.pop()
+        marker = current.find("/**/")
+        if marker < 0:
+            continue
+        collapsed = f"{current[:marker]}/{current[marker + 4:]}"
+        if collapsed not in variants:
+            variants.add(collapsed)
+            pending.append(collapsed)
+    return tuple(sorted(variants))
+
+
+def _inventory_glob_references(
+    value: str,
+    *,
+    entry_path: str,
+    candidate_root: str,
+    by_path: Mapping[str, InventoryEntry],
+) -> tuple[str, ...]:
+    if _is_unsafe_host_reference(_decode_reference(value)):
+        return (value,)
+    bases = (PurePosixPath(entry_path).parent, PurePosixPath(candidate_root), PurePosixPath("."))
+    seen_bases: set[str] = set()
+    for base in bases:
+        base_value = base.as_posix()
+        if base_value in seen_bases:
+            continue
+        seen_bases.add(base_value)
+        pattern, escaped = _collapse_path(base, value)
+        if escaped or pattern is None:
+            continue
+        variants = _glob_pattern_variants(pattern)
+        matches = tuple(
+            path
+            for path, entry in sorted(by_path.items())
+            if entry.kind == "file"
+            and any(PurePosixPath(path).match(variant) for variant in variants)
+        )
+        if not matches:
+            continue
+        if base_value == ".":
+            return matches
+        return tuple(path.removeprefix(f"{base_value}/") for path in matches)
+    return (value,)
+
+
+def _structured_path_references(
+    content: str,
+    *,
+    entry_path: str,
+    candidate_root: str,
+    by_path: Mapping[str, InventoryEntry],
+) -> Iterable[_PathReference]:
+    try:
+        parsed: object = json.loads(content)
+    except (ValueError, OverflowError, RecursionError):
+        if PurePosixPath(entry_path).name.casefold() in {
+            "deno.json",
+            "jsconfig.json",
+            "package.json",
+            "tsconfig.json",
+        }:
+            yield _PathReference(
+                "unparseable structured config",
+                0,
+                "unknown",
+                "json.parse_failure",
+            )
+        return
+    if not isinstance(parsed, Mapping):
+        return
+
+    values: list[tuple[str, str]] = []
+    for field in _STRUCTURED_PATH_FIELDS:
+        field_value = parsed.get(field)
+        if isinstance(field_value, str):
+            values.append((field, field_value))
+        elif isinstance(field_value, list):
+            values.extend((field, item) for item in field_value if isinstance(item, str))
+    references = parsed.get("references")
+    if isinstance(references, list):
+        values.extend(
+            ("references.path", item["path"])
+            for item in references
+            if isinstance(item, Mapping) and isinstance(item.get("path"), str)
+        )
+
+    cursor = 0
+    for field, value in values:
+        offset = content.find(value, cursor)
+        offset = max(offset, 0)
+        cursor = offset + len(value)
+        expanded: tuple[str, ...] = (value,)
+        syntax = f"json.{field}"
+        if field in {"files", "include"} and any(marker in value for marker in "*?["):
+            expanded = _inventory_glob_references(
+                value,
+                entry_path=entry_path,
+                candidate_root=candidate_root,
+                by_path=by_path,
+            )
+            syntax = "json.glob"
+        for reference in expanded:
+            yield _PathReference(reference, offset, "read", syntax)
+
+
+def _fenced_code_path_references(
+    language: str,
+    body: str,
+    *,
+    entry_path: str,
+    candidate_root: str,
+    by_path: Mapping[str, InventoryEntry],
+    base_offset: int,
+) -> Iterable[_PathReference]:
+    if language in {"py", "python"}:
+        yield from _python_path_references(
+            body,
+            entry_path=entry_path,
+            candidate_root=candidate_root,
+            by_path=by_path,
+            base_offset=base_offset,
+            fail_closed=False,
+        )
+    elif language in {"javascript", "js", "jsx", "node", "ts", "tsx", "typescript"}:
+        yield from _javascript_path_references(body, base_offset=base_offset)
+    else:
+        yield from _shell_path_references(
+            body,
+            base_offset=base_offset,
+            fail_closed=language in {"bash", "sh", "shell", "zsh"},
+        )
+
+
+def _markdown_path_references(
+    content: str,
+    *,
+    entry_path: str,
+    candidate_root: str,
+    by_path: Mapping[str, InventoryEntry],
+) -> Iterable[_PathReference]:
+    for match in _MARKDOWN_DESTINATION_RE.finditer(content):
+        group = "angle" if match.group("angle") is not None else "plain"
+        yield _PathReference(
+            _clean_reference(match.group(group)),
+            match.start(group),
+            "read",
+            "markdown.link",
+        )
+
+    if content.startswith("---"):
+        frontmatter_end = content.find("\n---", 3)
+        if frontmatter_end >= 0:
+            for match in _MARKDOWN_FRONTMATTER_PATH_RE.finditer(content, 0, frontmatter_end):
+                yield _PathReference(
+                    _clean_reference(match.group("path")),
+                    match.start("path"),
+                    "read",
+                    "markdown.frontmatter",
+                )
+
+    for match in _MARKDOWN_FENCE_RE.finditer(content):
+        yield from _fenced_code_path_references(
+            match.group("language").casefold(),
+            match.group("body"),
+            entry_path=entry_path,
+            candidate_root=candidate_root,
+            by_path=by_path,
+            base_offset=match.start("body"),
+        )
+
+    for match in _MARKDOWN_INLINE_CODE_RE.finditer(content):
+        yield from _shell_path_references(
+            match.group("body"),
+            base_offset=match.start("body"),
+            fail_closed=False,
+        )
+
+
+def _path_references(
+    entry: InventoryEntry,
+    candidate_root: str,
+    by_path: Mapping[str, InventoryEntry],
+) -> Iterable[_PathReference]:
+    content = entry.content
+    if content is None:
+        return
+    suffix = PurePosixPath(entry.path).suffix.casefold()
+    shebang = content.partition("\n")[0].casefold() if content.startswith("#!") else ""
+    if suffix in {".md", ".markdown"}:
+        yield from _markdown_path_references(
+            content,
+            entry_path=entry.path,
+            candidate_root=candidate_root,
+            by_path=by_path,
+        )
+    elif suffix == ".py" or "python" in shebang:
+        yield from _python_path_references(
+            content,
+            entry_path=entry.path,
+            candidate_root=candidate_root,
+            by_path=by_path,
+        )
+    elif suffix in _JAVASCRIPT_SUFFIXES or any(
+        runtime in shebang for runtime in ("bun", "deno", "node")
     ):
-        for match in pattern.finditer(content):
-            yield _clean_reference(match.group("path")), match.start("path")
+        yield from _javascript_path_references(content)
+    elif suffix in _SHELL_SUFFIXES or entry.executable or content.startswith("#!"):
+        yield from _shell_path_references(content)
+    elif suffix == ".json":
+        yield from _structured_path_references(
+            content,
+            entry_path=entry.path,
+            candidate_root=candidate_root,
+            by_path=by_path,
+        )
 
 
 def _decode_reference(value: str) -> str:
@@ -1487,8 +2161,23 @@ def _analyze_forward_paths(
                 ),
             )
 
-        for source_value, offset in _path_references(content):
-            raw = source_value
+        for reference in _path_references(entry, candidate.root, by_path):
+            raw = reference.value
+            offset = reference.offset
+            if reference.syntax.endswith(".parse_failure"):
+                if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
+                    collector.add(
+                        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            raw,
+                            f"static.forward.{reference.syntax}",
+                            field="source",
+                        ),
+                    )
+                continue
             decoded = _decode_reference(raw)
             if _is_unsafe_host_reference(decoded):
                 if collector.has_capacity(ReasonCode.PATH_TRAVERSAL):
@@ -1498,7 +2187,7 @@ def _analyze_forward_paths(
                             entry.path,
                             content,
                             offset,
-                            source_value,
+                            raw,
                             "static.forward.host_path",
                             field="path",
                         ),
@@ -1508,7 +2197,9 @@ def _analyze_forward_paths(
                 continue
             if _PLUGIN_VARIABLE_RE.search(decoded) is not None:
                 continue
-            if _DYNAMIC_RE.search(decoded) is not None:
+            if reference.syntax.endswith(".expression") or (
+                reference.syntax != "json.glob" and _DYNAMIC_RE.search(decoded) is not None
+            ):
                 if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
                     collector.add(
                         ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
