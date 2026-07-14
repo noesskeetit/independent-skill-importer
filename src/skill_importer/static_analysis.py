@@ -593,6 +593,39 @@ def _is_candidate_local_reference(value: str) -> bool:
     return _URL_SCHEME_RE.match(value) is None
 
 
+def _resolve_local_reference(
+    entry_path: str,
+    candidate_root: str,
+    raw: str,
+    by_path: Mapping[str, InventoryEntry],
+) -> tuple[str | None, bool]:
+    """Resolve a local reference against immutable inventory coordinates."""
+    decoded = _decode_reference(raw)
+    if _is_unsafe_host_reference(decoded):
+        return None, True
+    if decoded != raw and ".." in PurePosixPath(decoded).parts:
+        return None, True
+
+    primary, escaped = _collapse_path(PurePosixPath(entry_path).parent, decoded)
+    if escaped or primary is None:
+        return None, True
+    if primary in by_path:
+        return primary, False
+
+    if ".." in PurePosixPath(decoded).parts:
+        return primary, False
+
+    seen = {primary}
+    for base in (PurePosixPath(candidate_root), PurePosixPath(".")):
+        resolved, fallback_escaped = _collapse_path(base, decoded)
+        if fallback_escaped or resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved in by_path:
+            return resolved, False
+    return primary, False
+
+
 def _manifest_json(entry: InventoryEntry) -> Mapping[str, object] | None:
     if entry.kind != "file" or entry.content is None:
         return None
@@ -1454,7 +1487,6 @@ def _analyze_forward_paths(
                 ),
             )
 
-        base = PurePosixPath(entry.path).parent
         for source_value, offset in _path_references(content):
             raw = _decode_reference(source_value)
             if _is_unsafe_host_reference(raw):
@@ -1490,7 +1522,12 @@ def _analyze_forward_paths(
                     )
                 continue
 
-            resolved, escaped = _collapse_path(base, raw)
+            resolved, escaped = _resolve_local_reference(
+                entry.path,
+                candidate.root,
+                raw,
+                by_path,
+            )
             if escaped or resolved is None:
                 if collector.has_capacity(ReasonCode.PATH_TRAVERSAL):
                     collector.add(

@@ -500,6 +500,82 @@ def test_negated_plugin_install_instruction_keeps_mixed_package_ambiguous(
     assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE not in result.reason_codes
 
 
+def test_repository_root_relative_reference_inside_candidate_is_internal(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/session-viewer/SKILL.md": _skill(
+                "Run `skills/session-viewer/scripts/session-viewer.ts`.\n"
+            ),
+            "skills/session-viewer/scripts/session-viewer.ts": "export {};\n",
+        },
+        root="skills/session-viewer",
+    )
+
+    assert result.classification is Classification.PORTABLE, result.reasons
+    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_repository_root_relative_reference_outside_candidate_is_nonportable(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "shared/session-schema.json": "{}",
+            "skills/session-viewer/SKILL.md": _skill(
+                "Read [schema](shared/session-schema.json).\n"
+            ),
+        },
+        root="skills/session-viewer",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
+    evidence = _reason(result, ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT).evidence[0]
+    assert evidence.value == "shared/session-schema.json -> shared/session-schema.json"
+
+
+def test_repository_root_relative_resolution_preserves_entry_relative_precedence(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "references/guide.md": "repository guide",
+            "skills/session-viewer/SKILL.md": _skill(
+                "Read [guide](references/guide.md).\n"
+            ),
+            "skills/session-viewer/references/guide.md": "skill guide",
+        },
+        root="skills/session-viewer",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_repository_root_relative_resolution_keeps_snapshot_traversal_blocked(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/session-viewer/SKILL.md": _skill(
+                "Read [passwd](../../../../etc/passwd).\n"
+            )
+        },
+        root="skills/session-viewer",
+    )
+
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+
+
 def test_existing_parent_resource_is_outside_skill_and_nonportable(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
