@@ -9,17 +9,22 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from fixture_factory import StaticArchiveGitRunner, TarEntry, create_tar
 
+from skill_importer.errors import ImporterError
 from skill_importer.importer import ImportResult, SkillImporter
+from skill_importer.limits import Limits
 from skill_importer.models import (
     AnalyzedSkill,
     Classification,
     DecisionReason,
     ReasonCode,
     ScanReport,
+    SourceKind,
     SourceSpec,
 )
 from skill_importer.pipeline import ScanOptions, SkillImporterPipeline
+from skill_importer.source import SourceResolver, snapshot_local
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -278,7 +283,7 @@ def test_invalid_frontmatter_does_not_abort_valid_sibling() -> None:
     assert ReasonCode.STANDALONE_NO_PLUGIN_BOUNDARY in report.skills[1].reason_codes
 
 
-def test_traversal_and_dynamic_symlink_escape_are_both_blocked(tmp_path: Path) -> None:
+def test_runtime_escape_is_ignored_but_symlink_escape_is_blocked(tmp_path: Path) -> None:
     source = tmp_path / "unsafe-source"
     shutil.copytree(_fixture_source("10_symlink_escape"), source)
     (source / "skill/escape").symlink_to("../outside/secret.txt")
@@ -286,14 +291,40 @@ def test_traversal_and_dynamic_symlink_escape_are_both_blocked(tmp_path: Path) -
     skill = _only_skill(_scan_source_without_llm(source))
 
     assert skill.classification is Classification.BLOCKED
-    assert {ReasonCode.PATH_TRAVERSAL, ReasonCode.SYMLINK_ESCAPE} <= skill.reason_codes
-    traversal = _reason(skill, ReasonCode.PATH_TRAVERSAL).evidence[0]
+    assert ReasonCode.PATH_TRAVERSAL not in skill.reason_codes
+    assert ReasonCode.SYMLINK_ESCAPE in skill.reason_codes
     symlink = _reason(skill, ReasonCode.SYMLINK_ESCAPE).evidence[0]
-    assert (traversal.path, traversal.value) == ("skill/SKILL.md", "../../../etc/passwd")
     assert (symlink.path, symlink.value) == (
         "skill/escape",
         "../outside/secret.txt -> outside/secret.txt",
     )
+
+
+def test_unsafe_local_source_entry_is_rejected_before_static_analysis(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "unsafe-local-source"
+    source.mkdir()
+    (source / "bad\\name").write_text("unsafe", encoding="utf-8")
+
+    with pytest.raises(ImporterError, match="unsafe source path"):
+        snapshot_local(source, tmp_path / "workspace", Limits())
+
+
+def test_archive_traversal_is_rejected_before_static_analysis(tmp_path: Path) -> None:
+    archive = tmp_path / "hostile.tar"
+    create_tar(archive, [TarEntry("../escape", content=b"unsafe")])
+    resolver = SourceResolver(
+        limits=Limits(),
+        git_runner=StaticArchiveGitRunner(archive),
+    )
+    spec = SourceSpec(
+        kind=SourceKind.GIT,
+        value="https://example.com/acme/repository.git",
+    )
+
+    with pytest.raises(ImporterError, match="archive path traversal"):
+        resolver.resolve(spec, tmp_path / "workspace")
 
 
 def test_same_name_different_payloads_form_only_a_name_conflict() -> None:

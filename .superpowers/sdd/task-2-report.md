@@ -109,3 +109,78 @@ The 16 focused regressions cover the supplied JavaScript/TypeScript lexical cont
 ### Remaining concern
 
 - JavaScript/TypeScript extraction remains an intentionally bounded lexical analyzer rather than a complete parser. The review-specific ambiguity cases now have regression coverage and the scanner remains linear in source size.
+
+## Package-only product-boundary correction
+
+This section supersedes earlier Task 2 statements that static host paths,
+snapshot-escaping content references, or invalid runtime source must fail closed.
+The importer now answers only whether files must be packaged with the skill; it
+does not act as a runtime security checker.
+
+### TDD evidence
+
+The updated package/runtime boundary was captured before production changes:
+
+- `uv run pytest tests/test_static_analysis.py tests/test_acceptance_fixtures.py -q`
+- RED: `34 failed, 216 passed`.
+
+The failures demonstrated the old behavior directly: host paths and snapshot
+escapes still emitted `PATH_TRAVERSAL`, dynamic or missing runtime I/O still
+emitted dependency findings, invalid Python/JavaScript still affected
+portability, and the acceptance fixture still combined content traversal with
+the independent symlink escape.
+
+### Implementation
+
+- Added internal package-context predicates without changing public reason,
+  model, resolver, or pipeline contracts.
+- `access=write` is discarded before any path decision. It remains tracked only
+  to avoid reclassifying a later read of the same generated output.
+- Absolute, home-relative, Windows, backslash, and `file:` runtime paths are
+  ignored and never passed to the package resolver.
+- Dynamic evidence is emitted only for proven Markdown resource, import, or
+  structured-config contexts. Parse failures in arbitrary runtime source no
+  longer become package findings; known structured-config parse failures keep
+  their package-context behavior.
+- Static relative runtime operands are considered only when the immutable
+  inventory resolver finds an actual target. An existing target outside the
+  skill root still emits `REFERENCE_OUTSIDE_SKILL_ROOT` and, when owned by a
+  plugin boundary, `PLUGIN_RUNTIME_FILE_REFERENCE`.
+- A missing target emits `MISSING_LOCAL_RESOURCE` only for Markdown resources,
+  relative imports, and structured config. A reference escaping the source
+  snapshot without an inventory target is treated as external runtime data.
+- Source/inventory/archive and symlink validation code was not modified.
+  Acceptance controls explicitly prove that unsafe local source entries and
+  archive traversal are still rejected before static analysis, while symlink
+  escape remains `BLOCKED`.
+- Existing package controls for plugin-root variables, relative resources and
+  imports, structured config, plugin-owned modules/components, and reverse
+  runtime references remain covered.
+- `.env` was not touched, analyzed source was not executed, and host paths were
+  not read or copied.
+
+### Verification
+
+- Updated Task 2 focused suite:
+  - `uv run pytest tests/test_static_analysis.py tests/test_acceptance_fixtures.py -q`
+  - `250 passed`.
+- Full suite:
+  - `uv run pytest -q`
+  - `728 passed`.
+- Scoped lint:
+  - `uv run ruff check src/skill_importer/static_analysis.py tests/test_static_analysis.py tests/test_acceptance_fixtures.py`
+  - `All checks passed!`.
+- Repository lint:
+  - `uv run ruff check .`
+  - `All checks passed!`.
+- Strict typing:
+  - `uv run mypy src`
+  - `Success: no issues found in 13 source files`.
+- `git diff --check` passed.
+
+### Residual boundary
+
+- `PATH_TRAVERSAL` remains a valid model/source-layer reason, but forward
+  static-content extraction no longer emits it. Unsafe source coordinates,
+  hostile archive members, and escaping symlinks remain rejected by their
+  dedicated layers.

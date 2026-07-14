@@ -559,7 +559,7 @@ def test_repository_root_relative_resolution_preserves_entry_relative_precedence
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
 
 
-def test_repository_root_relative_resolution_keeps_snapshot_traversal_blocked(
+def test_repository_root_relative_escape_without_inventory_target_is_external(
     tmp_path: Path,
 ) -> None:
     result = _analyze(
@@ -572,8 +572,13 @@ def test_repository_root_relative_resolution_keeps_snapshot_traversal_blocked(
         root="skills/session-viewer",
     )
 
-    assert result.classification is Classification.BLOCKED
-    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+    assert result.classification is Classification.PORTABLE
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
 
 
 def test_local_reference_resolver_does_not_decode_raw_target_coordinates(
@@ -595,7 +600,7 @@ def test_local_reference_resolver_does_not_decode_raw_target_coordinates(
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
 
 
-def test_local_reference_resolver_keeps_double_encoded_traversal_blocked(
+def test_local_reference_resolver_treats_encoded_escape_as_external_runtime_data(
     tmp_path: Path,
 ) -> None:
     result = _analyze(
@@ -609,8 +614,13 @@ def test_local_reference_resolver_keeps_double_encoded_traversal_blocked(
         root="skills/session-viewer",
     )
 
-    assert result.classification is Classification.BLOCKED
-    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+    assert result.classification is Classification.PORTABLE
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
 
 
 def test_local_reference_resolver_prefers_candidate_root_for_nested_entry(
@@ -758,7 +768,7 @@ def test_markdown_dynamic_source_sink_remains_nonportable(tmp_path: Path) -> Non
     assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
 
 
-def test_known_source_parse_failure_is_fail_closed(tmp_path: Path) -> None:
+def test_known_source_parse_failure_is_not_a_package_dependency(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
         {
@@ -767,10 +777,8 @@ def test_known_source_parse_failure_is_fail_closed(tmp_path: Path) -> None:
         },
     )
 
-    assert result.classification is Classification.PLUGIN_BOUND
-    evidence = _reason(result, ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED).evidence[0]
-    assert evidence.path == "skills/alpha/scripts/broken.py"
-    assert evidence.field == "source"
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED not in result.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -825,7 +833,9 @@ def test_review_javascript_inert_lexical_contexts_have_no_path_evidence(
     } & result.reason_codes
 
 
-def test_review_javascript_unclosed_string_is_fail_closed(tmp_path: Path) -> None:
+def test_review_javascript_unclosed_string_is_not_a_package_dependency(
+    tmp_path: Path,
+) -> None:
     result = _analyze(
         tmp_path,
         {
@@ -837,10 +847,8 @@ def test_review_javascript_unclosed_string_is_fail_closed(tmp_path: Path) -> Non
         },
     )
 
-    assert result.classification is Classification.PLUGIN_BOUND
-    evidence = _reason(result, ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED).evidence[0]
-    assert evidence.path == "skills/alpha/scripts/broken.js"
-    assert evidence.field == "source"
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED not in result.reason_codes
 
 
 def test_review_python_path_alias_receiver_remains_nonportable(tmp_path: Path) -> None:
@@ -917,6 +925,188 @@ def test_review_generated_output_read_is_not_an_input_dependency(tmp_path: Path)
         ReasonCode.MISSING_LOCAL_RESOURCE,
         ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
     } & result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("skills/alpha/scripts/read.py", "open(user_path).read()\n"),
+        (
+            "skills/alpha/scripts/read.js",
+            "const data = readFileSync(process.env.INPUT_FILE);\n",
+        ),
+        (
+            "skills/alpha/scripts/run.py",
+            "import subprocess\nsubprocess.run(command, check=True)\n",
+        ),
+        ("skills/alpha/scripts/read.sh", 'cat "$INPUT_FILE"\n'),
+    ],
+)
+def test_dynamic_runtime_io_is_not_a_package_dependency(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            path: content,
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.PATH_TRAVERSAL,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("skills/alpha/scripts/read.py", 'open("data/missing.json").read()\n'),
+        (
+            "skills/alpha/scripts/read.js",
+            'const data = readFileSync("./data/missing.json");\n',
+        ),
+        ("skills/alpha/scripts/read.sh", "cat ./data/missing.json\n"),
+    ],
+)
+def test_missing_relative_runtime_input_is_not_a_package_dependency(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            path: content,
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (
+            "skills/alpha/scripts/render.py",
+            'from pathlib import Path\nPath("/tmp/output.html").write_text(payload)\n',
+        ),
+        (
+            "skills/alpha/scripts/render.js",
+            'writeFileSync("/tmp/output.html", payload);\n',
+        ),
+        (
+            "skills/alpha/scripts/render.sh",
+            "render --output ~/output.html\n",
+        ),
+    ],
+)
+def test_host_write_destination_is_not_a_package_dependency(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            path: content,
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
+
+
+def test_relative_write_destination_never_depends_on_existing_inventory_target(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/output.html": "previous output",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/render.py": (
+                "from pathlib import Path\n"
+                'Path("../../../runtime/output.html").write_text(payload)\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (
+            "skills/alpha/scripts/module.py",
+            "from .missing import run\n",
+        ),
+        (
+            "skills/alpha/scripts/module.js",
+            'const module = require("./missing.js");\n',
+        ),
+        (
+            "skills/alpha/tsconfig.json",
+            json.dumps({"extends": "./missing.json"}),
+        ),
+    ],
+)
+def test_missing_package_import_or_config_remains_nonportable(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            path: content,
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.MISSING_LOCAL_RESOURCE in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (
+            "skills/alpha/scripts/module.js",
+            "const module = require(modulePath);\n",
+        ),
+        (
+            "skills/alpha/tsconfig.json",
+            json.dumps({"extends": "${CONFIG_DIR}/base.json"}),
+        ),
+    ],
+)
+def test_dynamic_package_import_or_config_remains_nonportable(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            path: content,
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
 
 
 def test_review_shell_backslash_continuation_preserves_source_sink(tmp_path: Path) -> None:
@@ -1042,14 +1232,17 @@ def test_existing_parent_resource_is_outside_skill_and_nonportable(tmp_path: Pat
     assert evidence.value == "../shared/resource.txt -> skills/shared/resource.txt"
 
 
-def test_reference_traversing_beyond_snapshot_is_blocked(tmp_path: Path) -> None:
+def test_reference_traversing_beyond_snapshot_is_external_runtime_data(
+    tmp_path: Path,
+) -> None:
     result = _analyze(
         tmp_path,
         {"skills/alpha/SKILL.md": _skill("Read [passwd](../../../../etc/passwd).\n")},
     )
 
-    assert result.classification is Classification.BLOCKED
-    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
+    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -1063,7 +1256,7 @@ def test_reference_traversing_beyond_snapshot_is_blocked(tmp_path: Path) -> None
         "..%2f..%2f..%2fetc/passwd",
     ],
 )
-def test_explicit_host_or_encoded_traversal_reference_is_blocked(
+def test_explicit_host_or_encoded_traversal_reference_is_external_runtime_data(
     reference: str,
     tmp_path: Path,
 ) -> None:
@@ -1072,8 +1265,9 @@ def test_explicit_host_or_encoded_traversal_reference_is_blocked(
         {"skills/alpha/SKILL.md": _skill(f"Read [host file]({reference}).\n")},
     )
 
-    assert result.classification is Classification.BLOCKED
-    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
+    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
 
 
 @pytest.mark.parametrize("shebang", ["#!/bin/sh", "#! /usr/bin/env sh"])
@@ -1102,7 +1296,7 @@ def test_first_line_shebang_interpreter_is_not_a_resource_path(
         "#!/usr/bin/env /etc/passwd\n",
     ],
 )
-def test_non_interpreter_host_path_in_script_remains_blocked(
+def test_non_interpreter_host_path_in_script_is_runtime_io(
     script: str,
     tmp_path: Path,
 ) -> None:
@@ -1114,11 +1308,8 @@ def test_non_interpreter_host_path_in_script_remains_blocked(
         },
     )
 
-    assert result.classification is Classification.BLOCKED
-    assert any(
-        evidence.value == "/etc/passwd"
-        for evidence in _reason(result, ReasonCode.PATH_TRAVERSAL).evidence
-    )
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
 
 
 def test_plugin_root_variable_in_shebang_remains_plugin_bound(tmp_path: Path) -> None:
@@ -1143,14 +1334,14 @@ def test_plugin_root_variable_in_shebang_remains_plugin_bound(tmp_path: Path) ->
         '```javascript\nload("file:///etc/passwd")\n```\n',
     ],
 )
-def test_host_paths_in_code_are_blocked(body: str, tmp_path: Path) -> None:
+def test_host_paths_in_code_are_runtime_io(body: str, tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
         {"skills/alpha/SKILL.md": _skill(body)},
     )
 
-    assert result.classification is Classification.BLOCKED
-    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -1161,15 +1352,15 @@ def test_host_paths_in_code_are_blocked(body: str, tmp_path: Path) -> None:
         "---ignored---",
     ],
 )
-def test_home_and_backslash_host_paths_are_blocked(body: str, tmp_path: Path) -> None:
+def test_home_and_backslash_host_paths_are_runtime_io(body: str, tmp_path: Path) -> None:
     if body == "---ignored---":
         skill = _skill(extra="config:\n  path: /etc/passwd\n")
     else:
         skill = _skill(body)
     result = _analyze(tmp_path, {"skills/alpha/SKILL.md": skill})
 
-    assert result.classification is Classification.BLOCKED
-    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
 
 
 def test_https_reference_remains_external_and_is_not_path_traversal(tmp_path: Path) -> None:
@@ -1200,11 +1391,11 @@ def test_https_tilde_path_is_not_mistaken_for_local_home_path(tmp_path: Path) ->
         "```sh\nsource ~/config\n```\n",
     ],
 )
-def test_contextual_one_segment_host_path_is_blocked(body: str, tmp_path: Path) -> None:
+def test_contextual_one_segment_host_path_is_runtime_io(body: str, tmp_path: Path) -> None:
     result = _analyze(tmp_path, {"skills/alpha/SKILL.md": _skill(body)})
 
-    assert result.classification is Classification.BLOCKED
-    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
 
 
 def test_slash_command_is_not_mistaken_for_one_segment_host_path(tmp_path: Path) -> None:

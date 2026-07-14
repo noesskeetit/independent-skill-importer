@@ -2584,6 +2584,23 @@ def _is_owned_runtime_path(
     )
 
 
+def _is_proven_package_context(reference: _PathReference) -> bool:
+    return reference.access == "import" or reference.syntax.startswith(
+        ("json.", "markdown.")
+    )
+
+
+def _missing_reference_is_package_context(
+    reference: _PathReference,
+    value: str,
+) -> bool:
+    if reference.syntax.startswith(("json.", "markdown.")):
+        return True
+    if reference.syntax == "python.import":
+        return True
+    return reference.access == "import" and value.startswith(("./", "../"))
+
+
 def _analyze_forward_paths(
     candidate: SkillCandidate,
     inventory: Inventory,
@@ -2637,8 +2654,14 @@ def _analyze_forward_paths(
         for reference in references:
             raw = reference.value
             offset = reference.offset
+            decoded = _decode_reference(raw)
+            if reference.access == "write":
+                written_values.add(decoded)
+                continue
             if reference.syntax.endswith(".parse_failure"):
-                if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
+                if _is_proven_package_context(reference) and collector.has_capacity(
+                    ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED
+                ):
                     collector.add(
                         ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
                         _text_evidence(
@@ -2651,25 +2674,9 @@ def _analyze_forward_paths(
                         ),
                     )
                 continue
-            decoded = _decode_reference(raw)
             if _is_unsafe_host_reference(decoded):
-                if collector.has_capacity(ReasonCode.PATH_TRAVERSAL):
-                    collector.add(
-                        ReasonCode.PATH_TRAVERSAL,
-                        _text_evidence(
-                            entry.path,
-                            content,
-                            offset,
-                            raw,
-                            "static.forward.host_path",
-                            field="path",
-                        ),
-                    )
                 continue
             if not _is_candidate_local_reference(decoded):
-                continue
-            if reference.access == "write":
-                written_values.add(decoded)
                 continue
             if reference.access == "read" and decoded in written_values:
                 continue
@@ -2678,7 +2685,9 @@ def _analyze_forward_paths(
             if reference.syntax.endswith(".expression") or (
                 reference.syntax != "json.glob" and _DYNAMIC_RE.search(decoded) is not None
             ):
-                if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
+                if _is_proven_package_context(reference) and collector.has_capacity(
+                    ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED
+                ):
                     collector.add(
                         ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
                         _text_evidence(
@@ -2699,18 +2708,6 @@ def _analyze_forward_paths(
                 by_path,
             )
             if escaped or resolved is None:
-                if collector.has_capacity(ReasonCode.PATH_TRAVERSAL):
-                    collector.add(
-                        ReasonCode.PATH_TRAVERSAL,
-                        _text_evidence(
-                            entry.path,
-                            content,
-                            offset,
-                            raw,
-                            "static.forward.path_traversal",
-                            field="path",
-                        ),
-                    )
                 continue
 
             target = by_path.get(resolved)
@@ -2782,19 +2779,21 @@ def _analyze_forward_paths(
                                 field="path",
                             ),
                         )
-            else:
-                if collector.has_capacity(ReasonCode.MISSING_LOCAL_RESOURCE):
-                    collector.add(
-                        ReasonCode.MISSING_LOCAL_RESOURCE,
-                        _text_evidence(
-                            entry.path,
-                            content,
-                            offset,
-                            f"{raw} -> {resolved}",
-                            "static.forward.missing_reference",
-                            field="path",
-                        ),
-                    )
+            elif _missing_reference_is_package_context(
+                reference,
+                decoded,
+            ) and collector.has_capacity(ReasonCode.MISSING_LOCAL_RESOURCE):
+                collector.add(
+                    ReasonCode.MISSING_LOCAL_RESOURCE,
+                    _text_evidence(
+                        entry.path,
+                        content,
+                        offset,
+                        f"{raw} -> {resolved}",
+                        "static.forward.missing_reference",
+                        field="path",
+                    ),
+                )
 
 
 def _analyze_symlinks(
