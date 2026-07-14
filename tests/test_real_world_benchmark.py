@@ -1,0 +1,332 @@
+from __future__ import annotations
+
+import json
+import re
+import sys
+from collections.abc import Callable, Iterator, Mapping
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from benchmarks.real_world.run import (  # noqa: E402
+    ManifestValidationError,
+    load_manifest,
+    render_markdown,
+    run_benchmark,
+    write_outputs,
+)
+from skill_importer.errors import ImporterError  # noqa: E402
+from skill_importer.models import SourceSpec  # noqa: E402
+from skill_importer.pipeline import ScanOptions  # noqa: E402
+
+CASES_PATH = ROOT / "benchmarks" / "real_world" / "cases.json"
+SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _expected_candidate(
+    root: str,
+    *,
+    name: str | None = None,
+    classification: str = "portable",
+    reason: str = "STANDALONE_NO_PLUGIN_BOUNDARY",
+) -> dict[str, object]:
+    return {
+        "root": root,
+        "name": name if name is not None else root,
+        "staticClassification": classification,
+        "finalClassification": classification,
+        "staticReasonCodes": [reason],
+        "finalReasonCodes": [reason],
+        "provenanceLinks": [f"https://github.com/example/skills/blob/{SHA}/{root}/SKILL.md#L1-L3"],
+    }
+
+
+def _case(index: int, *, expected_error: str | None = None) -> dict[str, object]:
+    root = "scale" if expected_error is not None else f"skill-{index:02d}"
+    candidate = (
+        _expected_candidate(
+            root,
+            name="invalid-candidate",
+            classification="invalid",
+            reason="INVALID_FRONTMATTER",
+        )
+        if expected_error is not None
+        else _expected_candidate(root)
+    )
+    return {
+        "id": f"C{index:02d}-offline-case",
+        "category": "scale" if expected_error is not None else "standalone",
+        "coverageMode": "exact",
+        "source": {
+            "inputUrl": "https://github.com/example/skills",
+            "canonicalUrl": "https://github.com/example/skills.git",
+            "commitSha": SHA,
+            "subpath": root,
+        },
+        "expected": {
+            "operationalError": expected_error,
+            "candidates": [candidate],
+        },
+    }
+
+
+def _manifest_payload() -> dict[str, Any]:
+    cases = [_case(index) for index in range(1, 10)]
+    cases.append(_case(10, expected_error="SCAN_LIMIT_EXCEEDED"))
+    return {"schemaVersion": "1.0", "cases": cases}
+
+
+def _write_manifest(tmp_path: Path, payload: Mapping[str, object]) -> Path:
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _scan_payload(
+    spec: SourceSpec,
+    *,
+    classification: str = "portable",
+    reason: str = "STANDALONE_NO_PLUGIN_BOUNDARY",
+    resolved_sha: str | None = None,
+) -> dict[str, Any]:
+    root = spec.subpath or "skill"
+    return {
+        "schemaVersion": "1.0",
+        "source": {
+            "kind": "github",
+            "input": spec.value,
+            "canonicalUrl": "https://github.com/example/skills.git",
+            "resolvedCommitSha": resolved_sha or spec.ref,
+            "snapshotSha256": "0" * 64,
+            "discoveryScope": root,
+        },
+        "skills": [
+            {
+                "root": root,
+                "name": root,
+                "staticClassification": classification,
+                "classification": classification,
+                "reasons": [
+                    {
+                        "code": reason,
+                        "message": "offline fixture",
+                        "evidence": [],
+                    }
+                ],
+            }
+        ],
+        "duplicateGroups": [],
+        "nameConflictGroups": [],
+        "counts": {
+            "total": 1,
+            "portable": int(classification == "portable"),
+            "plugin_bound": int(classification == "plugin_bound"),
+            "ambiguous": int(classification == "ambiguous"),
+            "invalid": int(classification == "invalid"),
+            "blocked": int(classification == "blocked"),
+        },
+    }
+
+
+def _clock() -> Callable[[], float]:
+    values: Iterator[float] = iter(float(index) for index in range(100))
+    return lambda: next(values)
+
+
+def test_checked_in_manifest_contains_exactly_ten_pinned_research_cases() -> None:
+    manifest = load_manifest(CASES_PATH)
+
+    assert manifest.schema_version == "1.0"
+    assert [case.case_id for case in manifest.cases] == [
+        "C01-openai-blob-parent",
+        "C02-openai-system-monorepo",
+        "C03-anthropic-skills-only",
+        "C04-anthropic-mixed-independent",
+        "C05-anthropic-reverse-dependency",
+        "C06-openai-figma-plugin-bound",
+        "C07-openai-outside-boundary",
+        "C08-openclaw-scale-invalid",
+        "C09-microsoft-duplicate-layout",
+        "C10-huggingface-complex-ambiguous",
+    ]
+    assert len(manifest.cases) == 10
+    assert all(re.fullmatch(r"[0-9a-f]{40}", case.source.commit_sha) for case in manifest.cases)
+    assert all(case.expected.candidates for case in manifest.cases)
+    assert all(
+        candidate.provenance_links
+        for case in manifest.cases
+        for candidate in case.expected.candidates
+    )
+    scale_case = manifest.cases[7]
+    assert scale_case.expected.operational_error == "SCAN_LIMIT_EXCEEDED"
+    assert scale_case.expected.candidates[0].static_classification == "invalid"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda payload: payload["cases"][0]["source"].update(commitSha="main"),
+            "commitSha",
+        ),
+        (
+            lambda payload: payload["cases"][1].update(id=payload["cases"][0]["id"]),
+            "duplicate case id",
+        ),
+        (
+            lambda payload: payload["cases"][0]["expected"]["candidates"][0].update(
+                staticClassification="maybe"
+            ),
+            "staticClassification",
+        ),
+    ],
+)
+def test_manifest_validation_rejects_invalid_or_mutable_oracle(
+    tmp_path: Path,
+    mutate: Callable[[dict[str, Any]], object],
+    message: str,
+) -> None:
+    payload = _manifest_payload()
+    mutate(payload)
+
+    with pytest.raises(ManifestValidationError, match=message):
+        load_manifest(_write_manifest(tmp_path, payload))
+
+
+def test_runner_uses_injected_scan_offline_and_reports_expected_operational_error(
+    tmp_path: Path,
+) -> None:
+    manifest = load_manifest(_write_manifest(tmp_path, _manifest_payload()))
+    calls: list[tuple[SourceSpec, ScanOptions]] = []
+
+    def fake_scan(spec: SourceSpec, options: ScanOptions) -> Mapping[str, object]:
+        calls.append((spec, options))
+        if spec.subpath == "scale":
+            raise ImporterError("SCAN_LIMIT_EXCEEDED", "offline scale fixture")
+        return _scan_payload(spec)
+
+    result = run_benchmark(manifest, scan=fake_scan, clock=_clock(), use_llm=False)
+    payload = cast(dict[str, Any], result.to_dict())
+
+    assert len(calls) == 10
+    assert all(spec.ref == SHA for spec, _options in calls)
+    assert all(not options.use_llm for _spec, options in calls)
+    assert payload["summary"] == {
+        "total": 10,
+        "agreed": 10,
+        "disagreed": 0,
+        "operationalErrors": 1,
+    }
+    assert payload["cases"][0]["durationMs"] == 1000.0
+    error_case = payload["cases"][-1]
+    assert error_case["actual"]["error"]["code"] == "SCAN_LIMIT_EXCEEDED"
+    assert error_case["actual"]["resolvedCommitSha"] is None
+    assert error_case["candidateAgreement"] is None
+    assert error_case["reasonCodeMatch"] is None
+    assert error_case["agreement"] is True
+
+
+def test_runner_preserves_manual_labels_and_surfaces_disagreement(tmp_path: Path) -> None:
+    manifest_path = _write_manifest(tmp_path, _manifest_payload())
+    manifest = load_manifest(manifest_path)
+
+    def fake_scan(spec: SourceSpec, options: ScanOptions) -> Mapping[str, object]:
+        del options
+        if spec.subpath == "scale":
+            raise ImporterError("SCAN_LIMIT_EXCEEDED", "offline scale fixture")
+        if spec.subpath == "skill-01":
+            return _scan_payload(
+                spec,
+                classification="plugin_bound",
+                reason="REFERENCE_OUTSIDE_SKILL_ROOT",
+                resolved_sha="f" * 40,
+            )
+        return _scan_payload(spec)
+
+    result = run_benchmark(manifest, scan=fake_scan, clock=_clock(), use_llm=False)
+    first = cast(dict[str, Any], result.to_dict())["cases"][0]
+
+    assert first["expected"]["candidates"][0]["classification"] == "portable"
+    assert first["actual"]["candidates"][0]["classification"] == "plugin_bound"
+    assert first["shaAgreement"] is False
+    assert first["candidateAgreement"] is False
+    assert first["reasonCodeMatch"] is False
+    assert first["agreement"] is False
+    reloaded = load_manifest(manifest_path)
+    assert reloaded.cases[0].expected.candidates[0].static_classification == "portable"
+
+
+def test_json_and_markdown_outputs_include_required_benchmark_fields(tmp_path: Path) -> None:
+    manifest = load_manifest(_write_manifest(tmp_path, _manifest_payload()))
+
+    def fake_scan(spec: SourceSpec, options: ScanOptions) -> Mapping[str, object]:
+        del options
+        if spec.subpath == "scale":
+            raise ImporterError("SCAN_LIMIT_EXCEEDED", "offline scale fixture")
+        return _scan_payload(spec)
+
+    result = run_benchmark(manifest, scan=fake_scan, clock=_clock(), use_llm=False)
+    json_path = tmp_path / "result.json"
+    markdown_path = tmp_path / "result.md"
+
+    write_outputs(result, json_path=json_path, markdown_path=markdown_path)
+
+    written = json.loads(json_path.read_text(encoding="utf-8"))
+    assert written["cases"][0]["expectedCommitSha"] == SHA
+    assert written["cases"][0]["actual"]["candidates"][0]["root"] == "skill-01"
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert markdown == render_markdown(result)
+    assert "| Case | SHA | Expected | Actual | Agreement | Reasons | Duration | Error |" in markdown
+    assert SHA in markdown
+    assert "skill-01" in markdown
+    assert "SCAN_LIMIT_EXCEEDED" in markdown
+
+
+def test_fm_mode_compares_final_labels_without_changing_static_oracle(tmp_path: Path) -> None:
+    payload = _manifest_payload()
+    candidate = payload["cases"][0]["expected"]["candidates"][0]
+    candidate["staticClassification"] = "ambiguous"
+    candidate["finalClassification"] = "portable"
+    candidate["staticReasonCodes"] = ["MIXED_PLUGIN_AUTONOMY_UNPROVEN"]
+    candidate["finalReasonCodes"] = [
+        "MIXED_PLUGIN_AUTONOMY_UNPROVEN",
+        "FM_PORTABLE_VERIFIED",
+    ]
+    manifest = load_manifest(_write_manifest(tmp_path, payload))
+
+    def fake_scan(spec: SourceSpec, options: ScanOptions) -> Mapping[str, object]:
+        if spec.subpath == "scale":
+            raise ImporterError("SCAN_LIMIT_EXCEEDED", "offline scale fixture")
+        if spec.subpath == "skill-01":
+            assert options.use_llm
+            result = _scan_payload(spec)
+            skill = result["skills"][0]
+            skill["staticClassification"] = "ambiguous"
+            skill["reasons"].append(
+                {
+                    "code": "MIXED_PLUGIN_AUTONOMY_UNPROVEN",
+                    "message": "offline fixture",
+                    "evidence": [],
+                }
+            )
+            skill["reasons"].append(
+                {
+                    "code": "FM_PORTABLE_VERIFIED",
+                    "message": "offline fixture",
+                    "evidence": [],
+                }
+            )
+            return result
+        return _scan_payload(spec)
+
+    result = run_benchmark(manifest, scan=fake_scan, clock=_clock(), use_llm=True)
+    first = cast(dict[str, Any], result.to_dict())["cases"][0]
+
+    assert first["mode"] == "fm"
+    assert first["expected"]["candidates"][0]["classification"] == "portable"
+    assert first["agreement"] is True
+    assert manifest.cases[0].expected.candidates[0].static_classification == "ambiguous"

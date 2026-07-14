@@ -1,0 +1,372 @@
+{
+  "schemaVersion": "1.0",
+  "cases": [
+    {
+      "id": "C01-openai-blob-parent",
+      "category": "standalone_github_blob",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.system/skill-creator/SKILL.md",
+        "canonicalUrl": "https://github.com/openai/skills.git",
+        "commitSha": "49f948faa9258a0c61caceaf225e179651397431"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": "skills/.system/skill-creator",
+            "name": "skill-creator",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "finalReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "provenanceLinks": [
+              "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.system/skill-creator/SKILL.md#L1-L6",
+              "https://github.com/openai/skills/tree/49f948faa9258a0c61caceaf225e179651397431/skills/.system/skill-creator"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C02-openai-system-monorepo",
+      "category": "monorepo_multiple_skills",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/openai/skills/tree/49f948faa9258a0c61caceaf225e179651397431/skills/.system",
+        "canonicalUrl": "https://github.com/openai/skills.git",
+        "commitSha": "49f948faa9258a0c61caceaf225e179651397431"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": "skills/.system/imagegen",
+            "name": "imagegen",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "finalReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "provenanceLinks": [
+              "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.system/imagegen/SKILL.md#L1-L4"
+            ]
+          },
+          {
+            "root": "skills/.system/openai-docs",
+            "name": "openai-docs",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "finalReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "provenanceLinks": [
+              "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.system/openai-docs/SKILL.md#L1-L4"
+            ]
+          },
+          {
+            "root": "skills/.system/plugin-creator",
+            "name": "plugin-creator",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "finalReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "provenanceLinks": [
+              "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.system/plugin-creator/SKILL.md#L1-L4"
+            ]
+          },
+          {
+            "root": "skills/.system/skill-creator",
+            "name": "skill-creator",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "finalReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "provenanceLinks": [
+              "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.system/skill-creator/SKILL.md#L1-L6"
+            ]
+          },
+          {
+            "root": "skills/.system/skill-installer",
+            "name": "skill-installer",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "finalReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "provenanceLinks": [
+              "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.system/skill-installer/SKILL.md#L1-L6"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C03-anthropic-skills-only",
+      "category": "skills_only_plugin",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/anthropics/claude-plugins-official/tree/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/frontend-design",
+        "canonicalUrl": "https://github.com/anthropics/claude-plugins-official.git",
+        "commitSha": "ba1611e22a569ea036c3bc1c6889a41319130fe8"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": "plugins/frontend-design/skills/frontend-design",
+            "name": "frontend-design",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["SKILLS_ONLY_PACKAGE"],
+            "finalReasonCodes": ["SKILLS_ONLY_PACKAGE"],
+            "provenanceLinks": [
+              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/frontend-design/.claude-plugin/plugin.json#L1-L8",
+              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/frontend-design/skills/frontend-design/SKILL.md#L1-L5"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C04-anthropic-mixed-independent",
+      "category": "mixed_plugin_independent_skill",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/anthropics/claude-plugins-official/tree/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/plugin-dev/skills/plugin-settings",
+        "canonicalUrl": "https://github.com/anthropics/claude-plugins-official.git",
+        "commitSha": "ba1611e22a569ea036c3bc1c6889a41319130fe8"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": "plugins/plugin-dev/skills/plugin-settings",
+            "name": "plugin-settings",
+            "staticClassification": "ambiguous",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["MIXED_PLUGIN_AUTONOMY_UNPROVEN"],
+            "finalReasonCodes": [
+              "MIXED_PLUGIN_AUTONOMY_UNPROVEN",
+              "FM_PORTABLE_VERIFIED"
+            ],
+            "provenanceLinks": [
+              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/plugin-dev/.claude-plugin/plugin.json#L1-L8",
+              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/plugin-dev/skills/plugin-settings/SKILL.md#L1-L18",
+              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/plugin-dev/skills/plugin-settings/examples/create-settings-command.md#L16-L31"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C05-anthropic-reverse-dependency",
+      "category": "reverse_plugin_runtime_dependency",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/anthropics/claude-plugins-official/tree/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/example-plugin/skills/example-command",
+        "canonicalUrl": "https://github.com/anthropics/claude-plugins-official.git",
+        "commitSha": "ba1611e22a569ea036c3bc1c6889a41319130fe8"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": "plugins/example-plugin/skills/example-command",
+            "name": "example-command",
+            "staticClassification": "plugin_bound",
+            "finalClassification": "plugin_bound",
+            "staticReasonCodes": [
+              "REFERENCED_BY_PLUGIN_RUNTIME",
+              "PLUGIN_COMMAND_REFERENCE",
+              "PLUGIN_RUNTIME_FILE_REFERENCE",
+              "REFERENCE_OUTSIDE_SKILL_ROOT"
+            ],
+            "finalReasonCodes": [
+              "REFERENCED_BY_PLUGIN_RUNTIME",
+              "PLUGIN_COMMAND_REFERENCE",
+              "PLUGIN_RUNTIME_FILE_REFERENCE",
+              "REFERENCE_OUTSIDE_SKILL_ROOT"
+            ],
+            "provenanceLinks": [
+              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/example-plugin/commands/example-command.md#L1-L11",
+              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/example-plugin/skills/example-command/SKILL.md#L1-L10"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C06-openai-figma-plugin-bound",
+      "category": "explicit_plugin_owned_mcp",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/openai/plugins/tree/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/figma/skills/figma-design-to-code",
+        "canonicalUrl": "https://github.com/openai/plugins.git",
+        "commitSha": "11c74d6ba24d3a6d48f54a194cd00ef3beea18f9"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": "plugins/figma/skills/figma-design-to-code",
+            "name": "figma-design-to-code",
+            "staticClassification": "plugin_bound",
+            "finalClassification": "plugin_bound",
+            "staticReasonCodes": [
+              "PLUGIN_OWNED_MCP_TOOL",
+              "REFERENCE_OUTSIDE_SKILL_ROOT"
+            ],
+            "finalReasonCodes": [
+              "PLUGIN_OWNED_MCP_TOOL",
+              "REFERENCE_OUTSIDE_SKILL_ROOT"
+            ],
+            "provenanceLinks": [
+              "https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/figma/.codex-plugin/plugin.json#L19-L22",
+              "https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/figma/.mcp.json#L1-L8",
+              "https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/figma/skills/figma-design-to-code/SKILL.md#L7-L23"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C07-openai-outside-boundary",
+      "category": "standalone_beside_plugins",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/openai/plugins/tree/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/.agents/skills/plugin-creator",
+        "canonicalUrl": "https://github.com/openai/plugins.git",
+        "commitSha": "11c74d6ba24d3a6d48f54a194cd00ef3beea18f9"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": ".agents/skills/plugin-creator",
+            "name": "plugin-creator",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "finalReasonCodes": ["STANDALONE_NO_PLUGIN_BOUNDARY"],
+            "provenanceLinks": [
+              "https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/.agents/skills/plugin-creator/SKILL.md#L1-L18",
+              "https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/.agents/skills/plugin-creator/SKILL.md#L20-L46"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C08-openclaw-scale-invalid",
+      "category": "expected_scale_error_and_invalid_candidate",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/openclaw/openclaw/tree/236a6b815c18f1dd431d3e8569321d8e29d4e12c/extensions/lobster",
+        "canonicalUrl": "https://github.com/openclaw/openclaw.git",
+        "commitSha": "236a6b815c18f1dd431d3e8569321d8e29d4e12c"
+      },
+      "expected": {
+        "operationalError": "SCAN_LIMIT_EXCEEDED",
+        "candidates": [
+          {
+            "root": "extensions/lobster",
+            "name": null,
+            "staticClassification": "invalid",
+            "finalClassification": "invalid",
+            "staticReasonCodes": ["INVALID_FRONTMATTER"],
+            "finalReasonCodes": ["INVALID_FRONTMATTER"],
+            "provenanceLinks": [
+              "https://github.com/openclaw/openclaw/blob/236a6b815c18f1dd431d3e8569321d8e29d4e12c/extensions/lobster/SKILL.md#L1-L8",
+              "https://github.com/openclaw/openclaw/blob/236a6b815c18f1dd431d3e8569321d8e29d4e12c/extensions/lobster/openclaw.plugin.json#L1-L16",
+              "https://github.com/openclaw/openclaw/blob/236a6b815c18f1dd431d3e8569321d8e29d4e12c/extensions/lobster/index.ts#L1-L24"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C09-microsoft-duplicate-layout",
+      "category": "duplicate_distribution_layout",
+      "coverageMode": "focused",
+      "source": {
+        "inputUrl": "https://github.com/microsoft/skills",
+        "canonicalUrl": "https://github.com/microsoft/skills.git",
+        "commitSha": "dc543aa59048cb7d0faeb91c79f3a0ab405ec952",
+        "subpath": ".github"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": ".github/skills/applicationinsights-web-ts",
+            "name": "applicationinsights-web-ts",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": [
+              "STANDALONE_NO_PLUGIN_BOUNDARY",
+              "DUPLICATE_CONTENT",
+              "NAME_CONFLICT"
+            ],
+            "finalReasonCodes": [
+              "STANDALONE_NO_PLUGIN_BOUNDARY",
+              "DUPLICATE_CONTENT",
+              "NAME_CONFLICT"
+            ],
+            "provenanceLinks": [
+              "https://github.com/microsoft/skills/blob/dc543aa59048cb7d0faeb91c79f3a0ab405ec952/.github/skills/applicationinsights-web-ts/SKILL.md#L1-L24"
+            ]
+          },
+          {
+            "root": ".github/plugins/azure-sdk-typescript/skills/applicationinsights-web-ts",
+            "name": "applicationinsights-web-ts",
+            "staticClassification": "portable",
+            "finalClassification": "portable",
+            "staticReasonCodes": [
+              "SKILLS_ONLY_PACKAGE",
+              "DUPLICATE_CONTENT",
+              "NAME_CONFLICT"
+            ],
+            "finalReasonCodes": [
+              "SKILLS_ONLY_PACKAGE",
+              "DUPLICATE_CONTENT",
+              "NAME_CONFLICT"
+            ],
+            "provenanceLinks": [
+              "https://github.com/microsoft/skills/blob/dc543aa59048cb7d0faeb91c79f3a0ab405ec952/.github/plugins/azure-sdk-typescript/skills/applicationinsights-web-ts/SKILL.md#L1-L24",
+              "https://github.com/microsoft/skills/blob/dc543aa59048cb7d0faeb91c79f3a0ab405ec952/.github/plugins/azure-sdk-typescript/.claude-plugin/plugin.json#L1-L13"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "C10-huggingface-complex-ambiguous",
+      "category": "complex_multi_manifest_mixed_package",
+      "coverageMode": "exact",
+      "source": {
+        "inputUrl": "https://github.com/huggingface/skills/tree/52d324945107f68d06d561743cf26194bdbf9cf8/skills/hf-cli",
+        "canonicalUrl": "https://github.com/huggingface/skills.git",
+        "commitSha": "52d324945107f68d06d561743cf26194bdbf9cf8"
+      },
+      "expected": {
+        "operationalError": null,
+        "candidates": [
+          {
+            "root": "skills/hf-cli",
+            "name": "hf-cli",
+            "staticClassification": "ambiguous",
+            "finalClassification": "portable",
+            "staticReasonCodes": ["MIXED_PLUGIN_AUTONOMY_UNPROVEN"],
+            "finalReasonCodes": [
+              "MIXED_PLUGIN_AUTONOMY_UNPROVEN",
+              "FM_PORTABLE_VERIFIED"
+            ],
+            "provenanceLinks": [
+              "https://github.com/huggingface/skills/blob/52d324945107f68d06d561743cf26194bdbf9cf8/.cursor-plugin/plugin.json#L1-L12",
+              "https://github.com/huggingface/skills/blob/52d324945107f68d06d561743cf26194bdbf9cf8/gemini-extension.json#L1-L10",
+              "https://github.com/huggingface/skills/blob/52d324945107f68d06d561743cf26194bdbf9cf8/skills/hf-cli/SKILL.md#L1-L12"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
