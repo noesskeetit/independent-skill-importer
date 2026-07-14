@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
 import re
 import shlex
+import tokenize
 import warnings
-from bisect import bisect_left
-from collections.abc import Iterable, Mapping
+from bisect import bisect_left, bisect_right
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import PurePosixPath
@@ -62,11 +64,22 @@ _DYNAMIC_RE = re.compile(r"\$(?:\{[^}]+\}|[A-Za-z_][A-Za-z0-9_]*)|[*?]|\{[^}]+\}
 _MARKDOWN_DESTINATION_RE = re.compile(
     r"!?\[[^\]]*\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<plain>[^)\s]+))",
 )
-_MARKDOWN_FENCE_RE = re.compile(
-    r"^```(?P<language>[A-Za-z0-9_+-]*)[^\r\n]*\r?\n(?P<body>.*?)(?:^```\s*$|\Z)",
-    re.MULTILINE | re.DOTALL,
-)
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<body>[^`\r\n]+)`(?!`)")
+_MARKDOWN_HEADING_RE = re.compile(
+    r"^ {0,3}(?P<marker>#{1,6})(?:[ \t]+|$)(?P<title>.*?)(?:[ \t]+#+[ \t]*)?$"
+)
+_MARKDOWN_REFERENCE_DEFINITION_RE = re.compile(
+    r"^ {0,3}\[(?P<label>[^\]]+)\]:[ \t]*(?:<(?P<angle>[^>]+)>|(?P<plain>\S+))"
+)
+_MARKDOWN_REFERENCE_USAGE_RE = re.compile(
+    r"!?\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]"
+)
+_MARKDOWN_SHORTCUT_REFERENCE_RE = re.compile(
+    r"(?<![!\]])!?\[(?P<label>[^\]]+)\](?![\[(])"
+)
+_DEVELOPMENT_HEADING_TITLES = frozenset(
+    {"dev", "develop", "development", "test", "testing", "tests", "validate", "validation"}
+)
 _YAML_FIELD_RE = re.compile(
     r"^(?P<indent> *)(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(?P<value>.*)$",
 )
@@ -116,6 +129,9 @@ _SHELL_PATH_COMMANDS = frozenset(
         "stat",
         "tail",
     }
+)
+_SCRIPT_INTERPRETERS = frozenset(
+    {"bash", "bun", "deno", "node", "python", "python3", "sh"}
 )
 _JAVASCRIPT_SUFFIXES = frozenset(
     {".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"}
@@ -388,6 +404,15 @@ class _PathReference:
     offset: int
     access: str
     syntax: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MarkdownFence:
+    language: str
+    body_start: int
+    body_end: int
+    start: int
+    end: int
 
 
 @dataclass(slots=True)
@@ -733,6 +758,72 @@ def _python_path_receiver_access(
     return "read"
 
 
+def _python_indirect_path_accesses(
+    tree: ast.AST,
+    parents: Mapping[int, ast.AST],
+    path_names: set[str],
+    pathlib_modules: set[str],
+) -> dict[int, str]:
+    bindings: dict[str, ast.Call] = {}
+    ambiguous: set[str] = set()
+    assignment_targets: set[int] = set()
+    for node in ast.walk(tree):
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        if not (
+            isinstance(target, ast.Name)
+            and isinstance(value, ast.Call)
+            and _python_is_path_constructor(value, path_names, pathlib_modules)
+        ):
+            continue
+        name = target.id.casefold()
+        assignment_targets.add(id(target))
+        if name in bindings:
+            ambiguous.add(name)
+        else:
+            bindings[name] = value
+
+    accesses: dict[int, str] = {}
+    for name, constructor in bindings.items():
+        access = "write"
+        saw_use = False
+        if name in ambiguous:
+            accesses[id(constructor)] = "read"
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Name) or node.id.casefold() != name:
+                continue
+            if id(node) in assignment_targets:
+                continue
+            if not isinstance(node.ctx, ast.Load):
+                access = "read"
+                break
+            saw_use = True
+            attribute = parents.get(id(node))
+            parent_call = parents.get(id(attribute)) if attribute is not None else None
+            if not (
+                isinstance(attribute, ast.Attribute)
+                and attribute.value is node
+                and isinstance(parent_call, ast.Call)
+                and parent_call.func is attribute
+            ):
+                access = "read"
+                break
+            method = attribute.attr.casefold()
+            if method in _PYTHON_WRITE_METHODS:
+                continue
+            if method == "open" and _python_open_access(parent_call) == "write":
+                continue
+            access = "read"
+            break
+        accesses[id(constructor)] = access if saw_use else "read"
+    return accesses
+
+
 def _python_is_subprocess_call(
     call: ast.Call,
     subprocess_modules: set[str],
@@ -748,11 +839,46 @@ def _python_is_subprocess_call(
     )
 
 
-def _python_subprocess_argument(call: ast.Call) -> ast.expr | None:
+def _python_subprocess_arguments(call: ast.Call) -> tuple[ast.expr, ...]:
     argument = _python_call_argument(call)
     if isinstance(argument, (ast.List, ast.Tuple)):
-        return argument.elts[0] if argument.elts else None
-    return argument
+        elements = tuple(argument.elts)
+        if not elements:
+            return ()
+        executable = elements[0]
+        if not (
+            isinstance(executable, ast.Constant)
+            and isinstance(executable.value, str)
+            and PurePosixPath(executable.value).name.casefold() in _SCRIPT_INTERPRETERS
+        ):
+            return (executable,)
+        interpreter = PurePosixPath(executable.value).name.casefold()
+        index = 1
+        subcommand = elements[index] if index < len(elements) else None
+        if (
+            interpreter in {"bun", "deno"}
+            and isinstance(subcommand, ast.Constant)
+            and isinstance(subcommand.value, str)
+            and subcommand.value.casefold() == "run"
+        ):
+            index += 1
+        while index < len(elements):
+            current = elements[index]
+            if not (isinstance(current, ast.Constant) and isinstance(current.value, str)):
+                return ()
+            if current.value == "--":
+                index += 1
+                break
+            if current.value.startswith("-"):
+                if current.value in {"-c", "-e", "-m", "-p", "--eval", "--print"}:
+                    return ()
+                index += 1
+                continue
+            if _looks_shell_path(current.value):
+                return (current,)
+            index += 1
+        return ()
+    return (argument,) if argument is not None else ()
 
 
 def _python_import_reference(
@@ -824,14 +950,24 @@ def _python_path_references(
         for child in ast.iter_child_nodes(node)
     }
     path_names, pathlib_modules, subprocess_modules, subprocess_names = _python_symbols(tree)
+    indirect_accesses = _python_indirect_path_accesses(
+        tree,
+        parents,
+        path_names,
+        pathlib_modules,
+    )
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             access = "read"
+            arguments: tuple[ast.expr | None, ...]
             if _python_is_path_constructor(node, path_names, pathlib_modules):
-                argument = _python_call_argument(node)
-                access = _python_path_receiver_access(node, parents)
+                arguments = (_python_call_argument(node),)
+                access = indirect_accesses.get(
+                    id(node),
+                    _python_path_receiver_access(node, parents),
+                )
             elif _python_is_subprocess_call(node, subprocess_modules, subprocess_names):
-                argument = _python_subprocess_argument(node)
+                arguments = _python_subprocess_arguments(node)
                 access = "execute"
             else:
                 name = _python_call_name(node.func)
@@ -844,20 +980,21 @@ def _python_path_references(
                     pathlib_modules,
                 ):
                     continue
-                argument = _python_call_argument(node)
+                arguments = (_python_call_argument(node),)
                 access = "write" if name.startswith("write") else "read"
                 if name == "open":
                     access = _python_open_access(node)
-            if argument is None:
-                continue
-            value, dynamic = _python_argument_value(content, argument)
-            syntax = "python.expression" if dynamic else "python.call"
-            yield _PathReference(
-                value,
-                base_offset + _node_offset(content, argument, line_starts),
-                access,
-                syntax,
-            )
+            for argument in arguments:
+                if argument is None:
+                    continue
+                value, dynamic = _python_argument_value(content, argument)
+                syntax = "python.expression" if dynamic else "python.call"
+                yield _PathReference(
+                    value,
+                    base_offset + _node_offset(content, argument, line_starts),
+                    access,
+                    syntax,
+                )
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             import_value = _python_import_reference(node, entry_path, candidate_root, by_path)
             if import_value is not None:
@@ -1125,28 +1262,52 @@ def _javascript_static_imports(
     tokens: list[_JavaScriptToken],
 ) -> Iterable[_JavaScriptToken]:
     declaration_stops = {"class", "const", "default", "function", "let", "var"}
-    for index, token in enumerate(tokens):
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
         if token.kind != "identifier" or token.value not in {"export", "import"}:
+            index += 1
             continue
-        following = tokens[index + 1 : index + 34]
-        if not following or following[0].value in {"(", "."}:
+        cursor = index + 1
+        if cursor >= len(tokens) or tokens[cursor].value in {"(", "."}:
+            index += 1
             continue
-        if token.value == "import" and following[0].kind == "string":
-            yield following[0]
+        if token.value == "import" and tokens[cursor].kind == "string":
+            yield tokens[cursor]
+            index = cursor + 1
             continue
-        if following[0].kind == "identifier" and following[0].value in declaration_stops:
+        if tokens[cursor].kind == "identifier" and tokens[cursor].value in declaration_stops:
+            index += 1
             continue
-        for current_index, current in enumerate(following):
-            if current.start - token.start > 512 or current.value == ";":
+        depth = 0
+        while cursor < len(tokens):
+            current = tokens[cursor]
+            if current.value in {"(", "[", "{"}:
+                depth += 1
+            elif current.value in {")", "]", "}"}:
+                depth = max(depth - 1, 0)
+            elif depth == 0 and current.value == ";":
+                cursor += 1
                 break
             if (
-                current.kind == "identifier"
+                depth == 0
+                and current.kind == "identifier"
                 and current.value == "from"
-                and current_index + 1 < len(following)
-                and following[current_index + 1].kind == "string"
+                and cursor + 1 < len(tokens)
+                and tokens[cursor + 1].kind == "string"
             ):
-                yield following[current_index + 1]
+                yield tokens[cursor + 1]
+                cursor += 2
                 break
+            if (
+                cursor > index + 1
+                and depth == 0
+                and current.kind == "identifier"
+                and current.value in {"export", "import"}
+            ):
+                break
+            cursor += 1
+        index = max(cursor, index + 1)
 
 
 def _javascript_call_reference(
@@ -1288,6 +1449,36 @@ def _looks_shell_command_path(value: str) -> bool:
     return ("/" in decoded or "\\" in decoded) and _looks_shell_path(decoded)
 
 
+def _shell_interpreter_script_index(
+    tokens: list[str],
+    command_index: int,
+) -> int | None:
+    interpreter = PurePosixPath(tokens[command_index]).name.casefold()
+    if interpreter not in _SCRIPT_INTERPRETERS:
+        return None
+    index = command_index + 1
+    if (
+        interpreter in {"bun", "deno"}
+        and index < len(tokens)
+        and tokens[index].casefold() == "run"
+    ):
+        index += 1
+    while index < len(tokens):
+        value = tokens[index]
+        if value == "--":
+            index += 1
+            break
+        if value.startswith("-"):
+            if value in {"-c", "-e", "-m", "-p", "--eval", "--print"}:
+                return None
+            index += 1
+            continue
+        if _looks_shell_path(value):
+            return index
+        index += 1
+    return None
+
+
 def _shell_segment_references(
     tokens: list[str],
     offsets: list[int],
@@ -1310,6 +1501,15 @@ def _shell_segment_references(
 
     if _looks_shell_command_path(command):
         yield _PathReference(command, base_offset + offsets[index], "execute", "shell.command")
+
+    script_index = _shell_interpreter_script_index(tokens, index)
+    if script_index is not None:
+        yield _PathReference(
+            tokens[script_index],
+            base_offset + offsets[script_index],
+            "execute",
+            "shell.interpreter",
+        )
 
     for operand_index in operands:
         operand = tokens[operand_index]
@@ -1444,9 +1644,10 @@ def _inventory_glob_references(
     by_path: Mapping[str, InventoryEntry],
 ) -> tuple[str, ...]:
     decoded = _decode_reference(value)
-    if _is_unsafe_host_reference(decoded) or (
-        decoded != value and ".." in PurePosixPath(decoded).parts
-    ):
+    if _is_unsafe_host_reference(decoded):
+        return (value,)
+    inventory_value = unquote(value)
+    if decoded != inventory_value and ".." in PurePosixPath(decoded).parts:
         return (value,)
     bases = (PurePosixPath(entry_path).parent, PurePosixPath(candidate_root))
     seen_bases: set[str] = set()
@@ -1456,7 +1657,7 @@ def _inventory_glob_references(
         if base_value in seen_bases:
             continue
         seen_bases.add(base_value)
-        pattern, escaped = _collapse_path(base, value)
+        pattern, escaped = _collapse_path(base, inventory_value)
         if escaped or pattern is None:
             saw_escape = True
             continue
@@ -1616,8 +1817,114 @@ def _frontmatter_path_references(
         )
 
 
-def _offset_in_ranges(offset: int, ranges: tuple[tuple[int, int], ...]) -> bool:
-    return any(start <= offset < end for start, end in ranges)
+def _merge_offset_ranges(
+    ranges: Iterable[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if start >= end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+def _offset_in_ranges(offset: int, ranges: Sequence[tuple[int, int]]) -> bool:
+    index = bisect_right(ranges, offset, key=lambda item: item[0]) - 1
+    return index >= 0 and offset < ranges[index][1]
+
+
+def _markdown_fences(content: str) -> tuple[_MarkdownFence, ...]:
+    """Return CommonMark-style backtick and tilde fences in one linear pass."""
+    fences: list[_MarkdownFence] = []
+    active: tuple[str, int, str, int, int] | None = None
+    offset = 0
+    for physical_line in content.splitlines(keepends=True):
+        line = physical_line.rstrip("\r\n")
+        if active is None:
+            opening = re.match(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$", line)
+            if opening is not None:
+                marker = opening.group("marker")
+                info = opening.group("info").strip()
+                language = info.split(maxsplit=1)[0].casefold() if info else ""
+                active = (marker[0], len(marker), language, offset, offset + len(physical_line))
+        else:
+            marker, marker_length, language, start, body_start = active
+            closing = re.match(rf"^ {{0,3}}{re.escape(marker)}{{{marker_length},}}[ \t]*$", line)
+            if closing is not None:
+                fences.append(
+                    _MarkdownFence(
+                        language=language,
+                        body_start=body_start,
+                        body_end=offset,
+                        start=start,
+                        end=offset + len(physical_line),
+                    )
+                )
+                active = None
+        offset += len(physical_line)
+    if active is not None:
+        marker, marker_length, language, start, body_start = active
+        del marker, marker_length
+        fences.append(
+            _MarkdownFence(
+                language=language,
+                body_start=body_start,
+                body_end=len(content),
+                start=start,
+                end=len(content),
+            )
+        )
+    return tuple(fences)
+
+
+def _markdown_development_ranges(
+    content: str,
+    excluded_ranges: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    active: tuple[int, int] | None = None
+    previous: tuple[int, str] | None = None
+
+    def record_heading(offset: int, level: int, title: str) -> None:
+        nonlocal active
+        if active is not None and level <= active[1]:
+            ranges.append((active[0], offset))
+            active = None
+        normalized = re.sub(r"[^a-z]+", " ", title.casefold()).strip()
+        if active is None and normalized in _DEVELOPMENT_HEADING_TITLES:
+            active = (offset, level)
+
+    for offset, line in _iter_lines_with_offsets(content):
+        if _offset_in_ranges(offset, excluded_ranges):
+            previous = None
+            continue
+        match = _MARKDOWN_HEADING_RE.match(line)
+        if match is not None:
+            record_heading(offset, len(match.group("marker")), match.group("title"))
+            previous = (offset, line)
+            continue
+        underline = re.match(r"^ {0,3}(?P<marker>=+|-+)[ \t]*$", line)
+        if (
+            underline is not None
+            and previous is not None
+            and previous[1].strip()
+            and _MARKDOWN_HEADING_RE.match(previous[1]) is None
+        ):
+            level = 1 if underline.group("marker").startswith("=") else 2
+            record_heading(previous[0], level, previous[1].strip())
+            previous = None
+            continue
+        previous = (offset, line)
+    if active is not None:
+        ranges.append((active[0], len(content)))
+    return _merge_offset_ranges(ranges)
+
+
+def _markdown_reference_label(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
 def _markdown_path_references(
@@ -1628,15 +1935,20 @@ def _markdown_path_references(
     by_path: Mapping[str, InventoryEntry],
 ) -> Iterable[_PathReference]:
     frontmatter = _markdown_frontmatter_bounds(content)
-    fences = tuple(_MARKDOWN_FENCE_RE.finditer(content))
-    excluded_ranges = tuple((match.start(), match.end()) for match in fences)
+    fences = _markdown_fences(content)
+    structural_ranges: list[tuple[int, int]] = [
+        (fence.start, fence.end) for fence in fences
+    ]
     if frontmatter is not None:
         body_start, body_end, closing_end = frontmatter
-        excluded_ranges = ((0, closing_end), *excluded_ranges)
+        structural_ranges.append((0, closing_end))
         yield from _frontmatter_path_references(
             content[body_start:body_end],
             base_offset=body_start,
         )
+    structural_exclusions = _merge_offset_ranges(structural_ranges)
+    development_ranges = _markdown_development_ranges(content, structural_exclusions)
+    excluded_ranges = _merge_offset_ranges((*structural_exclusions, *development_ranges))
 
     for match in _MARKDOWN_DESTINATION_RE.finditer(content):
         if _offset_in_ranges(match.start(), excluded_ranges):
@@ -1649,14 +1961,43 @@ def _markdown_path_references(
             "markdown.link",
         )
 
-    for match in fences:
+    definitions: dict[str, tuple[str, int]] = {}
+    used_labels: set[str] = set()
+    for offset, line in _iter_lines_with_offsets(content):
+        if _offset_in_ranges(offset, excluded_ranges):
+            continue
+        definition = _MARKDOWN_REFERENCE_DEFINITION_RE.match(line)
+        if definition is not None:
+            group = "angle" if definition.group("angle") is not None else "plain"
+            definitions.setdefault(
+                _markdown_reference_label(definition.group("label")),
+                (
+                    _clean_reference(definition.group(group)),
+                    offset + definition.start(group),
+                ),
+            )
+            continue
+        for usage in _MARKDOWN_REFERENCE_USAGE_RE.finditer(line):
+            label = usage.group("label") or usage.group("text")
+            used_labels.add(_markdown_reference_label(label))
+        for usage in _MARKDOWN_SHORTCUT_REFERENCE_RE.finditer(line):
+            used_labels.add(_markdown_reference_label(usage.group("label")))
+    for label in sorted(used_labels):
+        resolved_definition = definitions.get(label)
+        if resolved_definition is not None:
+            value, offset = resolved_definition
+            yield _PathReference(value, offset, "read", "markdown.reference")
+
+    for fence in fences:
+        if _offset_in_ranges(fence.start, development_ranges):
+            continue
         yield from _fenced_code_path_references(
-            match.group("language").casefold(),
-            match.group("body"),
+            fence.language,
+            content[fence.body_start : fence.body_end],
             entry_path=entry_path,
             candidate_root=candidate_root,
             by_path=by_path,
-            base_offset=match.start("body"),
+            base_offset=fence.body_start,
         )
 
     for match in _MARKDOWN_INLINE_CODE_RE.finditer(content):
@@ -1745,21 +2086,22 @@ def _resolve_local_reference(
     decoded = _decode_reference(raw)
     if _is_unsafe_host_reference(decoded):
         return None, True
-    if decoded != raw and ".." in PurePosixPath(decoded).parts:
+    inventory_value = unquote(raw)
+    if decoded != inventory_value and ".." in PurePosixPath(decoded).parts:
         return None, True
 
-    primary, escaped = _collapse_path(PurePosixPath(entry_path).parent, raw)
+    primary, escaped = _collapse_path(PurePosixPath(entry_path).parent, inventory_value)
     if escaped or primary is None:
         return None, True
     if primary in by_path:
         return primary, False
 
-    if ".." in PurePosixPath(raw).parts:
+    if ".." in PurePosixPath(inventory_value).parts:
         return primary, False
 
     seen = {primary}
     for base in (PurePosixPath(candidate_root), PurePosixPath(".")):
-        resolved, fallback_escaped = _collapse_path(base, raw)
+        resolved, fallback_escaped = _collapse_path(base, inventory_value)
         if fallback_escaped or resolved is None or resolved in seen:
             continue
         seen.add(resolved)
@@ -2354,6 +2696,305 @@ def _aggregate_owned_components(
     return aggregate
 
 
+@dataclass(frozen=True, slots=True)
+class _RawPluginContext:
+    inert_ranges: tuple[tuple[int, int], ...] = ()
+    active_ranges: tuple[tuple[int, int], ...] = ()
+    default_inert: bool = False
+
+
+def _raw_plugin_match_is_inert(context: _RawPluginContext, offset: int) -> bool:
+    if _offset_in_ranges(offset, context.active_ranges):
+        return False
+    return context.default_inert or _offset_in_ranges(offset, context.inert_ranges)
+
+
+def _source_line_starts(content: str) -> tuple[int, ...]:
+    starts = [0]
+    starts.extend(match.end() for match in re.finditer("\n", content))
+    return tuple(starts)
+
+
+def _source_position_offset(
+    line_starts: tuple[int, ...],
+    position: tuple[int, int],
+) -> int:
+    line, column = position
+    line_index = max(line - 1, 0)
+    if line_index >= len(line_starts):
+        return line_starts[-1]
+    return line_starts[line_index] + column
+
+
+def _python_raw_inert_ranges(
+    content: str,
+    *,
+    base_offset: int = 0,
+) -> tuple[tuple[int, int], ...]:
+    line_starts = _source_line_starts(content)
+    ranges: list[tuple[int, int]] = []
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(content).readline)
+        for token in tokens:
+            if token.type not in {
+                tokenize.COMMENT,
+                tokenize.FSTRING_MIDDLE,
+                tokenize.STRING,
+            }:
+                continue
+            ranges.append(
+                (
+                    base_offset + _source_position_offset(line_starts, token.start),
+                    base_offset + _source_position_offset(line_starts, token.end),
+                )
+            )
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        pass
+    return _merge_offset_ranges(ranges)
+
+
+def _javascript_raw_context(
+    content: str,
+    *,
+    base_offset: int = 0,
+) -> _RawPluginContext:
+    tokens, failed = _javascript_tokens(content)
+    if failed:
+        return _RawPluginContext()
+
+    literal_ranges = _merge_offset_ranges(
+        (
+            base_offset + token.start,
+            base_offset + token.end,
+        )
+        for token in tokens
+        if token.kind in {"regex", "string", "template"}
+    )
+    active_ranges: list[tuple[int, int]] = [
+        (base_offset + token.start, base_offset + token.end)
+        for token in tokens
+        if token.kind not in {"regex", "string", "template", "template_expression"}
+    ]
+    for token in tokens:
+        if token.kind != "template_expression":
+            continue
+        for interpolation in re.finditer(r"(?<!\\)\$\{", content[token.start : token.end]):
+            start = base_offset + token.start + interpolation.start()
+            if not _offset_in_ranges(start, literal_ranges):
+                active_ranges.append((start, start + 2))
+    return _RawPluginContext(
+        active_ranges=_merge_offset_ranges(active_ranges),
+        default_inert=True,
+    )
+
+
+def _shell_heredoc_delimiter(line: str, offset: int) -> tuple[str, bool] | None:
+    cursor = offset + 2
+    strip_tabs = cursor < len(line) and line[cursor] == "-"
+    if strip_tabs:
+        cursor += 1
+    while cursor < len(line) and line[cursor] in " \t":
+        cursor += 1
+    if cursor >= len(line):
+        return None
+    if line[cursor] in {"\"", "'"}:
+        quote = line[cursor]
+        end = line.find(quote, cursor + 1)
+        if end < 0:
+            return None
+        delimiter = line[cursor + 1 : end]
+    else:
+        match = re.match(r"[^\s;&|<>()]+", line[cursor:])
+        if match is None:
+            return None
+        delimiter = match.group(0)
+    return (delimiter, strip_tabs) if delimiter else None
+
+
+def _shell_raw_context(
+    content: str,
+    *,
+    base_offset: int = 0,
+) -> _RawPluginContext:
+    hard_inert: list[tuple[int, int]] = []
+    double_quoted: list[tuple[int, int]] = []
+    heredocs: list[tuple[str, bool]] = []
+    line_offset = 0
+    for line_number, physical_line in enumerate(content.splitlines(keepends=True)):
+        line = physical_line.rstrip("\r\n")
+        if heredocs:
+            hard_inert.append(
+                (
+                    base_offset + line_offset,
+                    base_offset + line_offset + len(physical_line),
+                )
+            )
+            delimiter, strip_tabs = heredocs[0]
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if candidate == delimiter:
+                heredocs.pop(0)
+            line_offset += len(physical_line)
+            continue
+
+        pending: list[tuple[str, bool]] = []
+        cursor = 0
+        while cursor < len(line):
+            character = line[cursor]
+            if character == "\\":
+                cursor += 2
+                continue
+            if character in {"\"", "'"}:
+                quote = character
+                end = cursor + 1
+                while end < len(line):
+                    if quote == "\"" and line[end] == "\\":
+                        end += 2
+                        continue
+                    if line[end] == quote:
+                        end += 1
+                        break
+                    end += 1
+                target = double_quoted if quote == "\"" else hard_inert
+                target.append(
+                    (
+                        base_offset + line_offset + cursor,
+                        base_offset + line_offset + end,
+                    )
+                )
+                cursor = end
+                continue
+            if (
+                character == "#"
+                and not (line_number == 0 and cursor == 0 and line.startswith("#!"))
+                and (cursor == 0 or line[cursor - 1].isspace())
+            ):
+                hard_inert.append(
+                    (
+                        base_offset + line_offset + cursor,
+                        base_offset + line_offset + len(line),
+                    )
+                )
+                break
+            if line.startswith("<<", cursor) and not line.startswith("<<<", cursor):
+                heredoc_marker = _shell_heredoc_delimiter(line, cursor)
+                if heredoc_marker is not None:
+                    pending.append(heredoc_marker)
+                cursor += 2
+                continue
+            cursor += 1
+        heredocs.extend(pending)
+        line_offset += len(physical_line)
+
+    hard_ranges = _merge_offset_ranges(hard_inert)
+    double_ranges = _merge_offset_ranges(double_quoted)
+    active_ranges = _merge_offset_ranges(
+        (base_offset + match.start(), base_offset + match.end())
+        for match in _PLUGIN_VARIABLE_RE.finditer(content)
+        if _offset_in_ranges(base_offset + match.start(), double_ranges)
+        and not _offset_in_ranges(base_offset + match.start(), hard_ranges)
+    )
+    return _RawPluginContext(
+        inert_ranges=_merge_offset_ranges((*hard_ranges, *double_ranges)),
+        active_ranges=active_ranges,
+    )
+
+
+def _complement_offset_ranges(
+    start: int,
+    end: int,
+    active_ranges: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    ranges: list[tuple[int, int]] = []
+    cursor = start
+    for active_start, active_end in active_ranges:
+        active_start = max(active_start, start)
+        active_end = min(active_end, end)
+        if active_start >= active_end:
+            continue
+        if cursor < active_start:
+            ranges.append((cursor, active_start))
+        cursor = max(cursor, active_end)
+    if cursor < end:
+        ranges.append((cursor, end))
+    return tuple(ranges)
+
+
+def _markdown_raw_context(content: str) -> _RawPluginContext:
+    fences = _markdown_fences(content)
+    structural_ranges: list[tuple[int, int]] = [
+        (fence.start, fence.end) for fence in fences
+    ]
+    frontmatter = _markdown_frontmatter_bounds(content)
+    if frontmatter is not None:
+        structural_ranges.append((0, frontmatter[2]))
+    development_ranges = _markdown_development_ranges(
+        content,
+        _merge_offset_ranges(structural_ranges),
+    )
+    ranges: list[tuple[int, int]] = list(development_ranges)
+    active_ranges: list[tuple[int, int]] = []
+    python_languages = {"py", "python"}
+    javascript_languages = {
+        "javascript",
+        "js",
+        "jsx",
+        "node",
+        "ts",
+        "tsx",
+        "typescript",
+    }
+    shell_languages = {"bash", "sh", "shell", "zsh"}
+    for fence in fences:
+        if _offset_in_ranges(fence.start, development_ranges):
+            continue
+        body = content[fence.body_start : fence.body_end]
+        if fence.language in python_languages:
+            ranges.extend(
+                _python_raw_inert_ranges(body, base_offset=fence.body_start)
+            )
+        elif fence.language in javascript_languages:
+            context = _javascript_raw_context(body, base_offset=fence.body_start)
+            if context.default_inert:
+                ranges.extend(
+                    _complement_offset_ranges(
+                        fence.body_start,
+                        fence.body_end,
+                        context.active_ranges,
+                    )
+                )
+            else:
+                ranges.extend(context.inert_ranges)
+        elif fence.language in shell_languages:
+            context = _shell_raw_context(body, base_offset=fence.body_start)
+            ranges.extend(context.inert_ranges)
+            active_ranges.extend(context.active_ranges)
+        elif fence.language not in shell_languages:
+            ranges.append((fence.start, fence.end))
+    return _RawPluginContext(
+        inert_ranges=_merge_offset_ranges(ranges),
+        active_ranges=_merge_offset_ranges(active_ranges),
+    )
+
+
+def _raw_plugin_context(entry: InventoryEntry) -> _RawPluginContext:
+    content = entry.content or ""
+    suffix = PurePosixPath(entry.path).suffix.casefold()
+    shebang = content.partition("\n")[0].casefold() if content.startswith("#!") else ""
+    if suffix in {".md", ".markdown"}:
+        return _markdown_raw_context(content)
+    if suffix == ".py" or "python" in shebang:
+        return _RawPluginContext(inert_ranges=_python_raw_inert_ranges(content))
+    if suffix in _JAVASCRIPT_SUFFIXES or any(
+        runtime in shebang for runtime in ("bun", "deno", "node")
+    ):
+        return _javascript_raw_context(content)
+    if suffix in {".golden", ".snap", ".snapshot", ".txt"}:
+        return _RawPluginContext(inert_ranges=((0, len(content)),))
+    if suffix in _SHELL_SUFFIXES or content.startswith("#!"):
+        return _shell_raw_context(content)
+    return _RawPluginContext()
+
+
 def _add_plugin_symbol_references(
     candidate: SkillCandidate,
     validation: ValidationResult,
@@ -2396,9 +3037,12 @@ def _add_plugin_symbol_references(
         ):
             continue
         content = entry.content
+        raw_context = _raw_plugin_context(entry)
         for match in _MCP_TOOL_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_OWNED_MCP_TOOL):
                 break
+            if _raw_plugin_match_is_inert(raw_context, match.start()):
+                continue
             if match.group("server").casefold() in owned.mcp:
                 collector.add(
                     ReasonCode.PLUGIN_OWNED_MCP_TOOL,
@@ -2415,6 +3059,8 @@ def _add_plugin_symbol_references(
         for match in _COMMAND_REFERENCE_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_COMMAND_REFERENCE):
                 break
+            if _raw_plugin_match_is_inert(raw_context, match.start()):
+                continue
             symbol = next(value for value in match.groups() if value is not None).casefold()
             if symbol in owned.commands:
                 collector.add(
@@ -2432,6 +3078,8 @@ def _add_plugin_symbol_references(
         for match in _COMPONENT_REFERENCE_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
                 break
+            if _raw_plugin_match_is_inert(raw_context, match.start()):
+                continue
             kind = (match.group("kind") or match.group("directory") or "").casefold()
             category = f"{kind}s" if not kind.endswith("s") else kind
             symbol = (match.group("structured") or match.group("path") or "").casefold()
@@ -2451,6 +3099,8 @@ def _add_plugin_symbol_references(
         for match in _JS_MODULE_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
                 break
+            if _raw_plugin_match_is_inert(raw_context, match.start()):
+                continue
             module = next(value for value in match.groups() if value is not None)
             if _module_is_owned(module, owned.runtime_modules):
                 collector.add(
@@ -2468,6 +3118,8 @@ def _add_plugin_symbol_references(
         for match in _RUNTIME_FILENAME_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
                 break
+            if _raw_plugin_match_is_inert(raw_context, match.start()):
+                continue
             runtime_name = match.group("name")
             candidate_local = (
                 runtime_name if candidate.root == "." else f"{candidate.root}/{runtime_name}"
@@ -2490,7 +3142,10 @@ def _add_plugin_symbol_references(
 
         for line_offset, line in _iter_lines_with_offsets(content):
             import_match = _IMPORT_RE.match(line)
-            if import_match is not None:
+            if import_match is not None and not _raw_plugin_match_is_inert(
+                raw_context,
+                line_offset + import_match.start("module"),
+            ):
                 module = import_match.group("module")
                 if collector.has_capacity(
                     ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE
@@ -2508,12 +3163,16 @@ def _add_plugin_symbol_references(
                     )
 
             command = _command_binary(line)
+            position = line.find(command) if command is not None else -1
             if (
                 collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE)
                 and command is not None
+                and not _raw_plugin_match_is_inert(
+                    raw_context,
+                    line_offset + max(position, 0),
+                )
                 and command.casefold() in owned.binaries
             ):
-                position = line.find(command)
                 collector.add(
                     ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE,
                     _text_evidence(
@@ -2616,9 +3275,12 @@ def _analyze_forward_paths(
         ):
             continue
         content = entry.content
+        raw_context = _raw_plugin_context(entry)
         for match in _PLUGIN_VARIABLE_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_ROOT_VARIABLE):
                 break
+            if _raw_plugin_match_is_inert(raw_context, match.start()):
+                continue
             collector.add(
                 ReasonCode.PLUGIN_ROOT_VARIABLE,
                 _text_evidence(
@@ -2632,6 +3294,8 @@ def _analyze_forward_paths(
         for match in _PLUGIN_INSTALL_RE.finditer(content):
             if not collector.has_capacity(ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE):
                 break
+            if _raw_plugin_match_is_inert(raw_context, match.start()):
+                continue
             if _plugin_install_match_proves_independence(content, match):
                 continue
             collector.add(

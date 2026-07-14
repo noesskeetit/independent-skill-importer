@@ -2802,6 +2802,527 @@ def test_deep_manifest_is_bounded_and_does_not_abort_scan(tmp_path: Path) -> Non
     assert result.classification is Classification.AMBIGUOUS
 
 
+@pytest.mark.parametrize("heading", ["Development", "Tests", "Validate"])
+def test_corrected_review_development_sections_are_not_runtime_dependencies(
+    heading: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.sh": "exit 0\n",
+            "skills/alpha/SKILL.md": _skill(
+                f"## {heading}\n"
+                "Run `${PLUGIN_ROOT}/tool.py` only while developing.\n"
+                "Use [the validator](../../runtime/tool.sh).\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE not in result.reason_codes
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+@pytest.mark.parametrize("underline", ["===========", "-----------"])
+def test_corrected_review_setext_development_section_is_inert(
+    underline: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.sh": "exit 0\n",
+            "skills/alpha/SKILL.md": _skill(
+                "Development\n"
+                f"{underline}\n"
+                "Run `${PLUGIN_ROOT}/tool.py` only while developing.\n"
+                "Use [the validator](../../runtime/tool.sh).\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE not in result.reason_codes
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_corrected_review_real_session_viewer_validate_section_is_inert(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "scripts/validate-skills": "#!/bin/sh\nexit 0\n",
+            "skills/session-viewer/SKILL.md": _skill(
+                "## Commands\n"
+                "From a repo that has this skill:\n"
+                "```bash\n"
+                "node skills/session-viewer/scripts/session-viewer.ts "
+                "--out /tmp/session.html --open\n"
+                "```\n"
+                "## Development\n"
+                "Scripts are native Node TypeScript.\n"
+                "### Validate\n"
+                "```bash\n"
+                "pnpm exec tsgo -p skills/session-viewer/tsconfig.json\n"
+                "node --test skills/session-viewer/scripts/session-viewer.test.ts\n"
+                "scripts/validate-skills\n"
+                "```\n",
+                name="session-viewer",
+            ),
+            "skills/session-viewer/scripts/session-viewer.ts": "export {};\n",
+            "skills/session-viewer/scripts/session-viewer.test.ts": "export {};\n",
+            "skills/session-viewer/tsconfig.json": "{}\n",
+        },
+        root="skills/session-viewer",
+        executables=frozenset({"scripts/validate-skills"}),
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_corrected_review_operational_section_still_tracks_existing_target(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.js": "export {};\n",
+            "skills/alpha/SKILL.md": _skill(
+                "## Commands\n```bash\nnode ../../runtime/tool.js\n```\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("executor", "subcommand", "suffix"),
+    [
+        ("node", "", "js"),
+        ("python", "", "py"),
+        ("python3", "", "py"),
+        ("bash", "", "sh"),
+        ("sh", "", "sh"),
+        ("bun", "run ", "js"),
+        ("deno", "run ", "js"),
+    ],
+)
+def test_corrected_review_shell_interpreter_script_target_is_tracked(
+    executor: str,
+    subcommand: str,
+    suffix: str,
+    tmp_path: Path,
+) -> None:
+    target = f"runtime/tool.{suffix}"
+    result = _analyze(
+        tmp_path,
+        {
+            target: "pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/run.sh": f"{executor} {subcommand}../../runtime/tool.{suffix}\n",
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("executor", "subcommand", "suffix"),
+    [
+        ("node", (), "js"),
+        ("python", (), "py"),
+        ("python3", (), "py"),
+        ("bash", (), "sh"),
+        ("sh", (), "sh"),
+        ("bun", ("run",), "js"),
+        ("deno", ("run",), "js"),
+    ],
+)
+def test_corrected_review_subprocess_interpreter_script_target_is_tracked(
+    executor: str,
+    subcommand: tuple[str, ...],
+    suffix: str,
+    tmp_path: Path,
+) -> None:
+    argv = [executor, *subcommand, f"../../../runtime/tool.{suffix}"]
+    result = _analyze(
+        tmp_path,
+        {
+            f"runtime/tool.{suffix}": "pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/tests/run.py": (
+                "import subprocess\n"
+                f"subprocess.run({argv!r}, check=True)\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_corrected_review_commonmark_reference_definition_is_tracked(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/guide.md": "guide\n",
+            "skills/alpha/SKILL.md": _skill(
+                "Read the [shared guide][g].\n\n[g]: ../shared/guide.md\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "usage",
+    ["Read the [guide].", "See the ![architecture][diagram]."],
+)
+def test_corrected_review_commonmark_shortcut_and_image_references_are_tracked(
+    usage: str,
+    tmp_path: Path,
+) -> None:
+    label = "diagram" if "diagram" in usage else "guide"
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/guide.md": "guide\n",
+            "skills/alpha/SKILL.md": _skill(
+                f"{usage}\n\n[{label}]: ../shared/guide.md\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_corrected_review_commonmark_first_reference_definition_wins(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/guide.md": "outside\n",
+            "skills/alpha/SKILL.md": _skill(
+                "Read the [guide].\n\n"
+                "[guide]: references/guide.md\n"
+                "[guide]: ../shared/guide.md\n"
+            ),
+            "skills/alpha/references/guide.md": "inside\n",
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_corrected_review_tilde_shell_fence_is_tracked(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/env.sh": "export READY=1\n",
+            "skills/alpha/SKILL.md": _skill(
+                "~~~bash\nsource ../shared/env.sh\n~~~\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_corrected_review_long_javascript_static_import_is_tracked(
+    tmp_path: Path,
+) -> None:
+    imports = ", ".join(f"name{index}" for index in range(80))
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/mod.js": "export {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/module.js": (
+                f'import {{ {imports} }} from "../../runtime/mod.js";\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_corrected_review_decoded_parent_reference_resolves_inventory_target(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/guide.md": "guide\n",
+            "skills/alpha/SKILL.md": _skill(
+                "Read [the guide](%2e%2e/shared/guide.md).\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_corrected_review_decoded_space_resolves_bundled_resource(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill("Read [the guide](my%20guide.md).\n"),
+            "skills/alpha/my guide.md": "guide\n",
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
+
+
+def test_corrected_review_indirect_path_write_is_not_a_dependency(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/output.html": "old output\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/render.py": (
+                "from pathlib import Path\n"
+                'p = Path("../../runtime/output.html")\n'
+                'p.write_text("new output")\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_corrected_review_indirect_path_read_still_tracks_dependency(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/input.html": "input\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/render.py": (
+                "from pathlib import Path\n"
+                'p = Path("../../runtime/input.html")\n'
+                "p.read_text()\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("skills/alpha/tests/fixture.py", 'fixture = "${PLUGIN_ROOT}/tool.py"\n'),
+        (
+            "skills/alpha/tests/fixture.js",
+            'const fixture = "${PLUGIN_ROOT}/tool.js";\n',
+        ),
+        ("skills/alpha/tests/fixture.txt", "${PLUGIN_ROOT}/tool.py\n"),
+        (
+            "skills/alpha/SKILL.md",
+            _skill("```text\n${PLUGIN_ROOT}/tool.py\n```\n"),
+        ),
+    ],
+)
+def test_corrected_review_inert_plugin_root_fixture_does_not_bind(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    files = {"skills/alpha/SKILL.md": _skill(), path: content}
+    result = _analyze(tmp_path, files)
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (
+            "skills/alpha/runtime.py",
+            'import os\nroot = os.environ["PLUGIN_ROOT"]\n',
+        ),
+        (
+            "skills/alpha/runtime.js",
+            "const root = process.env.PLUGIN_ROOT;\n",
+        ),
+    ],
+)
+def test_corrected_review_plugin_root_expression_still_binds(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill(), path: content},
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("skills/alpha/run.sh", 'echo "${PLUGIN_ROOT}/tool.py"\n'),
+        (
+            "skills/alpha/SKILL.md",
+            _skill('```bash\necho "${PLUGIN_ROOT}/tool.py"\n```\n'),
+        ),
+    ],
+)
+def test_corrected_review_quoted_shell_plugin_root_still_binds(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill(), path: content},
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        (
+            "skills/alpha/run.sh",
+            "# ${PLUGIN_ROOT}/comment.py\n"
+            "cat <<'FIXTURE'\n"
+            "${PLUGIN_ROOT}/fixture.py\n"
+            "FIXTURE\n",
+        ),
+        (
+            "skills/alpha/SKILL.md",
+            _skill(
+                "```bash\n"
+                "# ${PLUGIN_ROOT}/comment.py\n"
+                "cat <<'FIXTURE'\n"
+                "${PLUGIN_ROOT}/fixture.py\n"
+                "FIXTURE\n"
+                "```\n"
+            ),
+        ),
+    ],
+)
+def test_corrected_review_shell_comments_and_heredocs_are_inert(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill(), path: content},
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("manifest_path", "manifest", "owned_path", "fixture_path", "fixture"),
+    [
+        (
+            "plugin.json",
+            json.dumps({"runtime": "src/acme_runtime.py"}),
+            "src/acme_runtime.py",
+            "skills/alpha/tests/fixture.py",
+            'fixture = """\nfrom acme_runtime import run\n"""\n',
+        ),
+        (
+            "plugin.json",
+            json.dumps({"agents": {"reviewer": "agents/reviewer.py"}}),
+            "agents/reviewer.py",
+            "skills/alpha/tests/fixture.js",
+            'const fixture = "agent: reviewer";\n',
+        ),
+        (
+            "package.json",
+            json.dumps(
+                {
+                    "plugin": {"skills": ["skills/alpha"]},
+                    "bin": {"acme-tool": "bin/tool.py"},
+                }
+            ),
+            "bin/tool.py",
+            "skills/alpha/tests/fixture.py",
+            'fixture = """\nacme-tool run\n"""\n',
+        ),
+        (
+            "plugin.json",
+            json.dumps({"runtime": "src/acme-runtime.ts"}),
+            "src/acme-runtime.ts",
+            "skills/alpha/tests/fixture.js",
+            'const fixture = \'import { run } from "acme-runtime"\';\n',
+        ),
+    ],
+)
+def test_corrected_review_inert_plugin_symbol_fixture_does_not_bind(
+    manifest_path: str,
+    manifest: str,
+    owned_path: str,
+    fixture_path: str,
+    fixture: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            manifest_path: manifest,
+            owned_path: "pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            fixture_path: fixture,
+        },
+        executables=frozenset({owned_path}),
+    )
+
+    assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE not in result.reason_codes
+
+
+def test_corrected_review_markdown_range_lookup_is_logarithmic() -> None:
+    class CountingRanges:
+        def __init__(self, values: tuple[tuple[int, int], ...]) -> None:
+            self.values = values
+            self.lookups = 0
+
+        def __len__(self) -> int:
+            return len(self.values)
+
+        def __getitem__(self, index: int) -> tuple[int, int]:
+            self.lookups += 1
+            return self.values[index]
+
+    ranges = CountingRanges(tuple((index * 4, index * 4 + 2) for index in range(4096)))
+
+    assert static_analysis_module._offset_in_ranges(4095 * 4 + 1, ranges)
+    assert ranges.lookups <= 24
+
+
 def test_repeated_evidence_is_bounded(tmp_path: Path) -> None:
     body = "".join(
         f"`${{PLUGIN_ROOT}}/scripts/tool.py` occurrence {index}\n" for index in range(200)
