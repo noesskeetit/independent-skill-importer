@@ -1,200 +1,127 @@
-# Real Repository Path Analysis Implementation Plan
+# План реализации package-aware skill importer
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Для agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove the demonstrated real-repository false positives without weakening fail-closed traversal, symlink, plugin ownership, or atomic import guarantees.
+**Цель:** Точно извлекать самостоятельные skills из repository/marketplace/plugin layouts, не смешивая package autonomy с runtime security checking.
 
-**Architecture:** Keep all analysis inventory-only. Add context-bearing path references inside `static_analysis.py`, resolve them through explicit entry/candidate/repository coordinate systems, and route only proven temporary outputs to a non-FM-promotable ambiguity.
+**Архитектура:** Inventory-only resolver определяет только package dependencies и plugin ownership. Host runtime inputs/outputs не участвуют в verdict; безопасностью содержимого занимается отдельный skill checker.
 
-**Tech Stack:** Python 3.12 standard library (`ast`, `re`, `pathlib`), existing immutable domain models, pytest, Ruff, strict mypy, uv/hatchling.
+**Стек:** Python 3.12 standard library, существующие immutable models, pytest, Ruff, strict mypy, uv/hatchling.
 
-## Global Constraints
+## Общие ограничения
 
-- Never execute repository scripts, install dependencies, initialize submodules, or read a referenced host file.
-- Never copy files outside the skill root and never silently rewrite `SKILL.md`.
-- `plugin_bound`, `ambiguous`, `invalid`, and `blocked` remain non-importable.
-- Relative traversal, `file:` URLs, sensitive host reads, and symlink escape remain blocked.
-- FM review may resolve plugin-autonomy ambiguity only; it may not override deterministic safety ambiguity.
-- Preserve every source file in inventory/import payload, including tests and fixtures.
+- Никогда не исполнять repository code, не устанавливать dependencies и не инициализировать submodules.
+- Никогда не читать referenced host path и не копировать файлы за пределами skill root.
+- Импортируются только `portable`; остальные classifications остаются non-importable.
+- `blocked` используется для unsafe extraction mechanics: source/archive traversal, symlink escape, collisions и limits.
+- Runtime host paths и опасность кода не оцениваются importer-ом.
+- FM проверяет только автономность относительно enclosing plugin.
+- Tests/fixtures сохраняются в inventory и import payload.
 
 ---
 
 ### Task 1: Inventory coordinate-system resolver
 
-**Files:**
+**Статус:** реализовано и прошло отдельный review.
+
+**Файлы:**
+- `src/skill_importer/static_analysis.py`
+- `tests/test_static_analysis.py`
+
+**Контракт:** `_resolve_local_reference(...)` использует только inventory и
+precedence entry → candidate → repository. Existing target снаружи skill root
+не включается в payload.
+
+### Task 2: Package-aware context extraction
+
+**Файлы:**
 - Modify: `src/skill_importer/static_analysis.py`
 - Test: `tests/test_static_analysis.py`
+- Test: `tests/test_acceptance_fixtures.py`
 
-**Interfaces:**
-- Produces: `_resolve_local_reference(entry_path, candidate_root, raw, by_path) -> tuple[str | None, bool]`.
-- Precedence: entry-relative, candidate-root-relative, exact repository-root-relative; duplicate targets are collapsed.
+**Интерфейсы:**
+- `_PathReference(value, offset, access, syntax)` описывает доказанный package context.
+- Resolver из Task 1 остаётся единственным способом найти target.
 
-- [ ] **Step 1: Write the repository-root RED tests**
+- [ ] **Step 1: Зафиксировать границу importer vs checker в RED tests**
 
-Cover `skills/session-viewer/scripts/session-viewer.ts` from the candidate
-entrypoint, an exact repository-root target outside the candidate, normal
-`references/guide.md`, and `../../../../etc/passwd` as a blocked control.
+Проверить, что `/tmp/output`, `/etc/passwd`, home/Windows paths, dynamic user
+inputs и write destinations не меняют portability. При этом source/archive
+traversal и symlink escape в inventory/import tests остаются blocked.
 
-- [ ] **Step 2: Verify RED**
+- [ ] **Step 2: Сохранить реальные package dependency controls**
 
-Run: `uv run pytest tests/test_static_analysis.py -k 'repository_root_relative' -q`
+Проверить relative imports, Markdown resource links, relative executable paths,
+`${PLUGIN_ROOT}`, plugin-owned modules/components и reverse runtime references.
+Existing target снаружи root остаётся `plugin_bound`; inert fixture text не
+создаёт finding.
 
-Expected: the internal repository-root case fails with duplicated skill-root evidence.
+- [ ] **Step 3: Реализовать package-only downstream policy**
 
-- [ ] **Step 3: Implement inventory-only resolution**
+Игнорировать absolute/dynamic runtime I/O и `access=write`. Анализировать
+relative file/API operand только когда он разрешается в inventory или является
+доказанным resource/import/executable context. Не делать raw-all-text fallback.
 
-Use `_collapse_path` for each relative base, never `Path.resolve()` or host
-filesystem I/O. Do not use fallback for absolute, encoded traversal, NUL, or
-backslash paths. Return an exact outside-inventory target as outside evidence;
-never add it to the import payload.
+- [ ] **Step 4: Проверить и закоммитить**
 
-- [ ] **Step 4: Verify and commit**
+Run:
 
-Run: `uv run pytest tests/test_static_analysis.py -k 'repository_root_relative or parent_resource or traversal' -q`
+```bash
+uv run pytest tests/test_static_analysis.py tests/test_acceptance_fixtures.py -q
+uv run ruff check src/skill_importer/static_analysis.py tests/test_static_analysis.py
+uv run mypy src
+```
 
-Expected: PASS.
+Expected: PASS, затем отдельный task review.
 
-Commit: `git commit -am 'fix: resolve repository-root skill references'`
+### Task 3: Real-world benchmark из 10 pinned cases
 
-### Task 2: Context-aware dependency extraction
+**Файлы:**
+- Create: `benchmarks/real_world/cases.json`
+- Create: `benchmarks/real_world/run.py`
+- Create: `benchmarks/real_world/README.md`
+- Create: `tests/test_real_world_benchmark.py`
 
-**Files:**
-- Modify: `src/skill_importer/static_analysis.py`
-- Test: `tests/test_static_analysis.py`
+**Интерфейсы:**
+- Manifest хранит source URL, immutable commit SHA, optional subpath, manual
+  expected candidates/classifications/reason codes и provenance ссылки.
+- Runner вызывает только public scan API и никогда не исполняет source code.
 
-**Interfaces:**
-- Produces: internal `_PathReference(value, offset, access, syntax)` records.
-- Produces: role-specific extractors for Markdown, Python AST, JS/TS lexical calls, shell operands, and known structured-config path fields.
-- Consumes: the resolver from Task 1.
+- [ ] **Step 1: Исследовать и вручную разметить 10 cases**
 
-- [ ] **Step 1: Write inert-content RED tests**
+Использовать primary public GitHub sources из OpenAI/Codex, Claude Code official
+marketplace/plugins, OpenClaw и соседних agent-skill ecosystems. Покрыть
+standalone, monorepo, skills-only plugin, mixed plugin, explicit plugin-bound,
+reverse dependency, duplicate layout и сложный ambiguous case.
 
-Create candidates containing CSS `font: 16px/1.62`, JS regex
-`instructions/u.test`, Python fixture strings `a/file-{index}.txt`, JSON test
-data `/tmp/project`, and `tsconfig.include = ["scripts/**/*.ts"]`. Assert that
-these produce none of `MISSING_LOCAL_RESOURCE`,
-`DYNAMIC_REFERENCE_UNRESOLVED`, or `PATH_TRAVERSAL`.
+- [ ] **Step 2: Реализовать manifest validation и runner**
 
-- [ ] **Step 2: Write fail-closed sink controls**
+Одна команда создаёт JSON и Markdown summary: resolved SHA, candidates, actual
+verdict, expected verdict, agreement, reason-code match, scan duration и error.
+Обычный pytest использует mocked/offline scan; online corpus запускается явно.
 
-Verify that actual `open("../../../runtime/engine.py")`,
-`require("../../../runtime/engine.js")`, shell `source ../shared/env.sh`, and a
-dynamic Markdown resource link remain nonportable. Keep a quoted fixture such
-as `fixture = 'open("../../../runtime/not-real.py")'` inert.
+- [ ] **Step 3: Прогнать pinned corpus**
 
-- [ ] **Step 3: Verify RED**
+Ни один case не использует mutable branch label. Зафиксировать фактические
+расхождения как benchmark result, а не подгонять manual labels под scanner.
 
-Run: `uv run pytest tests/test_static_analysis.py -k 'inert_code or source_sink or tsconfig_glob' -q`
+### Task 4: Tech-lead document и closeout
 
-Expected: inert examples currently create false evidence.
-
-- [ ] **Step 4: Implement role/context extraction**
-
-Use `ast.parse` for Python call/import nodes and line/column offsets. For JS/TS
-and shell, accept only bounded call/command patterns whose identifier begins
-outside a comment, quoted string, template body, or regex literal. Parse JSON
-with `json.loads`; resolve known fields such as `extends`, `files`, `include`,
-and `references[].path`, expanding globs only against `inventory.by_path`.
-Never fall back to raw-all-text scanning after parse failure.
-
-- [ ] **Step 5: Verify and commit**
-
-Run: `uv run pytest tests/test_static_analysis.py -k 'inert_code or source_sink or tsconfig_glob or missing_local or dynamic_local' -q`
-
-Expected: PASS.
-
-Commit: `git commit -am 'fix: analyze paths only in dependency contexts'`
-
-### Task 3: Temporary-output safety ambiguity
-
-**Files:**
-- Modify: `src/skill_importer/models.py`
-- Modify: `src/skill_importer/static_analysis.py`
-- Modify: `src/skill_importer/pipeline.py`
-- Test: `tests/test_static_analysis.py`
-- Test: `tests/test_pipeline.py`
-
-**Interfaces:**
-- Produces: `ReasonCode.HOST_TEMP_OUTPUT`.
-- Produces: `StaticAnalysisResult.fm_reviewable` which is false when a
-  deterministic host/safety ambiguity remains.
-
-- [ ] **Step 1: Write RED and security-control tests**
-
-Verify `--out /tmp/session.html` becomes static `ambiguous` with
-`HOST_TEMP_OUTPUT`, while `cat /tmp/token`, `open('/etc/passwd')`, `file:` URLs,
-Windows/home secrets, and relative traversal remain `blocked`. Verify the
-pipeline does not call injected FM transport for host-output-only ambiguity.
-
-- [ ] **Step 2: Verify RED**
-
-Run: `uv run pytest tests/test_static_analysis.py tests/test_pipeline.py -k 'temp_output or host_paths' -q`
-
-Expected: `/tmp` output is currently `PATH_TRAVERSAL` and FM review lacks a policy gate.
-
-- [ ] **Step 3: Implement strict output recognition and FM gate**
-
-Recognize only normalized `/tmp/` or `/var/tmp/` literals without `..` in an
-explicit `--out`, `--output`, or shell output-redirection context. All read or
-unknown contexts keep existing fail-closed behavior. Classify the new reason as
-ambiguous and expose `fm_reviewable=False` whenever it is present.
-
-- [ ] **Step 4: Verify and commit**
-
-Run: `uv run pytest tests/test_static_analysis.py tests/test_pipeline.py -k 'temp_output or host_paths or fm_transport' -q`
-
-Expected: PASS.
-
-Commit: `git commit -am 'fix: separate temporary outputs from host reads'`
-
-### Task 4: Pinned real-repository regression, tech-lead document, and closeout
-
-**Files:**
-- Create: `tests/test_real_repository_regression.py`
+**Файлы:**
 - Create: `docs/TECH_LEAD_IMPORTER_ALGORITHM.md`
-- Modify: `AUDIT_AND_NEXT_STEPS.md`
 - Modify: `README.md`
+- Modify: `AUDIT_AND_NEXT_STEPS.md`
 
-**Interfaces:**
-- Consumes: public CLI `skill-importer scan` and the pinned
-  `openclaw/agent-skills` commit.
-- Produces: a network-optional marker/test plus a checked-in minimal synthetic
-  corpus that runs offline in the default suite.
+- [ ] **Step 1: Написать русскоязычный code-grounded документ**
 
-- [ ] **Step 1: Add offline corpus assertions**
+Описать проблему и pipeline `SourceResolver → RepositoryInventory →
+PackageBoundaryDetector → SkillCandidateDiscoverer → SkillValidator →
+PortabilityAnalyzer → optional FM → ImportPlan → SkillImporter`, identity,
+provenance, dedupe/conflicts, reason/evidence, atomic import, extraction limits,
+Mermaid-схему, JSON example, portable/rejected cases и production next steps.
+Явно отделить importer от skill checker.
 
-Reproduce repository-root commands, inert CSS/regex/test fixtures, and a temp
-output in a compact fixture. Assert exact reason codes and source-addressable
-evidence.
-
-- [ ] **Step 2: Run the focused end-to-end test**
-
-Run: `uv run pytest tests/test_real_repository_regression.py -q`
-
-Expected: PASS after Tasks 1-3.
-
-- [ ] **Step 3: Run the pinned GitHub scan**
-
-Run: `uv run skill-importer scan https://github.com/openclaw/agent-skills --ref 4887c1d540febb1f55140e96da7e4aae3e5163ba --no-llm --json`
-
-Expected: no duplicated `skills/<name>/skills/<name>/...` evidence; no CSS,
-regex, or inert test-fixture evidence; strict temp outputs are ambiguous rather
-than blocked. Genuine outside/runtime/host-read evidence remains.
-
-- [ ] **Step 4: Write and verify the tech-lead algorithm document**
-
-Create a Russian-language, code-grounded document covering the product problem,
-the exact `SourceResolver → RepositoryInventory → PackageBoundaryDetector →
-SkillCandidateDiscoverer → SkillValidator → PortabilityAnalyzer → ImportPlan →
-SkillImporter` flow, source URL/ref/subpath normalization, plugin-boundary
-detection, static and optional FM decisions, identity/provenance/deduplication,
-the scan JSON contract, atomic import, security limits, one portable and one
-rejected example, current POC limitations, and production next steps. Include a
-Mermaid flowchart and link every implementation stage to its concrete Python
-module. Cross-check every claim against current code and tests; do not describe
-planned behavior as implemented.
-
-- [ ] **Step 5: Update remaining docs and run all gates**
+- [ ] **Step 2: Полный gate**
 
 Run:
 
@@ -206,12 +133,12 @@ uv lock --check
 uv build
 ```
 
-Expected: all commands exit 0.
+- [ ] **Step 3: Installed-wheel и live proof**
 
-- [ ] **Step 6: Installed-wheel smoke, review, commit, and push**
+Установить wheel в свежий Python 3.12 env, выполнить scan→import standalone
+fixture и pinned GitHub cases. `.env` не читать и не менять.
 
-Install the built wheel into a fresh temporary Python 3.12 environment and run
-`skill-importer scan` then `skill-importer import` on the standalone fixture.
-Run the repository's structured review helper if available, verify every
-finding against source, commit the docs/regression update, and push `main` to
-`origin` only after the working tree is clean and all gates are green.
+- [ ] **Step 4: Final review и публикация**
+
+Провести независимый whole-branch review. Только после clean verdict и всех
+зелёных gates интегрировать feature branch и push `main` в origin.
