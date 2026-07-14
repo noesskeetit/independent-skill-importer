@@ -507,6 +507,10 @@ evidence там, где pipeline может локализовать их к can
   references, не ослабляющий reason/evidence contract.
 - `git fetch` ограничен timeout, но exact byte quota на входящий pack до его завершения не
   гарантируется. Production нужен quota-controlled fetch service с disk/network isolation.
+- GitHub tree/blob route с full 40-hex SHA всё ещё сначала запрашивает advertised refs через
+  `git ls-remote`, чтобы не перепутать SHA с branch/tag, начинающимся теми же 40 hex. Это не
+  ослабляет resolved commit identity, но создаёт availability-зависимость от bounded ref listing;
+  production resolver нужен отдельный safe immutable-SHA fast path.
 - Protocol validation не является universal host allowlist или SSRF policy. Server deployment
   требует egress allowlist, DNS/IP controls и отдельный credential broker для private Git.
 - Local source snapshot охватывает весь supplied root; `subpath` не уменьшает source-global

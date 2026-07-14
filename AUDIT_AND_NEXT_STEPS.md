@@ -150,6 +150,8 @@ scan `openclaw/agent-skills` resolved commit
 
 - quota-controlled Git fetch с disk/network isolation: archive cap не ограничивает exact incoming
   pack bytes до завершения fetch;
+- safe immutable-SHA fast path для GitHub tree/blob routes без обязательного полного
+  `ls-remote`, сохраняющий disambiguation SHA-похожих branch/tag names;
 - pre-index/cache для static и reverse analysis: текущий worst case —
   `O(candidates * runtime files)`;
 - server-side egress allowlist, DNS/IP/SSRF controls и credential broker для private Git;
