@@ -79,15 +79,9 @@ _MARKDOWN_REFERENCE_DEFINITION_RE = re.compile(
     r"^ {0,3}\[(?P<label>[^\]]+)\]:[ \t]*(?:<(?P<angle>[^>]+)>|(?P<plain>\S+))"
 )
 _MARKDOWN_REFERENCE_LABEL_RE = re.compile(r"^ {0,3}\[(?P<label>[^\]]+)\]:[ \t]*$")
-_MARKDOWN_REFERENCE_DESTINATION_RE = re.compile(
-    r"^[ \t]{1,3}(?:<(?P<angle>[^>]+)>|(?P<plain>\S+))"
-)
-_MARKDOWN_REFERENCE_USAGE_RE = re.compile(
-    r"!?\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]"
-)
-_MARKDOWN_SHORTCUT_REFERENCE_RE = re.compile(
-    r"(?<![!\]])!?\[(?P<label>[^\]]+)\](?![\[(])"
-)
+_MARKDOWN_REFERENCE_DESTINATION_RE = re.compile(r"^[ \t]{1,3}(?:<(?P<angle>[^>]+)>|(?P<plain>\S+))")
+_MARKDOWN_REFERENCE_USAGE_RE = re.compile(r"!?\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]")
+_MARKDOWN_SHORTCUT_REFERENCE_RE = re.compile(r"(?<![!\]])!?\[(?P<label>[^\]]+)\](?![\[(])")
 _DEVELOPMENT_HEADING_TITLES = frozenset(
     {"dev", "develop", "development", "test", "testing", "tests", "validate", "validation"}
 )
@@ -110,9 +104,7 @@ _PYTHON_PATH_TYPES = frozenset({"path", "purepath"})
 _PYTHON_WRITE_METHODS = frozenset(
     {"chmod", "mkdir", "rename", "replace", "rmdir", "touch", "unlink", "write_bytes", "write_text"}
 )
-_PYTHON_SUBPROCESS_CALLS = frozenset(
-    {"call", "check_call", "check_output", "popen", "run"}
-)
+_PYTHON_SUBPROCESS_CALLS = frozenset({"call", "check_call", "check_output", "popen", "run"})
 _JAVASCRIPT_PATH_CALLS = {
     "import": "import",
     "require": "import",
@@ -141,12 +133,8 @@ _SHELL_PATH_COMMANDS = frozenset(
         "tail",
     }
 )
-_SCRIPT_INTERPRETERS = frozenset(
-    {"bash", "bun", "deno", "node", "python", "python3", "sh"}
-)
-_JAVASCRIPT_SUFFIXES = frozenset(
-    {".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"}
-)
+_SCRIPT_INTERPRETERS = frozenset({"bash", "bun", "deno", "node", "python", "python3", "sh"})
+_JAVASCRIPT_SUFFIXES = frozenset({".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"})
 _SHELL_SUFFIXES = frozenset({".bash", ".sh", ".zsh"})
 _STRUCTURED_PATH_FIELDS = frozenset({"extends", "files", "include"})
 _MCP_TOOL_RE = re.compile(r"\bmcp__(?P<server>[A-Za-z0-9_.-]+)__(?P<tool>[A-Za-z0-9_.-]+)\b")
@@ -955,11 +943,7 @@ def _python_path_references(
         return
 
     line_starts = tuple([0, *(match.end() for match in re.finditer("\n", content))])
-    parents = {
-        id(child): node
-        for node in ast.walk(tree)
-        for child in ast.iter_child_nodes(node)
-    }
+    parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     path_names, pathlib_modules, subprocess_modules, subprocess_names = _python_symbols(tree)
     indirect_accesses = _python_indirect_path_accesses(
         tree,
@@ -1018,7 +1002,20 @@ def _python_path_references(
 
 
 _JAVASCRIPT_REGEX_PREFIX_KEYWORDS = frozenset(
-    {"case", "delete", "do", "else", "in", "instanceof", "new", "return", "throw", "typeof", "void", "yield"}
+    {
+        "case",
+        "delete",
+        "do",
+        "else",
+        "in",
+        "instanceof",
+        "new",
+        "return",
+        "throw",
+        "typeof",
+        "void",
+        "yield",
+    }
 )
 _JAVASCRIPT_CONTROL_KEYWORDS = frozenset({"catch", "for", "if", "switch", "while", "with"})
 _JAVASCRIPT_REGEX_PREFIX_TOKENS = frozenset(
@@ -1142,7 +1139,7 @@ def _javascript_tokens(content: str) -> tuple[list[_JavaScriptToken], bool]:
                 return tokens, True
             offset = end + 2
             continue
-        if character in {"\"", "'"}:
+        if character in {'"', "'"}:
             quote = character
             start = offset + 1
             offset = start
@@ -1169,9 +1166,7 @@ def _javascript_tokens(content: str) -> tuple[list[_JavaScriptToken], bool]:
             continue
         if character == "`":
             token = _javascript_add_token(tokens, context, "template", "", offset + 1, offset + 1)
-            contexts.append(
-                _JavaScriptContext("template", template_token_index=len(tokens) - 1)
-            )
+            contexts.append(_JavaScriptContext("template", template_token_index=len(tokens) - 1))
             context.previous = token
             offset += 1
             continue
@@ -1209,9 +1204,7 @@ def _javascript_tokens(content: str) -> tuple[list[_JavaScriptToken], bool]:
         if character.isalpha() or character in "_$":
             start = offset
             offset += 1
-            while offset < len(content) and (
-                content[offset].isalnum() or content[offset] in "_$"
-            ):
+            while offset < len(content) and (content[offset].isalnum() or content[offset] in "_$"):
                 offset += 1
             _javascript_add_token(
                 tokens,
@@ -1225,9 +1218,7 @@ def _javascript_tokens(content: str) -> tuple[list[_JavaScriptToken], bool]:
         if character.isdigit():
             start = offset
             offset += 1
-            while offset < len(content) and (
-                content[offset].isalnum() or content[offset] in "._"
-            ):
+            while offset < len(content) and (content[offset].isalnum() or content[offset] in "._"):
                 offset += 1
             _javascript_add_token(
                 tokens,
@@ -1244,7 +1235,23 @@ def _javascript_tokens(content: str) -> tuple[list[_JavaScriptToken], bool]:
                 candidate
                 for size in (3, 2)
                 if (candidate := content[offset : offset + size])
-                in {"!=", "!==", "%=", "&&", "*=", "+=", "-=", "/=", "<=", "==", "===", "=>", ">=", "??", "||"}
+                in {
+                    "!=",
+                    "!==",
+                    "%=",
+                    "&&",
+                    "*=",
+                    "+=",
+                    "-=",
+                    "/=",
+                    "<=",
+                    "==",
+                    "===",
+                    "=>",
+                    ">=",
+                    "??",
+                    "||",
+                }
             ),
             character,
         )
@@ -1342,7 +1349,7 @@ def _javascript_call_reference(
         if current.value in {",", ")"}:
             end = min(end, current.start)
             break
-    value = content[argument.start:end].strip()
+    value = content[argument.start : end].strip()
     return (value, argument.start, True) if value else None
 
 
@@ -1468,11 +1475,7 @@ def _shell_interpreter_script_index(
     if interpreter not in _SCRIPT_INTERPRETERS:
         return None
     index = command_index + 1
-    if (
-        interpreter in {"bun", "deno"}
-        and index < len(tokens)
-        and tokens[index].casefold() == "run"
-    ):
+    if interpreter in {"bun", "deno"} and index < len(tokens) and tokens[index].casefold() == "run":
         index += 1
     while index < len(tokens):
         value = tokens[index]
@@ -1585,8 +1588,7 @@ def _shell_path_references(
                 return
             logical_offsets = _shell_token_offsets(line[2:], tokens)
             offsets = [
-                source_map[min(offset + 2, len(source_map) - 1)]
-                for offset in logical_offsets
+                source_map[min(offset + 2, len(source_map) - 1)] for offset in logical_offsets
             ]
             for index in range(1, len(tokens)):
                 if _looks_shell_path(tokens[index]):
@@ -1640,7 +1642,7 @@ def _glob_pattern_variants(pattern: str) -> tuple[str, ...]:
         marker = current.find("/**/")
         if marker < 0:
             continue
-        collapsed = f"{current[:marker]}/{current[marker + 4:]}"
+        collapsed = f"{current[:marker]}/{current[marker + 4 :]}"
         if collapsed not in variants:
             variants.add(collapsed)
             pending.append(collapsed)
@@ -1834,14 +1836,16 @@ def _frontmatter_path_references(
             continue
         if match.group("key").casefold() not in {"file", "path", "root", "source"}:
             continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"\"", "'"}:
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
         else:
             value = value.split(" #", 1)[0].strip()
         if not value:
             continue
-        value_column = line.find(match.group("value")) + len(match.group("value")) - len(
-            match.group("value").lstrip()
+        value_column = (
+            line.find(match.group("value"))
+            + len(match.group("value"))
+            - len(match.group("value").lstrip())
         )
         yield _PathReference(
             _clean_reference(value),
@@ -2021,9 +2025,7 @@ def _markdown_path_references(
 ) -> Iterable[_PathReference]:
     frontmatter = _markdown_frontmatter_bounds(content)
     fences = _markdown_fences(content)
-    structural_ranges: list[tuple[int, int]] = [
-        (fence.start, fence.end) for fence in fences
-    ]
+    structural_ranges: list[tuple[int, int]] = [(fence.start, fence.end) for fence in fences]
     if frontmatter is not None:
         body_start, body_end, closing_end = frontmatter
         structural_ranges.append((0, closing_end))
@@ -2087,9 +2089,7 @@ def _markdown_path_references(
             continue
         definition_label = _MARKDOWN_REFERENCE_LABEL_RE.match(line)
         if definition_label is not None:
-            pending_definition = _markdown_reference_label(
-                definition_label.group("label")
-            )
+            pending_definition = _markdown_reference_label(definition_label.group("label"))
             continue
         for usage in _MARKDOWN_REFERENCE_USAGE_RE.finditer(line):
             usage_offset = offset + usage.start()
@@ -2925,7 +2925,7 @@ def _shell_heredoc_delimiter(line: str, offset: int) -> tuple[str, bool] | None:
         cursor += 1
     if cursor >= len(line):
         return None
-    if line[cursor] in {"\"", "'"}:
+    if line[cursor] in {'"', "'"}:
         quote = line[cursor]
         end = line.find(quote, cursor + 1)
         if end < 0:
@@ -2971,18 +2971,18 @@ def _shell_raw_context(
             if character == "\\":
                 cursor += 2
                 continue
-            if character in {"\"", "'"}:
+            if character in {'"', "'"}:
                 quote = character
                 end = cursor + 1
                 while end < len(line):
-                    if quote == "\"" and line[end] == "\\":
+                    if quote == '"' and line[end] == "\\":
                         end += 2
                         continue
                     if line[end] == quote:
                         end += 1
                         break
                     end += 1
-                target = double_quoted if quote == "\"" else hard_inert
+                target = double_quoted if quote == '"' else hard_inert
                 target.append(
                     (
                         base_offset + line_offset + cursor,
@@ -3049,9 +3049,7 @@ def _complement_offset_ranges(
 
 def _markdown_raw_context(content: str) -> _RawPluginContext:
     fences = _markdown_fences(content)
-    structural_ranges: list[tuple[int, int]] = [
-        (fence.start, fence.end) for fence in fences
-    ]
+    structural_ranges: list[tuple[int, int]] = [(fence.start, fence.end) for fence in fences]
     frontmatter = _markdown_frontmatter_bounds(content)
     if frontmatter is not None:
         structural_ranges.append((0, frontmatter[2]))
@@ -3077,9 +3075,7 @@ def _markdown_raw_context(content: str) -> _RawPluginContext:
             continue
         body = content[fence.body_start : fence.body_end]
         if fence.language in python_languages:
-            ranges.extend(
-                _python_raw_inert_ranges(body, base_offset=fence.body_start)
-            )
+            ranges.extend(_python_raw_inert_ranges(body, base_offset=fence.body_start))
         elif fence.language in javascript_languages:
             context = _javascript_raw_context(body, base_offset=fence.body_start)
             if context.default_inert:
@@ -3372,9 +3368,7 @@ def _is_owned_runtime_path(
 
 
 def _is_proven_package_context(reference: _PathReference) -> bool:
-    return reference.access == "import" or reference.syntax.startswith(
-        ("json.", "markdown.")
-    )
+    return reference.access == "import" or reference.syntax.startswith(("json.", "markdown."))
 
 
 def _missing_reference_is_package_context(

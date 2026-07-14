@@ -546,9 +546,7 @@ def test_repository_root_relative_resolution_preserves_entry_relative_precedence
         tmp_path,
         {
             "references/guide.md": "repository guide",
-            "skills/session-viewer/SKILL.md": _skill(
-                "Read [guide](references/guide.md).\n"
-            ),
+            "skills/session-viewer/SKILL.md": _skill("Read [guide](references/guide.md).\n"),
             "skills/session-viewer/references/guide.md": "skill guide",
         },
         root="skills/session-viewer",
@@ -605,9 +603,7 @@ def test_markdown_inline_shell_command_remains_a_dependency(tmp_path: Path) -> N
         tmp_path,
         {
             "skills/shared/env.sh": "export READY=1\n",
-            "skills/alpha/SKILL.md": _skill(
-                "Shell example: `source ../shared/env.sh`.\n"
-            ),
+            "skills/alpha/SKILL.md": _skill("Shell example: `source ../shared/env.sh`.\n"),
         },
     )
 
@@ -620,21 +616,20 @@ def test_repository_root_relative_escape_without_inventory_target_is_external(
 ) -> None:
     result = _analyze(
         tmp_path,
-        {
-            "skills/session-viewer/SKILL.md": _skill(
-                "Read [passwd](../../../../etc/passwd).\n"
-            )
-        },
+        {"skills/session-viewer/SKILL.md": _skill("Read [passwd](../../../../etc/passwd).\n")},
         root="skills/session-viewer",
     )
 
     assert result.classification is Classification.PORTABLE
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 def test_local_reference_resolver_does_not_decode_raw_target_coordinates(
@@ -663,20 +658,22 @@ def test_local_reference_resolver_treats_encoded_escape_as_external_runtime_data
         tmp_path,
         {
             "skills/session-viewer/SKILL.md": _skill(
-                "Read [passwd](%252e%252e%252f%252e%252e%252f"
-                "%252e%252e%252fetc%252fpasswd).\n"
+                "Read [passwd](%252e%252e%252f%252e%252e%252f%252e%252e%252fetc%252fpasswd).\n"
             )
         },
         root="skills/session-viewer",
     )
 
     assert result.classification is Classification.PORTABLE
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 def test_local_reference_resolver_prefers_candidate_root_for_nested_entry(
@@ -731,11 +728,14 @@ def test_inert_code_strings_do_not_create_dependency_evidence(
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+        }
+        & result.reason_codes
+    )
 
 
 def test_tsconfig_glob_is_expanded_only_against_inventory(tmp_path: Path) -> None:
@@ -743,18 +743,19 @@ def test_tsconfig_glob_is_expanded_only_against_inventory(tmp_path: Path) -> Non
         tmp_path,
         {
             "skills/alpha/SKILL.md": _skill(),
-            "skills/alpha/tsconfig.json": json.dumps(
-                {"include": ["scripts/**/*.ts"]}
-            ),
+            "skills/alpha/tsconfig.json": json.dumps({"include": ["scripts/**/*.ts"]}),
             "skills/alpha/scripts/main.ts": "export {};\n",
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+        }
+        & result.reason_codes
+    )
 
 
 def test_python_source_sink_in_test_file_remains_nonportable_but_fixture_is_inert(
@@ -767,7 +768,7 @@ def test_python_source_sink_in_test_file_remains_nonportable_but_fixture_is_iner
             "skills/alpha/SKILL.md": _skill(),
             "skills/alpha/tests/test_engine.py": (
                 "fixture = 'open(\"../../../runtime/not-real.py\")'\n"
-                "with open(\"../../../runtime/engine.py\") as handle:\n"
+                'with open("../../../runtime/engine.py") as handle:\n'
                 "    handle.read()\n"
             ),
         },
@@ -813,11 +814,7 @@ def test_shell_source_sink_remains_nonportable(tmp_path: Path) -> None:
 def test_markdown_dynamic_source_sink_remains_nonportable(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
-        {
-            "skills/alpha/SKILL.md": _skill(
-                "Read [data](${RESOURCE_DIR}/data.json).\n"
-            )
-        },
+        {"skills/alpha/SKILL.md": _skill("Read [data](${RESOURCE_DIR}/data.json).\n")},
     )
 
     assert result.classification is Classification.PLUGIN_BOUND
@@ -881,12 +878,15 @@ def test_review_javascript_inert_lexical_contexts_have_no_path_evidence(
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 def test_review_javascript_unclosed_string_is_not_a_package_dependency(
@@ -897,8 +897,7 @@ def test_review_javascript_unclosed_string_is_not_a_package_dependency(
         {
             "skills/alpha/SKILL.md": _skill(),
             "skills/alpha/scripts/broken.js": (
-                'const note = "unterminated\n'
-                'require("../../../runtime/engine.js");\n'
+                'const note = "unterminated\nrequire("../../../runtime/engine.js");\n'
             ),
         },
     )
@@ -914,8 +913,7 @@ def test_review_python_path_alias_receiver_remains_nonportable(tmp_path: Path) -
             "runtime/engine.py": "pass\n",
             "skills/alpha/SKILL.md": _skill(),
             "skills/alpha/tests/test_alias.py": (
-                "from pathlib import Path as P\n"
-                'P("../../../runtime/engine.py").read_text()\n'
+                'from pathlib import Path as P\nP("../../../runtime/engine.py").read_text()\n'
             ),
         },
     )
@@ -931,8 +929,7 @@ def test_review_python_subprocess_argv_sink_remains_nonportable(tmp_path: Path) 
             "runtime/tool.sh": "exit 0\n",
             "skills/alpha/SKILL.md": _skill(),
             "skills/alpha/tests/test_runner.py": (
-                "import subprocess\n"
-                'subprocess.run(["../../../runtime/tool.sh"], check=True)\n'
+                'import subprocess\nsubprocess.run(["../../../runtime/tool.sh"], check=True)\n'
             ),
         },
     )
@@ -956,12 +953,15 @@ def test_review_python_write_receiver_content_is_not_an_input_dependency(
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 def test_review_generated_output_read_is_not_an_input_dependency(tmp_path: Path) -> None:
@@ -977,10 +977,13 @@ def test_review_generated_output_read_is_not_an_input_dependency(tmp_path: Path)
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        }
+        & result.reason_codes
+    )
 
 
 @pytest.mark.parametrize(
@@ -1012,12 +1015,15 @@ def test_dynamic_runtime_io_is_not_a_package_dependency(
     )
 
     assert result.classification is Classification.PORTABLE
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 @pytest.mark.parametrize(
@@ -1153,18 +1159,19 @@ def test_markdown_typescript_fence_relative_import_is_consumer_example(
     result = _analyze(
         tmp_path,
         {
-            "skills/alpha/SKILL.md": _skill(
-                "See [the consumer example](references/example.md).\n"
-            ),
+            "skills/alpha/SKILL.md": _skill("See [the consumer example](references/example.md).\n"),
             "skills/alpha/references/example.md": f"```ts\n{statement}\n```\n",
         },
     )
 
     assert result.classification is Classification.PORTABLE
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        }
+        & result.reason_codes
+    )
 
 
 @pytest.mark.parametrize(
@@ -1218,20 +1225,19 @@ def test_review_shell_heredoc_body_is_inert(tmp_path: Path) -> None:
         {
             "skills/shared/env.sh": "export READY=1\n",
             "skills/alpha/SKILL.md": _skill(),
-            "skills/alpha/check.sh": (
-                "cat <<'EOF'\n"
-                "source ../shared/env.sh\n"
-                "EOF\n"
-            ),
+            "skills/alpha/check.sh": ("cat <<'EOF'\nsource ../shared/env.sh\nEOF\n"),
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 @pytest.mark.parametrize(
@@ -1253,12 +1259,15 @@ def test_review_markdown_unknown_fence_content_is_inert(
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 def test_review_markdown_frontmatter_block_scalar_is_not_a_path_field(
@@ -1268,21 +1277,20 @@ def test_review_markdown_frontmatter_block_scalar_is_not_a_path_field(
         tmp_path,
         {
             "skills/alpha/SKILL.md": (
-                "---\n"
-                "name: alpha\n"
-                "description: |\n"
-                "  path: ../../../runtime/not-real.js\n"
-                "---\n"
+                "---\nname: alpha\ndescription: |\n  path: ../../../runtime/not-real.js\n---\n"
             )
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 def test_review_tsconfig_glob_does_not_fall_back_to_repository_siblings(
@@ -1297,12 +1305,15 @@ def test_review_tsconfig_glob_does_not_fall_back_to_repository_siblings(
         },
     )
 
-    assert not {
-        ReasonCode.MISSING_LOCAL_RESOURCE,
-        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-        ReasonCode.PATH_TRAVERSAL,
-        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-    } & result.reason_codes
+    assert (
+        not {
+            ReasonCode.MISSING_LOCAL_RESOURCE,
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.PATH_TRAVERSAL,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
 
 
 def test_existing_parent_resource_is_outside_skill_and_nonportable(tmp_path: Path) -> None:
@@ -1782,9 +1793,7 @@ def test_reverse_boundary_relative_skill_path_from_command_is_plugin_bound(
     result = _analyze(
         tmp_path,
         {
-            "plugins/example/.claude-plugin/plugin.json": json.dumps(
-                {"commands": "./commands"}
-            ),
+            "plugins/example/.claude-plugin/plugin.json": json.dumps({"commands": "./commands"}),
             "plugins/example/commands/example.md": (
                 "The command also exists as `skills/alpha/SKILL.md`.\n"
             ),
@@ -3068,8 +3077,7 @@ def test_corrected_review_subprocess_interpreter_script_target_is_tracked(
             f"runtime/tool.{suffix}": "pass\n",
             "skills/alpha/SKILL.md": _skill(),
             "skills/alpha/tests/run.py": (
-                "import subprocess\n"
-                f"subprocess.run({argv!r}, check=True)\n"
+                f"import subprocess\nsubprocess.run({argv!r}, check=True)\n"
             ),
         },
     )
@@ -3108,9 +3116,7 @@ def test_corrected_review_commonmark_shortcut_and_image_references_are_tracked(
         tmp_path,
         {
             "skills/shared/guide.md": "guide\n",
-            "skills/alpha/SKILL.md": _skill(
-                f"{usage}\n\n[{label}]: ../shared/guide.md\n"
-            ),
+            "skills/alpha/SKILL.md": _skill(f"{usage}\n\n[{label}]: ../shared/guide.md\n"),
         },
     )
 
@@ -3126,9 +3132,7 @@ def test_corrected_review_commonmark_first_reference_definition_wins(
         {
             "skills/shared/guide.md": "outside\n",
             "skills/alpha/SKILL.md": _skill(
-                "Read the [guide].\n\n"
-                "[guide]: references/guide.md\n"
-                "[guide]: ../shared/guide.md\n"
+                "Read the [guide].\n\n[guide]: references/guide.md\n[guide]: ../shared/guide.md\n"
             ),
             "skills/alpha/references/guide.md": "inside\n",
         },
@@ -3146,9 +3150,7 @@ def test_corrected_review_multiline_commonmark_reference_definition_is_tracked(
         {
             "skills/shared/guide.md": "guide\n",
             "skills/alpha/SKILL.md": _skill(
-                "Read the [shared guide][g].\n\n"
-                "[g]:\n"
-                "  ../shared/guide.md\n"
+                "Read the [shared guide][g].\n\n[g]:\n  ../shared/guide.md\n"
             ),
         },
     )
@@ -3169,9 +3171,7 @@ def test_corrected_review_escaped_and_code_span_brackets_are_not_references(
         tmp_path,
         {
             "skills/shared/guide.md": "guide\n",
-            "skills/alpha/SKILL.md": _skill(
-                f"{usage}\n\n[guide]: ../shared/guide.md\n"
-            ),
+            "skills/alpha/SKILL.md": _skill(f"{usage}\n\n[guide]: ../shared/guide.md\n"),
         },
     )
 
@@ -3187,10 +3187,7 @@ def test_corrected_review_reference_definition_inside_code_span_is_inert(
         {
             "skills/shared/guide.md": "guide\n",
             "skills/alpha/SKILL.md": _skill(
-                "Read the [guide].\n\n"
-                "``\n"
-                "[guide]: ../shared/guide.md\n"
-                "``\n"
+                "Read the [guide].\n\n``\n[guide]: ../shared/guide.md\n``\n"
             ),
         },
     )
@@ -3204,9 +3201,7 @@ def test_corrected_review_tilde_shell_fence_is_tracked(tmp_path: Path) -> None:
         tmp_path,
         {
             "skills/shared/env.sh": "export READY=1\n",
-            "skills/alpha/SKILL.md": _skill(
-                "~~~bash\nsource ../shared/env.sh\n~~~\n"
-            ),
+            "skills/alpha/SKILL.md": _skill("~~~bash\nsource ../shared/env.sh\n~~~\n"),
         },
     )
 
@@ -3223,9 +3218,7 @@ def test_corrected_review_long_javascript_static_import_is_tracked(
         {
             "runtime/mod.js": "export {};\n",
             "skills/alpha/SKILL.md": _skill(),
-            "skills/alpha/module.js": (
-                f'import {{ {imports} }} from "../../runtime/mod.js";\n'
-            ),
+            "skills/alpha/module.js": (f'import {{ {imports} }} from "../../runtime/mod.js";\n'),
         },
     )
 
@@ -3240,9 +3233,7 @@ def test_corrected_review_decoded_parent_reference_resolves_inventory_target(
         tmp_path,
         {
             "skills/shared/guide.md": "guide\n",
-            "skills/alpha/SKILL.md": _skill(
-                "Read [the guide](%2e%2e/shared/guide.md).\n"
-            ),
+            "skills/alpha/SKILL.md": _skill("Read [the guide](%2e%2e/shared/guide.md).\n"),
         },
     )
 
@@ -3290,9 +3281,7 @@ def test_corrected_review_indirect_path_read_still_tracks_dependency(tmp_path: P
             "runtime/input.html": "input\n",
             "skills/alpha/SKILL.md": _skill(),
             "skills/alpha/render.py": (
-                "from pathlib import Path\n"
-                'p = Path("../../runtime/input.html")\n'
-                "p.read_text()\n"
+                'from pathlib import Path\np = Path("../../runtime/input.html")\np.read_text()\n'
             ),
         },
     )
@@ -3384,10 +3373,7 @@ def test_corrected_review_quoted_shell_plugin_root_still_binds(
     [
         (
             "skills/alpha/run.sh",
-            "# ${PLUGIN_ROOT}/comment.py\n"
-            "cat <<'FIXTURE'\n"
-            "${PLUGIN_ROOT}/fixture.py\n"
-            "FIXTURE\n",
+            "# ${PLUGIN_ROOT}/comment.py\ncat <<'FIXTURE'\n${PLUGIN_ROOT}/fixture.py\nFIXTURE\n",
         ),
         (
             "skills/alpha/SKILL.md",
@@ -3450,7 +3436,7 @@ def test_corrected_review_shell_comments_and_heredocs_are_inert(
             json.dumps({"runtime": "src/acme-runtime.ts"}),
             "src/acme-runtime.ts",
             "skills/alpha/tests/fixture.js",
-            'const fixture = \'import { run } from "acme-runtime"\';\n',
+            "const fixture = 'import { run } from \"acme-runtime\"';\n",
         ),
     ],
 )
