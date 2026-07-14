@@ -150,9 +150,11 @@ class CaseResult:
     source: SourceDefinition
     expected_error: str | None
     expected_candidates: tuple[SelectedCandidateExpectation, ...]
+    actual_canonical_url: str | None
     resolved_commit_sha: str | None
     actual_candidates: tuple[ActualCandidate, ...]
     actual_error: ActualError | None
+    source_agreement: bool | None
     sha_agreement: bool | None
     candidate_agreement: bool | None
     reason_code_match: bool | None
@@ -176,10 +178,12 @@ class CaseResult:
                 "candidates": [item.to_dict() for item in self.expected_candidates],
             },
             "actual": {
+                "canonicalUrl": self.actual_canonical_url,
                 "resolvedCommitSha": self.resolved_commit_sha,
                 "candidates": [item.to_dict() for item in self.actual_candidates],
                 "error": self.actual_error.to_dict() if self.actual_error is not None else None,
             },
+            "sourceAgreement": self.source_agreement,
             "shaAgreement": self.sha_agreement,
             "candidateAgreement": self.candidate_agreement,
             "reasonCodeMatch": self.reason_code_match,
@@ -293,6 +297,52 @@ def _https_url(
     return text
 
 
+def _github_path_parts(value: str, path: str) -> tuple[str, ...]:
+    parsed = urlsplit(value)
+    if parsed.hostname != "github.com" or "%" in parsed.path:
+        raise _invalid(path, "must use an unencoded github.com repository path")
+    parts = tuple(part for part in parsed.path.split("/") if part)
+    if len(parts) < 2:
+        raise _invalid(path, "must identify a GitHub owner and repository")
+    return parts
+
+
+def _repository_identity(value: str, path: str, *, canonical: bool = False) -> tuple[str, str]:
+    parts = _github_path_parts(value, path)
+    repository = parts[1]
+    if canonical:
+        if len(parts) != 2 or not repository.endswith(".git"):
+            raise _invalid(path, "must be an exact GitHub clone URL")
+        repository = repository[:-4]
+    elif repository.endswith(".git"):
+        repository = repository[:-4]
+    if not parts[0] or not repository:
+        raise _invalid(path, "must identify a GitHub owner and repository")
+    return parts[0].casefold(), repository.casefold()
+
+
+def _validate_provenance(
+    source: SourceDefinition,
+    candidates: tuple[CandidateExpectation, ...],
+    path: str,
+) -> None:
+    expected_identity = _repository_identity(
+        source.canonical_url, f"{path}.source.canonicalUrl", canonical=True
+    )
+    for candidate_index, candidate in enumerate(candidates):
+        for link_index, link in enumerate(candidate.provenance_links):
+            link_path = (
+                f"{path}.expected.candidates[{candidate_index}].provenanceLinks[{link_index}]"
+            )
+            if _repository_identity(link, link_path) != expected_identity:
+                raise _invalid(link_path, "must reference the source repository")
+            parts = _github_path_parts(link, link_path)
+            if len(parts) < 4 or parts[2] not in {"blob", "tree"}:
+                raise _invalid(link_path, "must be pinned to a blob/tree commit")
+            if parts[3] != source.commit_sha:
+                raise _invalid(link_path, "must use the source commitSha")
+
+
 def _string_array(
     value: object, path: str, *, allowed: frozenset[str] | None = None
 ) -> tuple[str, ...]:
@@ -374,9 +424,17 @@ def _parse_source(value: object, path: str) -> SourceDefinition:
     commit_sha = _string(payload["commitSha"], f"{path}.commitSha")
     if _SHA_RE.fullmatch(commit_sha) is None:
         raise _invalid(f"{path}.commitSha", "must be a 40-character lowercase commit SHA")
-    route_match = re.search(r"/(?:tree|blob)/([^/]+)", urlsplit(input_url).path)
-    if route_match is not None and route_match.group(1) != commit_sha:
-        raise _invalid(f"{path}.inputUrl", "tree/blob route must use commitSha, not a branch")
+    input_identity = _repository_identity(input_url, f"{path}.inputUrl")
+    canonical_identity = _repository_identity(canonical_url, f"{path}.canonicalUrl", canonical=True)
+    if input_identity != canonical_identity:
+        raise _invalid(f"{path}.canonicalUrl", "must identify the inputUrl repository")
+    input_parts = _github_path_parts(input_url, f"{path}.inputUrl")
+    route = input_parts[2:]
+    if route:
+        if len(route) < 2 or route[0] not in {"tree", "blob"}:
+            raise _invalid(f"{path}.inputUrl", "must be a GitHub repository/tree/blob URL")
+        if route[1] != commit_sha:
+            raise _invalid(f"{path}.inputUrl", "tree/blob route must use commitSha, not a branch")
     subpath = None
     if "subpath" in payload:
         subpath = _relative_path(payload["subpath"], f"{path}.subpath")
@@ -413,6 +471,7 @@ def _parse_case(value: object, path: str) -> BenchmarkCase:
     )
     if operational_error is not None and _ERROR_CODE_RE.fullmatch(operational_error) is None:
         raise _invalid(f"{path}.expected.operationalError", "must be an uppercase error code")
+    source = _parse_source(payload["source"], f"{path}.source")
     candidate_values = _array(expected_payload["candidates"], f"{path}.expected.candidates")
     candidates = tuple(
         _parse_candidate(item, f"{path}.expected.candidates[{index}]")
@@ -423,11 +482,12 @@ def _parse_case(value: object, path: str) -> BenchmarkCase:
     roots = [item.root for item in candidates]
     if len(roots) != len(set(roots)):
         raise _invalid(f"{path}.expected.candidates", "candidate roots must be unique")
+    _validate_provenance(source, candidates, path)
     return BenchmarkCase(
         case_id=case_id,
         category=category,
         coverage_mode=coverage_mode,
-        source=_parse_source(payload["source"], f"{path}.source"),
+        source=source,
         expected=ExpectedOutcome(
             operational_error=operational_error,
             candidates=candidates,
@@ -495,8 +555,9 @@ def _scan_string(value: object, path: str, *, nullable: bool = False) -> str | N
 
 def _read_actual(
     report: Mapping[str, object], *, use_llm: bool
-) -> tuple[str | None, tuple[ActualCandidate, ...]]:
+) -> tuple[str, str | None, tuple[ActualCandidate, ...]]:
     source = _scan_object(report.get("source"), "source")
+    canonical_url = _scan_string(source.get("canonicalUrl"), "source.canonicalUrl")
     resolved_sha = _scan_string(
         source.get("resolvedCommitSha"), "source.resolvedCommitSha", nullable=True
     )
@@ -530,7 +591,9 @@ def _read_actual(
                 reason_codes=tuple(sorted(set(reasons))),
             )
         )
-    return resolved_sha, tuple(candidates)
+    if canonical_url is None:  # pragma: no cover - guarded by _scan_string
+        raise AssertionError("unreachable")
+    return canonical_url, resolved_sha, tuple(candidates)
 
 
 def _compare_candidates(
@@ -594,9 +657,11 @@ def run_benchmark(
                     source=case.source,
                     expected_error=case.expected.operational_error,
                     expected_candidates=selected,
+                    actual_canonical_url=None,
                     resolved_commit_sha=None,
                     actual_candidates=(),
                     actual_error=ActualError(code=exc.code, message=exc.message),
+                    source_agreement=None,
                     sha_agreement=None,
                     candidate_agreement=None,
                     reason_code_match=None,
@@ -608,7 +673,10 @@ def run_benchmark(
             continue
 
         duration_ms = round((clock() - started) * 1000, 3)
-        resolved_sha, actual_candidates = _read_actual(report, use_llm=use_llm)
+        actual_canonical_url, resolved_sha, actual_candidates = _read_actual(
+            report, use_llm=use_llm
+        )
+        source_agreement = actual_canonical_url == case.source.canonical_url
         sha_agreement = resolved_sha == case.source.commit_sha
         candidate_agreement, reason_match = _compare_candidates(case, selected, actual_candidates)
         error_agreement = case.expected.operational_error is None
@@ -620,15 +688,21 @@ def run_benchmark(
                 source=case.source,
                 expected_error=case.expected.operational_error,
                 expected_candidates=selected,
+                actual_canonical_url=actual_canonical_url,
                 resolved_commit_sha=resolved_sha,
                 actual_candidates=actual_candidates,
                 actual_error=None,
+                source_agreement=source_agreement,
                 sha_agreement=sha_agreement,
                 candidate_agreement=candidate_agreement,
                 reason_code_match=reason_match,
                 error_agreement=error_agreement,
                 agreement=(
-                    error_agreement and sha_agreement and candidate_agreement and reason_match
+                    error_agreement
+                    and source_agreement
+                    and sha_agreement
+                    and candidate_agreement
+                    and reason_match
                 ),
                 duration_ms=duration_ms,
             )
@@ -721,6 +795,7 @@ def write_outputs(
     markdown_path: Path,
 ) -> None:
     """Write deterministic JSON and Markdown result files."""
+    _ensure_distinct_paths((("JSON", json_path), ("Markdown", markdown_path)))
     json_path.parent.mkdir(parents=True, exist_ok=True)
     markdown_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(
@@ -735,6 +810,23 @@ def write_outputs(
         encoding="utf-8",
     )
     markdown_path.write_text(render_markdown(result), encoding="utf-8")
+
+
+def _ensure_distinct_paths(named_paths: Sequence[tuple[str, Path]]) -> None:
+    resolved = [
+        (label, path, path.expanduser().resolve(strict=False)) for label, path in named_paths
+    ]
+    for index, (left_label, left_path, left_resolved) in enumerate(resolved):
+        for right_label, right_path, right_resolved in resolved[index + 1 :]:
+            aliases = left_resolved == right_resolved
+            if not aliases and left_path.exists() and right_path.exists():
+                try:
+                    aliases = left_path.samefile(right_path)
+                except OSError:
+                    aliases = False
+            if aliases:
+                labels = f"{left_label}, {right_label}"
+                raise ValueError(f"{labels} paths must resolve to distinct files")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -766,6 +858,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point; network access is impossible without explicit --online."""
     args = _parser().parse_args(argv)
     try:
+        _ensure_distinct_paths(
+            (
+                ("manifest", args.manifest),
+                ("JSON", args.json_out),
+                ("Markdown", args.markdown_out),
+            )
+        )
         manifest = load_manifest(args.manifest)
         result = run_benchmark(manifest, use_llm=args.with_llm)
         write_outputs(result, json_path=args.json_out, markdown_path=args.markdown_out)

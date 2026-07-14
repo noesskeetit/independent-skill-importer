@@ -19,6 +19,9 @@ from benchmarks.real_world.run import (  # noqa: E402
     run_benchmark,
     write_outputs,
 )
+from benchmarks.real_world.run import (  # noqa: E402
+    main as benchmark_main,
+)
 from skill_importer.errors import ImporterError  # noqa: E402
 from skill_importer.models import SourceSpec  # noqa: E402
 from skill_importer.pipeline import ScanOptions  # noqa: E402
@@ -183,6 +186,26 @@ def test_checked_in_manifest_contains_exactly_ten_pinned_research_cases() -> Non
             ),
             "staticClassification",
         ),
+        (
+            lambda payload: payload["cases"][0]["source"].update(
+                canonicalUrl="https://github.com/other/skills.git"
+            ),
+            "canonicalUrl",
+        ),
+        (
+            lambda payload: payload["cases"][0]["expected"]["candidates"][0].update(
+                provenanceLinks=[f"https://github.com/other/skills/blob/{SHA}/skill-01/SKILL.md#L1"]
+            ),
+            "provenanceLinks",
+        ),
+        (
+            lambda payload: payload["cases"][0]["expected"]["candidates"][0].update(
+                provenanceLinks=[
+                    f"https://github.com/example/skills/blob/{'f' * 40}/skill-01/SKILL.md#L1"
+                ]
+            ),
+            "provenanceLinks",
+        ),
     ],
 )
 def test_manifest_validation_rejects_invalid_or_mutable_oracle(
@@ -260,6 +283,26 @@ def test_runner_preserves_manual_labels_and_surfaces_disagreement(tmp_path: Path
     assert reloaded.cases[0].expected.candidates[0].static_classification == "portable"
 
 
+def test_runner_rejects_actual_source_identity_mismatch(tmp_path: Path) -> None:
+    manifest = load_manifest(_write_manifest(tmp_path, _manifest_payload()))
+
+    def fake_scan(spec: SourceSpec, options: ScanOptions) -> Mapping[str, object]:
+        del options
+        if spec.subpath == "scale":
+            raise ImporterError("SCAN_LIMIT_EXCEEDED", "offline scale fixture")
+        payload = _scan_payload(spec)
+        if spec.subpath == "skill-01":
+            payload["source"]["canonicalUrl"] = "https://github.com/other/skills.git"
+        return payload
+
+    result = run_benchmark(manifest, scan=fake_scan, clock=_clock(), use_llm=False)
+    first = cast(dict[str, Any], result.to_dict())["cases"][0]
+
+    assert first["actual"]["canonicalUrl"] == "https://github.com/other/skills.git"
+    assert first["sourceAgreement"] is False
+    assert first["agreement"] is False
+
+
 def test_json_and_markdown_outputs_include_required_benchmark_fields(tmp_path: Path) -> None:
     manifest = load_manifest(_write_manifest(tmp_path, _manifest_payload()))
 
@@ -284,6 +327,45 @@ def test_json_and_markdown_outputs_include_required_benchmark_fields(tmp_path: P
     assert SHA in markdown
     assert "skill-01" in markdown
     assert "SCAN_LIMIT_EXCEEDED" in markdown
+
+
+def test_output_paths_must_not_alias_each_other_or_manifest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    manifest_path = _write_manifest(tmp_path, _manifest_payload())
+    original_manifest = manifest_path.read_bytes()
+    shared_output = tmp_path / "result"
+
+    exit_code = benchmark_main(
+        [
+            "--online",
+            "--manifest",
+            str(manifest_path),
+            "--json-out",
+            str(shared_output),
+            "--markdown-out",
+            str(shared_output),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "must resolve to distinct files" in capsys.readouterr().err
+    assert not shared_output.exists()
+
+    exit_code = benchmark_main(
+        [
+            "--online",
+            "--manifest",
+            str(manifest_path),
+            "--json-out",
+            str(manifest_path),
+            "--markdown-out",
+            str(tmp_path / "result.md"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert manifest_path.read_bytes() == original_manifest
 
 
 def test_fm_mode_compares_final_labels_without_changing_static_oracle(tmp_path: Path) -> None:
