@@ -61,6 +61,9 @@ client и не вызывает FM для deterministic decisions.
 Manual labels никогда не переписываются фактическим output. Несовпадение
 становится benchmark result (`agreement=false`), а не новой «истиной» manifest.
 
+Текущий проверенный static результат и его ограничения зафиксированы в
+[`BASELINE.md`](BASELINE.md): 10/10 agreement на pinned corpus от 2026-07-14.
+
 ## Expected operational error
 
 OpenClaw case честно размечен двумя слоями:
@@ -79,6 +82,7 @@ expectation даст disagreement. После ручной проверки mani
 JSON сохраняет для каждого case:
 
 - expected и resolved SHA;
+- expected и actual canonical source identity;
 - expected и все actual candidates;
 - selected expected/actual classification;
 - reason-code match;

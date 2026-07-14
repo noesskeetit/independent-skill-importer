@@ -47,7 +47,8 @@ enclosing runtime.
 - [Real-world benchmark](benchmarks/real_world/README.md) запускает public read-only scan path по
   десяти вручную размеченным GitHub cases, pinned на полные commit SHA. Manifest находится в
   [`benchmarks/real_world/cases.json`](benchmarks/real_world/cases.json); обычные tests полностью
-  offline, а сеть включается только явным `--online`.
+  offline, а сеть включается только явным `--online`. Проверенный static baseline:
+  [10/10 cases](benchmarks/real_world/BASELINE.md).
 - [Аудит и следующие шаги](AUDIT_AND_NEXT_STEPS.md) отделяет уже реализованные функциональные
   исправления от отложенного combined audit и production backlog.
 
