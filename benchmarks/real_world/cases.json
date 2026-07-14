@@ -175,13 +175,11 @@
             "finalClassification": "plugin_bound",
             "staticReasonCodes": [
               "REFERENCED_BY_PLUGIN_RUNTIME",
-              "PLUGIN_COMMAND_REFERENCE",
               "PLUGIN_RUNTIME_FILE_REFERENCE",
               "REFERENCE_OUTSIDE_SKILL_ROOT"
             ],
             "finalReasonCodes": [
               "REFERENCED_BY_PLUGIN_RUNTIME",
-              "PLUGIN_COMMAND_REFERENCE",
               "PLUGIN_RUNTIME_FILE_REFERENCE",
               "REFERENCE_OUTSIDE_SKILL_ROOT"
             ],
@@ -211,11 +209,9 @@
             "staticClassification": "plugin_bound",
             "finalClassification": "plugin_bound",
             "staticReasonCodes": [
-              "PLUGIN_OWNED_MCP_TOOL",
               "REFERENCE_OUTSIDE_SKILL_ROOT"
             ],
             "finalReasonCodes": [
-              "PLUGIN_OWNED_MCP_TOOL",
               "REFERENCE_OUTSIDE_SKILL_ROOT"
             ],
             "provenanceLinks": [

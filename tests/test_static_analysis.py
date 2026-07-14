@@ -1688,6 +1688,29 @@ def test_reverse_exact_skill_path_from_runtime_is_plugin_bound(tmp_path: Path) -
     assert "skills/alpha/SKILL.md" in evidence.value
 
 
+def test_reverse_boundary_relative_skill_path_from_command_is_plugin_bound(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugins/example/.claude-plugin/plugin.json": json.dumps(
+                {"commands": "./commands"}
+            ),
+            "plugins/example/commands/example.md": (
+                "The command also exists as `skills/alpha/SKILL.md`.\n"
+            ),
+            "plugins/example/skills/alpha/SKILL.md": _skill(),
+        },
+        root="plugins/example/skills/alpha",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    evidence = _reason(result, ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME).evidence[0]
+    assert evidence.path == "plugins/example/commands/example.md"
+    assert evidence.value == "skills/alpha/SKILL.md"
+
+
 def test_outer_plugin_runtime_reference_reaches_nested_skill_package(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,

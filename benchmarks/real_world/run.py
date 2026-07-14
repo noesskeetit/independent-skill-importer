@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -299,10 +300,10 @@ def _https_url(
 
 def _github_path_parts(value: str, path: str) -> tuple[str, ...]:
     parsed = urlsplit(value)
-    if parsed.hostname != "github.com" or "%" in parsed.path:
+    if parsed.hostname != "github.com" or "%" in parsed.path or "\\" in parsed.path:
         raise _invalid(path, "must use an unencoded github.com repository path")
     parts = tuple(part for part in parsed.path.split("/") if part)
-    if len(parts) < 2:
+    if len(parts) < 2 or any(part in {".", ".."} for part in parts):
         raise _invalid(path, "must identify a GitHub owner and repository")
     return parts
 
@@ -814,11 +815,17 @@ def write_outputs(
 
 def _ensure_distinct_paths(named_paths: Sequence[tuple[str, Path]]) -> None:
     resolved = [
-        (label, path, path.expanduser().resolve(strict=False)) for label, path in named_paths
+        (
+            label,
+            path,
+            path.expanduser().resolve(strict=False),
+            unicodedata.normalize("NFC", str(path.expanduser().resolve(strict=False))).casefold(),
+        )
+        for label, path in named_paths
     ]
-    for index, (left_label, left_path, left_resolved) in enumerate(resolved):
-        for right_label, right_path, right_resolved in resolved[index + 1 :]:
-            aliases = left_resolved == right_resolved
+    for index, (left_label, left_path, left_resolved, left_portable_key) in enumerate(resolved):
+        for right_label, right_path, right_resolved, right_portable_key in resolved[index + 1 :]:
+            aliases = left_resolved == right_resolved or left_portable_key == right_portable_key
             if not aliases and left_path.exists() and right_path.exists():
                 try:
                     aliases = left_path.samefile(right_path)

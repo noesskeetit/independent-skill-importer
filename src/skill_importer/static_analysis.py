@@ -3957,10 +3957,21 @@ def _analyze_boundary_reverse_dependencies(
             path_search_content = json.dumps(
                 _without_packaging_skills(parsed), ensure_ascii=False, separators=(",", ":")
             )
-        exact_match = re.search(
-            rf"(?<![A-Za-z0-9_.-]){re.escape(candidate.root)}(?:/[A-Za-z0-9_./-]+)?",
-            path_search_content,
+        boundary_relative_root = _relative_to(candidate.root, boundary.root)
+        searchable_skill_roots = {candidate.root, boundary_relative_root}
+        path_matches = tuple(
+            match
+            for skill_root in searchable_skill_roots
+            if (
+                match := re.search(
+                    rf"(?<![A-Za-z0-9_./-])(?:\./)?{re.escape(skill_root)}"
+                    rf"(?:/[A-Za-z0-9_./-]+)?",
+                    path_search_content,
+                )
+            )
+            is not None
         )
+        exact_match = min(path_matches, key=lambda item: item.start(), default=None)
         if exact_match is not None and collector.has_capacity(
             ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME
         ):

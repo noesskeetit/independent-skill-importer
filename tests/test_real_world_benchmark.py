@@ -206,6 +206,22 @@ def test_checked_in_manifest_contains_exactly_ten_pinned_research_cases() -> Non
             ),
             "provenanceLinks",
         ),
+        (
+            lambda payload: payload["cases"][0]["expected"]["candidates"][0].update(
+                provenanceLinks=[
+                    f"https://github.com/example/skills/blob/{SHA}/../../tree/main/SKILL.md#L1"
+                ]
+            ),
+            "provenanceLinks",
+        ),
+        (
+            lambda payload: payload["cases"][0]["expected"]["candidates"][0].update(
+                provenanceLinks=[
+                    f"https://github.com/example/skills/blob/{SHA}\\..\\tree\\main\\SKILL.md#L1"
+                ]
+            ),
+            "provenanceLinks",
+        ),
     ],
 )
 def test_manifest_validation_rejects_invalid_or_mutable_oracle(
@@ -366,6 +382,22 @@ def test_output_paths_must_not_alias_each_other_or_manifest(
 
     assert exit_code == 2
     assert manifest_path.read_bytes() == original_manifest
+
+    case_variant = tmp_path / "Result"
+    exit_code = benchmark_main(
+        [
+            "--online",
+            "--manifest",
+            str(manifest_path),
+            "--json-out",
+            str(case_variant),
+            "--markdown-out",
+            str(tmp_path / "result"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert not case_variant.exists()
 
 
 def test_fm_mode_compares_final_labels_without_changing_static_oracle(tmp_path: Path) -> None:
