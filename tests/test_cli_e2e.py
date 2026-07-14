@@ -535,6 +535,27 @@ def test_scan_console_subprocess_emits_json_and_is_read_only(tmp_path: Path) -> 
     assert not (tmp_path / "out").exists()
 
 
+def test_import_console_subprocess_empty_repository_creates_only_empty_manifest(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "empty-source"
+    source.mkdir()
+    out = tmp_path / "out"
+
+    result = _run_console(
+        tmp_path,
+        ["import", str(source), "--out", str(out)],
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout == (f"Imported 0 skill payload(s) into {out}\nSkipped 0 candidate(s)\n")
+    assert [path.name for path in out.iterdir()] == ["import-manifest.json"]
+    manifest = json.loads((out / "import-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["imported"] == []
+    assert manifest["rejected"] == []
+
+
 def test_import_console_subprocess_rescans_and_never_executes_payload(
     tmp_path: Path,
 ) -> None:

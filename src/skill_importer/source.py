@@ -466,6 +466,35 @@ def _validate_discovery_scope(root: Path, scope: str) -> None:
         raise ImporterError("INVALID_SUBPATH", "source subpath must select a directory")
 
 
+def _validate_github_blob_target(root: Path, target: str) -> None:
+    current = root
+    parts = PurePosixPath(target).parts
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            current_stat = current.lstat()
+        except OSError as exc:
+            raise ImporterError(
+                "INVALID_SOURCE",
+                "GitHub blob URL must select an existing regular file",
+            ) from exc
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise ImporterError(
+                "INVALID_SOURCE",
+                "GitHub blob URL must select an existing regular file",
+            )
+        if index < len(parts) - 1 and not stat.S_ISDIR(current_stat.st_mode):
+            raise ImporterError(
+                "INVALID_SOURCE",
+                "GitHub blob URL must select an existing regular file",
+            )
+    if not stat.S_ISREG(current_stat.st_mode):
+        raise ImporterError(
+            "INVALID_SOURCE",
+            "GitHub blob URL must select an existing regular file",
+        )
+
+
 def _create_temporary_root(workspace: Path, prefix: str) -> Path:
     try:
         workspace.mkdir(parents=True, exist_ok=True)
@@ -572,39 +601,59 @@ def _github_ref_and_scope(
     location: _GitHubLocation,
     runner: GitRunner,
     timeout: int,
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, str | None]:
     if location.route_kind is None:
-        return spec.ref, spec.subpath or "."
+        return spec.ref, spec.subpath or ".", None
 
-    remote_output = runner.run_capture(
-        ["ls-remote", "--heads", "--tags", "--", location.canonical_url],
-        timeout=timeout,
-    )
     route_text = "/".join(location.route_tail)
-    matches = [
-        name
-        for name in _remote_ref_names(remote_output)
-        if route_text == name or route_text.startswith(f"{name}/")
-    ]
-    matched_url_ref = max(matches, key=len) if matches else None
-    if matched_url_ref is None and spec.ref is None:
-        raise ImporterError(
-            "AMBIGUOUS_GITHUB_REF",
-            "GitHub tree or blob URL has an ambiguous ref; pass --ref",
+    matched_url_ref = (
+        spec.ref
+        if spec.ref is not None
+        and (route_text == spec.ref or route_text.startswith(f"{spec.ref}/"))
+        else None
+    )
+    if matched_url_ref is None:
+        remote_output = runner.run_capture(
+            ["ls-remote", "--heads", "--tags", "--", location.canonical_url],
+            timeout=timeout,
         )
+        matches = [
+            name
+            for name in _remote_ref_names(remote_output)
+            if route_text == name or route_text.startswith(f"{name}/")
+        ]
+        immutable_url_ref = (
+            location.route_tail[0]
+            if _GIT_SHA_RE.fullmatch(location.route_tail[0]) is not None
+            else None
+        )
+        matched_url_ref = max(matches, key=len) if matches else immutable_url_ref
+    if matched_url_ref is None:
+        if spec.ref is None:
+            raise ImporterError(
+                "AMBIGUOUS_GITHUB_REF",
+                "GitHub tree or blob URL has an ambiguous ref; pass --ref",
+            )
+        if spec.subpath is None:
+            raise ImporterError(
+                "AMBIGUOUS_GITHUB_REF",
+                "GitHub URL ref boundary is ambiguous; pass --subpath",
+            )
 
     url_ref_parts = 1 if matched_url_ref is None else len(PurePosixPath(matched_url_ref).parts)
     routed_path = location.route_tail[url_ref_parts:]
     requested_ref = spec.ref or matched_url_ref
 
     if spec.subpath is not None:
-        return requested_ref, spec.subpath
+        return requested_ref, spec.subpath, None
+    blob_target: str | None = None
     if location.route_kind == "blob":
         if not routed_path:
             raise ImporterError("INVALID_SOURCE", "GitHub blob URL must select a file")
+        blob_target = PurePosixPath(*routed_path).as_posix()
         routed_path = routed_path[:-1]
     scope = PurePosixPath(*routed_path).as_posix() if routed_path else "."
-    return requested_ref, scope
+    return requested_ref, scope, blob_target
 
 
 def _normalize_archive_path(name: str) -> tuple[str, tuple[str, ...]]:
@@ -760,10 +809,11 @@ class SourceResolver:
             spec.value,
             allow_file_transport=self.git_runner.allow_file_transport,
         )
+        github_blob_target: str | None = None
         if spec.kind is SourceKind.GITHUB or parsed_kind is SourceKind.GITHUB:
             location = _github_location(spec.value)
             canonical_url = location.canonical_url
-            requested_ref, discovery_scope = _github_ref_and_scope(
+            requested_ref, discovery_scope, github_blob_target = _github_ref_and_scope(
                 spec,
                 location,
                 self.git_runner,
@@ -833,6 +883,8 @@ class SourceResolver:
             timeout=timeout,
         )
         _extract_git_archive(archive, snapshot_root, self.limits)
+        if github_blob_target is not None:
+            _validate_github_blob_target(snapshot_root, github_blob_target)
         _validate_discovery_scope(snapshot_root, discovery_scope)
         snapshot_sha256 = _snapshot_hash(snapshot_root, self.limits)
         return ResolvedSource(

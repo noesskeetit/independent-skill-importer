@@ -185,8 +185,10 @@ def test_reason_code_surface_contains_approved_poc_codes() -> None:
         "REFERENCED_BY_PLUGIN_RUNTIME",
         "MISSING_LOCAL_RESOURCE",
         "DYNAMIC_REFERENCE_UNRESOLVED",
+        "STATIC_ANALYSIS_INCOMPLETE",
         "MIXED_PLUGIN_AUTONOMY_UNPROVEN",
         "SYMLINK_ESCAPE",
+        "SYMLINK_CYCLE",
         "PATH_TRAVERSAL",
         "PATH_COLLISION",
         "INVALID_FRONTMATTER",
@@ -973,6 +975,7 @@ def test_limits_are_immutable_and_match_approved_defaults() -> None:
     assert limits.git_timeout_seconds == 60
     assert limits.max_archive_bytes == 100 * 1024 * 1024
     assert limits.max_entries == 10_000
+    assert limits.max_candidates == 1_000
     assert limits.max_scan_bytes == 250 * 1024 * 1024
     assert limits.max_file_bytes == 10 * 1024 * 1024
     assert limits.max_depth == 64
@@ -980,9 +983,30 @@ def test_limits_are_immutable_and_match_approved_defaults() -> None:
     assert limits.max_fm_response_bytes == 1024 * 1024
     assert limits.max_fm_reviews == 50
     assert limits.max_manifest_bytes == 10 * 1024 * 1024
+    assert limits.to_dict()["maxCandidates"] == 1_000
     assert limits.to_dict()["maxManifestBytes"] == 10 * 1024 * 1024
+    with pytest.raises(ValueError, match="resource limits must be positive"):
+        Limits(max_candidates=0)
     with pytest.raises(FrozenInstanceError):
         limits.max_entries = 1  # type: ignore[misc]
+
+
+def test_limits_preserve_existing_positional_parameter_order() -> None:
+    limits = Limits(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+
+    assert limits.git_timeout_seconds == 1
+    assert limits.fm_timeout_seconds == 2
+    assert limits.max_archive_bytes == 3
+    assert limits.max_entries == 4
+    assert limits.max_scan_bytes == 5
+    assert limits.max_file_bytes == 6
+    assert limits.max_depth == 7
+    assert limits.max_fm_context_chars == 8
+    assert limits.max_fm_response_bytes == 9
+    assert limits.max_fm_reviews == 10
+    assert limits.max_manifest_bytes == 11
+    assert limits.max_candidates == 12
+    assert limits.to_dict()["maxCandidates"] == 12
 
 
 def test_importer_error_exposes_only_bounded_public_text() -> None:

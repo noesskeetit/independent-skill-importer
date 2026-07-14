@@ -138,6 +138,37 @@ def test_invalid_frontmatter_does_not_abort_valid_sibling(tmp_path: Path) -> Non
     assert report.counts["total"] == 2
 
 
+def test_scan_rejects_excess_candidates_before_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(
+        source,
+        {
+            "skills/one/SKILL.md": _skill("one"),
+            "skills/two/SKILL.md": _skill("two"),
+        },
+    )
+    pipeline = SkillImporterPipeline(
+        limits=Limits(max_candidates=1),
+        api_key_provider=lambda: None,
+    )
+
+    def forbidden_analysis(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("candidate limit must be enforced before analysis")
+
+    monkeypatch.setattr(pipeline, "_analyze_candidates", forbidden_analysis)
+
+    with pytest.raises(ImporterError) as captured:
+        pipeline.scan(SourceSpec.local(source), ScanOptions(use_llm=False))
+
+    assert captured.value.code == "SCAN_LIMIT_EXCEEDED"
+    assert "candidate" in captured.value.message
+
+
 def test_symlink_entrypoint_escaping_skill_root_is_discovered_and_blocked(
     tmp_path: Path,
 ) -> None:
@@ -331,6 +362,36 @@ def test_fm_transport_is_used_only_for_ambiguous_candidates(tmp_path: Path) -> N
         Classification.PORTABLE,
         Classification.AMBIGUOUS,
     }
+
+
+def test_residual_static_ambiguity_is_dispatched_to_fm_review(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(
+        source,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill("x"),
+            "skills/x/scripts/run.rb": (
+                'target = "../../../runtime/tool.rb"\nloader.call(target)\n'
+            ),
+        },
+    )
+    transport = _CountingTransport()
+    pipeline = SkillImporterPipeline(
+        fm_transport_factory=lambda limits: transport,
+        api_key_provider=lambda: "test-key",
+    )
+
+    skill = pipeline.scan(
+        SourceSpec.local(source),
+        ScanOptions(use_llm=True),
+    ).skills[0]
+
+    assert transport.calls == 1
+    assert skill.static_classification is Classification.AMBIGUOUS
+    assert skill.analysis_method == "static+fm"
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE in skill.reason_codes
 
 
 def test_mixed_plugin_whose_root_is_the_skill_is_plugin_bound_without_fm(

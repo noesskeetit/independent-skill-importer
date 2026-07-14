@@ -14,7 +14,7 @@ import sys
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -491,6 +491,10 @@ class _CreatedEntry:
     inode: int
     link_count: int
     symlink_target: str | None = None
+    directory_mode: int | None = None
+    file_mode: int | None = None
+    file_size: int | None = None
+    file_sha256: str | None = None
 
 
 @dataclass(slots=True)
@@ -501,12 +505,36 @@ class _CreationLedger:
         init=False,
         repr=False,
     )
+    _indexes_by_path: dict[tuple[str, ...], int] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def record(self, entry: _CreatedEntry) -> None:
         if entry.path in self._entries_by_path:
             raise ImporterError("COPY_FAILED", "destination path was created more than once")
+        self._indexes_by_path[entry.path] = len(self.entries)
         self.entries.append(entry)
         self._entries_by_path[entry.path] = entry
+
+    def finalize_file(self, path: Sequence[str], *, mode: int, size: int, sha256: str) -> None:
+        key = tuple(path)
+        entry = self._entries_by_path.get(key)
+        if entry is None or entry.kind != "file":
+            raise ImporterError("COPY_FAILED", "destination file is absent from the ledger")
+        if any(
+            value is not None for value in (entry.file_mode, entry.file_size, entry.file_sha256)
+        ):
+            raise ImporterError("COPY_FAILED", "destination file was finalized more than once")
+        updated = replace(
+            entry,
+            file_mode=mode,
+            file_size=size,
+            file_sha256=sha256,
+        )
+        self.entries[self._indexes_by_path[key]] = updated
+        self._entries_by_path[key] = updated
 
     def by_path(self) -> Mapping[tuple[str, ...], _CreatedEntry]:
         return self._entries_by_path
@@ -864,6 +892,95 @@ def _validate_mixed_boundaries(
                 )
 
 
+def _payload_directory_paths(
+    entries: Sequence[tuple[str, InventoryEntry]],
+) -> set[str]:
+    directories = {"."}
+    for relative_path, entry in entries:
+        parts = PurePosixPath(relative_path).parts
+        for index in range(1, len(parts)):
+            directories.add(PurePosixPath(*parts[:index]).as_posix())
+        if entry.kind == "directory":
+            directories.add(relative_path)
+    return directories
+
+
+def _payload_symlink_directory_target(
+    start_path: str,
+    entries: Mapping[str, InventoryEntry],
+    directories: set[str],
+) -> str | None:
+    start = entries[start_path]
+    if start.symlink_target is None:
+        raise ImporterError("SYMLINK_CHANGED", "symlink inventory target is unavailable")
+    pending = list(_normalize_symlink_target(start_path, start.symlink_target))
+    visited = {start_path}
+    steps = 0
+    index = 0
+    while index < len(pending):
+        steps += 1
+        if steps > _MAX_SYMLINK_STEPS:
+            raise ImporterError("SYMLINK_CYCLE", "symlink chain exceeds the safe step limit")
+        current_path = PurePosixPath(*pending[: index + 1]).as_posix()
+        current = entries.get(current_path)
+        if current is None:
+            raise ImporterError("SYMLINK_DANGLING", "symlink chain has a missing target")
+        if current.kind == "symlink":
+            if current_path in visited or current.symlink_target is None:
+                raise ImporterError("SYMLINK_CYCLE", "symlink chain contains a cycle")
+            visited.add(current_path)
+            remaining = pending[index + 1 :]
+            pending = [
+                *_normalize_symlink_target(current_path, current.symlink_target),
+                *remaining,
+            ]
+            index = 0
+            continue
+        if index < len(pending) - 1 and current.kind != "directory":
+            raise ImporterError("SYMLINK_DANGLING", "symlink chain crosses a non-directory")
+        index += 1
+    terminal = PurePosixPath(*pending).as_posix() if pending else "."
+    return terminal if terminal in directories else None
+
+
+def _validate_payload_symlink_graph(
+    entries: Sequence[tuple[str, InventoryEntry]],
+) -> None:
+    by_path = {relative_path: entry for relative_path, entry in entries}
+    directories = _payload_directory_paths(entries)
+    graph: dict[str, set[str]] = {path: set() for path in directories}
+    for directory in directories - {"."}:
+        parent = PurePosixPath(directory).parent.as_posix()
+        graph.setdefault(parent, set()).add(directory)
+
+    for relative_path, entry in entries:
+        if entry.kind != "symlink":
+            continue
+        target = _payload_symlink_directory_target(relative_path, by_path, directories)
+        if target is None:
+            continue
+        parent = PurePosixPath(relative_path).parent.as_posix()
+        graph.setdefault(parent, set()).add(target)
+
+    indegree = {path: 0 for path in graph}
+    for targets in graph.values():
+        for target in targets:
+            indegree[target] = indegree.get(target, 0) + 1
+    ready = [path for path, count in indegree.items() if count == 0]
+    visited = 0
+    index = 0
+    while index < len(ready):
+        current = ready[index]
+        index += 1
+        visited += 1
+        for target in graph.get(current, ()):
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                ready.append(target)
+    if visited != len(indegree):
+        raise ImporterError("SYMLINK_CYCLE", "symlink directory graph contains a cycle")
+
+
 def _validate_copy_plan(
     operation: ScanOperation,
     plan: ImportPlan,
@@ -911,6 +1028,7 @@ def _validate_copy_plan(
                 raise ImporterError(
                     "UNSUPPORTED_ENTRY", "selected payload has an unsupported entry"
                 )
+        _validate_payload_symlink_graph(entries)
         payloads.append(_Payload(record, representative, tuple(entries)))
     return tuple(payloads)
 
@@ -948,6 +1066,49 @@ def _entry_stat_matches(entry: _CreatedEntry, current: os.stat_result) -> bool:
         _kind_from_mode(current.st_mode) == entry.kind
         and (current.st_dev, current.st_ino) == (entry.device, entry.inode)
         and (entry.kind == "directory" or current.st_nlink == entry.link_count == 1)
+    )
+
+
+def _file_is_finalized(entry: _CreatedEntry) -> bool:
+    values = (entry.file_mode, entry.file_size, entry.file_sha256)
+    return all(value is not None for value in values)
+
+
+def _directory_metadata_matches(entry: _CreatedEntry, current: os.stat_result) -> bool:
+    return (
+        entry.kind == "directory"
+        and entry.directory_mode is not None
+        and _entry_stat_matches(entry, current)
+        and stat.S_IMODE(current.st_mode) == entry.directory_mode
+    )
+
+
+def _file_metadata_matches(entry: _CreatedEntry, current: os.stat_result) -> bool:
+    return (
+        _file_is_finalized(entry)
+        and _entry_stat_matches(entry, current)
+        and stat.S_IMODE(current.st_mode) == entry.file_mode
+        and current.st_size == entry.file_size
+    )
+
+
+def _file_content_matches(entry: _CreatedEntry, file_fd: int) -> bool:
+    if not _file_metadata_matches(entry, os.fstat(file_fd)):
+        return False
+    assert entry.file_size is not None
+    assert entry.file_sha256 is not None
+    remaining = entry.file_size
+    digest = hashlib.sha256()
+    while remaining:
+        chunk = os.read(file_fd, min(_READ_CHUNK_SIZE, remaining))
+        if not chunk:
+            return False
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if os.read(file_fd, 1):
+        return False
+    return _file_metadata_matches(entry, os.fstat(file_fd)) and (
+        digest.hexdigest() == entry.file_sha256
     )
 
 
@@ -1157,6 +1318,19 @@ def _copy_regular_file(
         if copied != entry.size or digest.hexdigest() != entry.sha256:
             raise ImporterError("FILE_HASH_MISMATCH", "source file content changed during import")
         _fsync_file(destination_file)
+        destination_final = os.fstat(destination_file)
+        if (
+            not _entry_stat_matches(created_entry, destination_final)
+            or stat.S_IMODE(destination_final.st_mode) != output_mode
+            or destination_final.st_size != copied
+        ):
+            raise ImporterError("COPY_FAILED", "destination file changed while being finalized")
+        ledger.finalize_file(
+            destination_parts,
+            mode=output_mode,
+            size=copied,
+            sha256=digest.hexdigest(),
+        )
     except ImporterError:
         raise
     except OSError as exc:
@@ -1189,7 +1363,11 @@ def _normalize_symlink_target(relative_path: str, target: str) -> tuple[str, ...
             stack.pop()
         else:
             stack.append(part)
-    return tuple(stack)
+    normalized = tuple(stack)
+    source_parts = PurePosixPath(relative_path).parts
+    if len(normalized) < len(source_parts) and source_parts[: len(normalized)] == normalized:
+        raise ImporterError("SYMLINK_CYCLE", "symlink target points to an ancestor directory")
+    return normalized
 
 
 def _lstat_repository_path(snapshot_fd: int, path: str) -> os.stat_result:
@@ -1368,6 +1546,7 @@ def _create_destination_directory(
             device=created.st_dev,
             inode=created.st_ino,
             link_count=created.st_nlink,
+            directory_mode=0o700,
         )
         child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
         opened = os.fstat(child_fd)
@@ -1375,6 +1554,9 @@ def _create_destination_directory(
             raise ImporterError("COPY_FAILED", "destination directory identity changed")
         ledger.record(created_entry)
         os.fchmod(child_fd, 0o700)
+        finalized = os.fstat(child_fd)
+        if not _directory_metadata_matches(created_entry, finalized):
+            raise ImporterError("COPY_FAILED", "destination directory mode changed")
     except ImporterError:
         raise
     except OSError as exc:
@@ -1487,6 +1669,19 @@ def _write_manifest(
         os.fchmod(file_fd, 0o600)
         _write_all(file_fd, manifest_bytes)
         _fsync_file(file_fd)
+        finalized = os.fstat(file_fd)
+        if (
+            not _entry_stat_matches(created_entry, finalized)
+            or stat.S_IMODE(finalized.st_mode) != 0o600
+            or finalized.st_size != len(manifest_bytes)
+        ):
+            raise ImporterError("MANIFEST_WRITE_FAILED", "manifest changed while being finalized")
+        ledger.finalize_file(
+            ("import-manifest.json",),
+            mode=0o600,
+            size=len(manifest_bytes),
+            sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        )
     except ImporterError:
         raise
     except OSError as exc:
@@ -1579,6 +1774,8 @@ def _validate_ledger_entry(
     staging_fd: int,
     ledger: _CreationLedger,
     entry: _CreatedEntry,
+    *,
+    require_finalized_files: bool = False,
 ) -> None:
     parent_fd = _open_ledger_directory_chain(staging_fd, entry.path[:-1], ledger)
     opened_fd = -1
@@ -1590,14 +1787,18 @@ def _validate_ledger_entry(
         if entry.kind == "directory":
             opened_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
             opened = os.fstat(opened_fd)
-            if not _entry_stat_matches(entry, opened):
+            if not _directory_metadata_matches(entry, opened):
                 raise OSError(errno.ESTALE, "ledger directory changed while opening")
         elif entry.kind == "file":
+            if require_finalized_files and not _file_is_finalized(entry):
+                raise OSError(errno.ESTALE, "ledger file was not finalized")
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
             opened_fd = os.open(name, flags, dir_fd=parent_fd)
             opened = os.fstat(opened_fd)
             if not _entry_stat_matches(entry, opened):
                 raise OSError(errno.ESTALE, "ledger file changed while opening")
+            if _file_is_finalized(entry) and not _file_content_matches(entry, opened_fd):
+                raise OSError(errno.ESTALE, "ledger file content or metadata changed")
         elif entry.kind == "symlink":
             target = os.readlink(name, dir_fd=parent_fd)
             after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1608,6 +1809,14 @@ def _validate_ledger_entry(
         after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not _entry_stat_matches(entry, after):
             raise OSError(errno.ESTALE, "ledger entry changed during validation")
+        if entry.kind == "directory" and not _directory_metadata_matches(entry, after):
+            raise OSError(errno.ESTALE, "ledger directory metadata changed during validation")
+        if (
+            entry.kind == "file"
+            and _file_is_finalized(entry)
+            and not _file_metadata_matches(entry, after)
+        ):
+            raise OSError(errno.ESTALE, "ledger file metadata changed during validation")
     finally:
         if opened_fd >= 0:
             with suppress(OSError):
@@ -1615,7 +1824,12 @@ def _validate_ledger_entry(
         os.close(parent_fd)
 
 
-def _preflight_cleanup(staging_fd: int, ledger: _CreationLedger) -> None:
+def _preflight_cleanup(
+    staging_fd: int,
+    ledger: _CreationLedger,
+    *,
+    require_finalized_files: bool = False,
+) -> None:
     entries = ledger.by_path()
     if len(entries) != len(ledger.entries):
         raise OSError(errno.ESTALE, "ledger contains duplicate paths")
@@ -1628,7 +1842,12 @@ def _preflight_cleanup(staging_fd: int, ledger: _CreationLedger) -> None:
         finally:
             os.close(directory_fd)
     for entry in sorted(entries.values(), key=lambda item: item.path):
-        _validate_ledger_entry(staging_fd, ledger, entry)
+        _validate_ledger_entry(
+            staging_fd,
+            ledger,
+            entry,
+            require_finalized_files=require_finalized_files,
+        )
 
 
 def _delete_ledger_entry(
@@ -1647,12 +1866,12 @@ def _delete_ledger_entry(
         if entry.kind == "directory":
             child_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
             opened = os.fstat(child_fd)
-            if not _entry_stat_matches(entry, opened) or _directory_names(child_fd):
+            if not _directory_metadata_matches(entry, opened) or _directory_names(child_fd):
                 raise OSError(errno.ESTALE, "ledger directory is not the expected empty directory")
             os.close(child_fd)
             child_fd = -1
             final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if not _entry_stat_matches(entry, final):
+            if not _directory_metadata_matches(entry, final):
                 raise OSError(errno.ESTALE, "ledger directory changed before rmdir")
             os.rmdir(name, dir_fd=parent_fd)
         elif entry.kind == "file":
@@ -1735,14 +1954,16 @@ def _verify_parent(output: _OutputHandle) -> None:
 
 
 def _verify_staging(output: _OutputHandle, staging: _StagingHandle) -> None:
-    current = _lstat_at(output.parent_fd, staging.name)
-    if (
-        current is None
-        or not stat.S_ISDIR(current.st_mode)
-        or current.st_dev != staging.device
-        or current.st_ino != staging.inode
-    ):
-        raise ImporterError("STAGING_CHANGED", "staging directory identity changed")
+    staging_fd = -1
+    try:
+        staging_fd = _open_staging_for_cleanup(output.parent_fd, staging)
+        _preflight_cleanup(staging_fd, staging.ledger, require_finalized_files=True)
+    except OSError as exc:
+        raise ImporterError("STAGING_CHANGED", "staging directory contents changed") from exc
+    finally:
+        if staging_fd >= 0:
+            with suppress(OSError):
+                os.close(staging_fd)
 
 
 class SkillImporter:

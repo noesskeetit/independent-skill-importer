@@ -283,7 +283,7 @@ def test_invalid_frontmatter_does_not_abort_valid_sibling() -> None:
     assert ReasonCode.STANDALONE_NO_PLUGIN_BOUNDARY in report.skills[1].reason_codes
 
 
-def test_runtime_escape_is_ignored_but_symlink_escape_is_blocked(tmp_path: Path) -> None:
+def test_path_traversal_and_symlink_escape_are_both_blocked(tmp_path: Path) -> None:
     source = tmp_path / "unsafe-source"
     shutil.copytree(_fixture_source("10_symlink_escape"), source)
     (source / "skill/escape").symlink_to("../outside/secret.txt")
@@ -291,7 +291,7 @@ def test_runtime_escape_is_ignored_but_symlink_escape_is_blocked(tmp_path: Path)
     skill = _only_skill(_scan_source_without_llm(source))
 
     assert skill.classification is Classification.BLOCKED
-    assert ReasonCode.PATH_TRAVERSAL not in skill.reason_codes
+    assert ReasonCode.PATH_TRAVERSAL in skill.reason_codes
     assert ReasonCode.SYMLINK_ESCAPE in skill.reason_codes
     symlink = _reason(skill, ReasonCode.SYMLINK_ESCAPE).evidence[0]
     assert (symlink.path, symlink.value) == (

@@ -14,6 +14,7 @@ from typing import Protocol
 
 from .boundaries import detect_boundaries
 from .discovery import discover_candidates, validate_candidate
+from .errors import ImporterError
 from .fm_review import (
     DEFAULT_FM_MODEL,
     FmReviewer,
@@ -295,6 +296,11 @@ class SkillImporterPipeline:
             inventory = build_inventory(resolved, self.limits)
             boundaries = detect_boundaries(inventory)
             candidates = discover_candidates(resolved, inventory, boundaries)
+            if len(candidates) > self.limits.max_candidates:
+                raise ImporterError(
+                    "SCAN_LIMIT_EXCEEDED",
+                    "source exceeds the skill candidate limit",
+                )
             skills = self._analyze_candidates(
                 candidates,
                 inventory,

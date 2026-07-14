@@ -36,6 +36,33 @@ _PACKAGE_MARKERS = frozenset(
 )
 _PLATFORM_CONTAINERS = frozenset({"claude", "codex", "cursor", "gemini"})
 _DOC_DIRECTORIES = frozenset({"docs", "examples"})
+_DOCUMENTATION_NAMES = frozenset(
+    {
+        "architecture.md",
+        "code_of_conduct.md",
+        "contributing.md",
+        "security.md",
+    }
+)
+_DISTRIBUTION_CONFIG_NAMES = frozenset({".editorconfig", ".gitignore"})
+_PACKAGE_METADATA_KEYS = frozenset(
+    {
+        "author",
+        "bugs",
+        "contributors",
+        "description",
+        "engines",
+        "funding",
+        "homepage",
+        "keywords",
+        "license",
+        "name",
+        "packageManager",
+        "private",
+        "repository",
+        "version",
+    }
+)
 _METADATA_DIRECTORIES = frozenset(
     {".plugin", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".github"}
 )
@@ -243,10 +270,24 @@ def _is_documentation_or_marketplace(path: str, root: str) -> bool:
     upper_name = parts[-1].upper()
     if len(parts) == 1 and upper_name.startswith(("README", "CHANGELOG", "LICENSE")):
         return True
+    if len(parts) == 1 and parts[-1].casefold() in (
+        _DOCUMENTATION_NAMES | _DISTRIBUTION_CONFIG_NAMES
+    ):
+        return True
     if parts[0].casefold() in _DOC_DIRECTORIES:
         return True
     return parts[-1].casefold() in _MARKETPLACE_NAMES and (
         len(parts) == 1 or parts[0].casefold() in _METADATA_DIRECTORIES
+    )
+
+
+def _is_metadata_only_package_json(entry: InventoryEntry, root: str) -> bool:
+    relative = PurePosixPath(_relative_to(entry.path, root))
+    if relative.parts != ("package.json",):
+        return False
+    parsed = _load_manifest_mapping(entry)
+    return parsed is not None and all(
+        isinstance(key, str) and key in _PACKAGE_METADATA_KEYS for key in parsed
     )
 
 
@@ -303,6 +344,8 @@ def _classify_package(
         ):
             continue
         if _is_documentation_or_marketplace(entry.path, root):
+            continue
+        if _is_metadata_only_package_json(entry, root):
             continue
         if (
             root_is_skill

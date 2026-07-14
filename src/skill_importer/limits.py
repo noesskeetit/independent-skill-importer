@@ -18,6 +18,7 @@ class Limits:
     max_fm_response_bytes: int = 1024 * 1024
     max_fm_reviews: int = 50
     max_manifest_bytes: int = 10 * 1024 * 1024
+    max_candidates: int = 1_000
 
     def __post_init__(self) -> None:
         values = (
@@ -32,6 +33,7 @@ class Limits:
             self.max_fm_response_bytes,
             self.max_fm_reviews,
             self.max_manifest_bytes,
+            self.max_candidates,
         )
         if any(value <= 0 for value in values):
             raise ValueError("resource limits must be positive")
@@ -43,6 +45,7 @@ class Limits:
             "fmTimeoutSeconds": self.fm_timeout_seconds,
             "maxArchiveBytes": self.max_archive_bytes,
             "maxEntries": self.max_entries,
+            "maxCandidates": self.max_candidates,
             "maxScanBytes": self.max_scan_bytes,
             "maxFileBytes": self.max_file_bytes,
             "maxDepth": self.max_depth,

@@ -37,7 +37,10 @@ _MAX_MANIFEST_DEPTH = 64
 _MAX_SYMLINK_CHAIN = 64
 _PLUGIN_NEGATION_CONTEXT_CHARS = 256
 _MAX_STATIC_PROPAGATION_DEPTH = 32
+_MAX_TAINT_PROPAGATION_DEPTH = 128
 _MAX_STATIC_BINDINGS = 4096
+_MAX_RESIDUAL_LITERALS = 4096
+_MAX_REFERENCE_DECODING_ROUNDS = 8
 _PLUGIN_ENV_NAME_PATTERN = (
     r"(?:(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)"
     r"|EXTENSION_(?:ROOT|DIR|PATH))"
@@ -63,11 +66,18 @@ _PLUGIN_VARIABLE_RE = re.compile(
     r"|\bextensionPath\b",
     re.IGNORECASE,
 )
+_PLUGIN_ENV_NAME_RE = re.compile(rf"{_PLUGIN_ENV_NAME_PATTERN}", re.IGNORECASE)
 _DYNAMIC_RE = re.compile(r"\$(?:\{[^}]+\}|[A-Za-z_][A-Za-z0-9_]*)|[*?]|\{[^}]+\}")
 _MARKDOWN_DESTINATION_RE = re.compile(
     r"!?\[[^\]]*\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<plain>[^)\s]+))",
 )
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<body>[^`\r\n]+)`(?!`)")
+_MARKDOWN_BARE_ACTION_PATH_RE = re.compile(
+    r"\b(?:call|execute|invoke|load|read|run|source|use)\b"
+    r"[^\r\n`]{0,120}?"
+    r"(?P<path>(?:\.\.?/)+(?:[A-Za-z0-9_.<>-]+/)*[A-Za-z0-9_.<>-]+)",
+    re.IGNORECASE,
+)
 _MARKDOWN_INLINE_DESTINATION_BEFORE_RE = re.compile(
     r"(?:\b(?:destination|output\s+path|write\s+target|"
     r"marketplace\s+config)\s*(?:is|=|:|as)"
@@ -126,6 +136,7 @@ _PYTHON_WRITE_METHODS = frozenset(
 )
 _PYTHON_READ_METHODS = frozenset({"open", "read_bytes", "read_text"})
 _PYTHON_SUBPROCESS_CALLS = frozenset({"call", "check_call", "check_output", "popen", "run"})
+_PYTHON_EXECUTION_CALLS = frozenset({"execfile", "run_path", "system"})
 _JAVASCRIPT_PATH_CALLS = {
     "import": "import",
     "require": "import",
@@ -135,6 +146,10 @@ _JAVASCRIPT_PATH_CALLS = {
     "readfilesync": "read",
     "writefile": "write",
     "writefilesync": "write",
+    "execfile": "execute",
+    "execfilesync": "execute",
+    "spawn": "execute",
+    "spawnsync": "execute",
 }
 _SHELL_PATH_COMMANDS = frozenset(
     {
@@ -157,11 +172,83 @@ _SHELL_PATH_COMMANDS = frozenset(
 _SCRIPT_INTERPRETERS = frozenset({"bash", "bun", "deno", "node", "python", "python3", "sh"})
 _JAVASCRIPT_SUFFIXES = frozenset({".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"})
 _JAVASCRIPT_REPOSITORY_URL_RE = re.compile(r"\bimport\s*\.\s*meta\b")
+_JAVASCRIPT_INDIRECT_ENV_RE = re.compile(
+    r"\b(?:process|Deno|Bun)\s*\.\s*env\s*\[\s*(?P<key>[A-Za-z_$][A-Za-z0-9_$]*)\s*\]",
+    re.IGNORECASE,
+)
+_JAVASCRIPT_DESTRUCTURED_CHILD_PROCESS_RE = re.compile(
+    r"\{(?P<members>[^{}]{0,2048})\}\s*=\s*"
+    r"(?:require\s*\(\s*[\"'](?:node:)?child_process[\"']\s*\)"
+    r"|(?:child_process|childProcess))",
+    re.IGNORECASE,
+)
+_JAVASCRIPT_CHILD_PROCESS_IMPORT_RE = re.compile(
+    r"\bimport\s*\{(?P<members>[^{}]{0,2048})\}\s*"
+    r"from\s*[\"'](?:node:)?child_process[\"']",
+    re.IGNORECASE,
+)
 _JAVASCRIPT_ASSIGNMENT_OPERATORS = frozenset(
     {"=", "%=", "&&=", "*=", "**=", "+=", "-=", "/=", "??=", "||="}
 )
 _SHELL_SUFFIXES = frozenset({".bash", ".sh", ".zsh"})
+_REVERSE_RUNTIME_SOURCE_SUFFIXES = (
+    frozenset({".py", ".rb", ".php", ".go", ".rs", ".java", ".kt", ".swift", ".lua"})
+    | _JAVASCRIPT_SUFFIXES
+    | _SHELL_SUFFIXES
+)
 _STRUCTURED_PATH_FIELDS = frozenset({"extends", "files", "include"})
+_CONFIG_PATH_FIELDS = frozenset(
+    {"entrypoint", "executable", "file", "path", "runtime", "script", "source"}
+)
+_TEXT_CONFIG_SUFFIXES = frozenset({".cfg", ".ini", ".toml", ".yaml", ".yml"})
+_GENERIC_RUNTIME_SUFFIXES = frozenset(
+    {
+        ".bat",
+        ".c",
+        ".cc",
+        ".cmd",
+        ".cpp",
+        ".cs",
+        ".cxx",
+        ".fish",
+        ".go",
+        ".h",
+        ".hpp",
+        ".java",
+        ".kt",
+        ".kts",
+        ".lua",
+        ".php",
+        ".pl",
+        ".ps1",
+        ".rb",
+        ".rs",
+        ".swift",
+    }
+)
+_RESIDUAL_RUNTIME_SUFFIXES = (
+    _GENERIC_RUNTIME_SUFFIXES | _JAVASCRIPT_SUFFIXES | _SHELL_SUFFIXES | {".py"}
+)
+_GENERIC_RUNTIME_PATH_RE = re.compile(
+    r"(?:"
+    r"\b(?:load|require|include|source)\s+"
+    r"|\b(?:File\.(?:open|read)|os\.(?:Open|ReadFile)|"
+    r"fopen|open|readFile|read_file)\s*\(\s*"
+    r"|(?m:^\s*\.\s+)"
+    r")[\"'](?P<path>[^\"'\r\n]{1,2048})[\"']",
+    re.IGNORECASE,
+)
+_GENERIC_RUNTIME_WRITE_PATH_RE = re.compile(
+    r"(?:"
+    r"\bFile\.(?:binwrite|write)\s*\(\s*"
+    r"|\bos\.(?:Create|WriteFile)\s*\(\s*"
+    r")[\"'](?P<path>[^\"'\r\n]{1,2048})[\"']",
+    re.IGNORECASE,
+)
+_TEXT_CONFIG_PATH_RE = re.compile(
+    r"^\s*(?P<field>[A-Za-z_][A-Za-z0-9_-]*)\s*[:=]\s*"
+    r"(?:[\"'](?P<quoted>[^\"'\r\n]+)[\"']|(?P<plain>[^\s#;]+))",
+)
 _MCP_TOOL_RE = re.compile(r"\bmcp__(?P<server>[A-Za-z0-9_.-]+)__(?P<tool>[A-Za-z0-9_.-]+)\b")
 _COMMAND_REFERENCE_RE = re.compile(
     r"(?<![\w-])/(?P<slash>[A-Za-z0-9_.-]+)\b"
@@ -361,6 +448,7 @@ _CONTEXTUAL_RUNTIME_ROOT_KEYS = frozenset({"source", "src"})
 _BLOCKED_CODES = frozenset(
     {
         ReasonCode.SYMLINK_ESCAPE,
+        ReasonCode.SYMLINK_CYCLE,
         ReasonCode.PATH_TRAVERSAL,
         ReasonCode.PATH_COLLISION,
         ReasonCode.FILE_TOO_LARGE,
@@ -394,10 +482,14 @@ _MESSAGES = {
     ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME: "plugin runtime references this skill",
     ReasonCode.MISSING_LOCAL_RESOURCE: "skill references a missing local resource",
     ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED: "skill contains a dynamic resource reference",
+    ReasonCode.STATIC_ANALYSIS_INCOMPLETE: (
+        "static analysis found an unresolved external path dataflow"
+    ),
     ReasonCode.MIXED_PLUGIN_AUTONOMY_UNPROVEN: (
         "skill is inside a mixed plugin and static autonomy is unproven"
     ),
     ReasonCode.SYMLINK_ESCAPE: "symlink resolves outside the skill root",
+    ReasonCode.SYMLINK_CYCLE: "symlink graph creates a directory traversal cycle",
     ReasonCode.PATH_TRAVERSAL: "resource reference traverses beyond the source snapshot",
     ReasonCode.INVALID_FRONTMATTER: "skill frontmatter is invalid",
 }
@@ -439,6 +531,16 @@ class _StaticPathValue:
     value: str
     anchored_to_repository: bool = False
     propagated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _GenericDataflowValue:
+    value: str
+    offset: int
+
+
+class _StaticAnalysisLimitError(Exception):
+    """Internal signal that a bounded static evaluator exhausted its budget."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -652,6 +754,8 @@ def _collapse_path(base: PurePosixPath, value: str) -> tuple[str | None, bool]:
 
 def _clean_reference(value: str) -> str:
     cleaned = value.strip().strip("`'\"<>")
+    if cleaned in {".", ".."}:
+        return cleaned
     cleaned = cleaned.split("#", 1)[0].split("?", 1)[0]
     return cleaned.rstrip(".,;:")
 
@@ -800,11 +904,12 @@ def _python_open_access(call: ast.Call) -> str:
 
 def _python_symbols(
     tree: ast.AST,
-) -> tuple[set[str], set[str], set[str], set[str]]:
+) -> tuple[set[str], set[str], set[str], set[str], set[str]]:
     path_names = set(_PYTHON_PATH_TYPES)
     pathlib_modules = {"pathlib"}
     subprocess_modules = {"subprocess"}
     subprocess_names: set[str] = set()
+    execution_names = set(_PYTHON_EXECUTION_CALLS)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -824,7 +929,19 @@ def _python_symbols(
                 for alias in node.names
                 if alias.name.casefold() in _PYTHON_SUBPROCESS_CALLS
             )
-    return path_names, pathlib_modules, subprocess_modules, subprocess_names
+        elif isinstance(node, ast.ImportFrom):
+            execution_names.update(
+                (alias.asname or alias.name).casefold()
+                for alias in node.names
+                if alias.name.casefold() in _PYTHON_EXECUTION_CALLS
+            )
+    return (
+        path_names,
+        pathlib_modules,
+        subprocess_modules,
+        subprocess_names,
+        execution_names,
+    )
 
 
 def _python_is_path_constructor(
@@ -1098,6 +1215,47 @@ def _merge_path_taints(taints: Iterable[_PathTaint]) -> _PathTaint:
     )
 
 
+def _python_static_string(
+    node: ast.expr,
+    bindings: Mapping[str, tuple[ast.expr, ...]],
+    resolving: set[str],
+    *,
+    depth: int = 0,
+) -> str | None:
+    if depth >= _MAX_STATIC_PROPAGATION_DEPTH:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        values = bindings.get(node.id, ())
+        if len(values) != 1 or node.id in resolving:
+            return None
+        resolving.add(node.id)
+        value = _python_static_string(
+            values[0],
+            bindings,
+            resolving,
+            depth=depth + 1,
+        )
+        resolving.remove(node.id)
+        return value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _python_static_string(
+            node.left,
+            bindings,
+            resolving,
+            depth=depth + 1,
+        )
+        right = _python_static_string(
+            node.right,
+            bindings,
+            resolving,
+            depth=depth + 1,
+        )
+        return f"{left}{right}" if left is not None and right is not None else None
+    return None
+
+
 def _python_path_taint(
     node: ast.expr,
     *,
@@ -1109,7 +1267,7 @@ def _python_path_taint(
     resolving: set[str],
     depth: int = 0,
 ) -> _PathTaint:
-    if depth >= _MAX_STATIC_PROPAGATION_DEPTH:
+    if depth >= _MAX_TAINT_PROPAGATION_DEPTH:
         return _PathTaint(uncertain=True)
 
     source = (
@@ -1122,9 +1280,33 @@ def _python_path_taint(
         or ""
     )
     plugin_match = _PLUGIN_VARIABLE_RE.search(source)
+    indirect_plugin_value: str | None = None
+    indirect_plugin_offset: int | None = None
+    if isinstance(node, ast.Call):
+        call_name = _python_call_name(node.func)
+        environment_lookup = call_name == "getenv" or (
+            call_name == "get"
+            and re.search(r"\b(?:env|environ|environment)\s*\.\s*get\s*\(", source, re.I)
+            is not None
+        )
+        argument = _python_call_argument(node) if environment_lookup else None
+        if argument is not None:
+            environment_name = _python_static_string(argument, bindings, set())
+            if (
+                environment_name is not None
+                and _PLUGIN_ENV_NAME_RE.fullmatch(environment_name) is not None
+            ):
+                indirect_plugin_value = environment_name
+                indirect_plugin_offset = _node_offset(
+                    content,
+                    argument,
+                    line_starts,
+                    source_is_ascii=source_is_ascii,
+                )
+
     direct = _PathTaint(
         repository=isinstance(node, ast.Name) and node.id == "__file__",
-        plugin_value=plugin_match.group(0) if plugin_match is not None else None,
+        plugin_value=(plugin_match.group(0) if plugin_match is not None else indirect_plugin_value),
         plugin_offset=(
             _node_offset(
                 content,
@@ -1134,7 +1316,7 @@ def _python_path_taint(
             )
             + plugin_match.start()
             if plugin_match is not None
-            else None
+            else indirect_plugin_offset
         ),
     )
 
@@ -1202,6 +1384,27 @@ def _python_static_path_value(
         return None
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return _StaticPathValue(node.value)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        for element in node.elts:
+            value = _python_static_path_value(
+                element,
+                entry_path=entry_path,
+                bindings=bindings,
+                path_names=path_names,
+                pathlib_modules=pathlib_modules,
+                memo=memo,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            if value is not None and (
+                value.anchored_to_repository or _looks_explicit_path(value.value)
+            ):
+                return _StaticPathValue(
+                    value.value,
+                    anchored_to_repository=value.anchored_to_repository,
+                    propagated=True,
+                )
+        return None
     if isinstance(node, ast.Name):
         name = node.id
         if name == "__file__":
@@ -1231,7 +1434,7 @@ def _python_static_path_value(
             )
         memo[name] = resolved
         return resolved
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
         left = _python_static_path_value(
             node.left,
             entry_path=entry_path,
@@ -1252,7 +1455,15 @@ def _python_static_path_value(
             resolving=resolving,
             depth=depth + 1,
         )
-        return _static_path_join((left, right)) if left is not None and right is not None else None
+        if left is None or right is None or right.anchored_to_repository:
+            return None
+        if isinstance(node.op, ast.Add):
+            return _StaticPathValue(
+                f"{left.value}{right.value}",
+                anchored_to_repository=left.anchored_to_repository,
+                propagated=True,
+            )
+        return _static_path_join((left, right))
     if isinstance(node, ast.Attribute) and node.attr.casefold() == "parent":
         value = _python_static_path_value(
             node.value,
@@ -1317,6 +1528,27 @@ def _python_static_path_value(
             depth=depth + 1,
         )
     call_name = _python_call_name(node.func)
+    if call_name == "str":
+        argument = _python_call_argument(node)
+        if argument is None:
+            return None
+        value = _python_static_path_value(
+            argument,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        if value is None:
+            return None
+        return _StaticPathValue(
+            value.value,
+            anchored_to_repository=value.anchored_to_repository,
+            propagated=True,
+        )
     if isinstance(node.func, ast.Attribute) and call_name in {"absolute", "resolve"}:
         value = _python_static_path_value(
             node.func.value,
@@ -1333,6 +1565,44 @@ def _python_static_path_value(
         return _StaticPathValue(
             value.value,
             anchored_to_repository=value.anchored_to_repository,
+            propagated=True,
+        )
+    if isinstance(node.func, ast.Attribute) and call_name == "with_name":
+        receiver = _python_static_path_value(
+            node.func.value,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        argument = _python_call_argument(node)
+        replacement_name = (
+            _python_static_path_value(
+                argument,
+                entry_path=entry_path,
+                bindings=bindings,
+                path_names=path_names,
+                pathlib_modules=pathlib_modules,
+                memo=memo,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            if argument is not None
+            else None
+        )
+        if (
+            receiver is None
+            or replacement_name is None
+            or replacement_name.anchored_to_repository
+            or "/" in replacement_name.value
+        ):
+            return None
+        return _StaticPathValue(
+            str(PurePosixPath(receiver.value).with_name(replacement_name.value)),
+            anchored_to_repository=receiver.anchored_to_repository,
             propagated=True,
         )
     if isinstance(node.func, ast.Attribute) and call_name == "joinpath":
@@ -1417,6 +1687,7 @@ def _python_static_consumed_path_references(
     pathlib_modules: set[str],
     subprocess_modules: set[str],
     subprocess_names: set[str],
+    execution_names: set[str],
     base_offset: int,
 ) -> Iterable[_PathReference]:
     bindings, taint_bindings, binding_overflow = _python_static_bindings(tree)
@@ -1447,7 +1718,11 @@ def _python_static_consumed_path_references(
                 candidates = ((argument, "execute"),)
         else:
             name = _python_call_name(node.func)
-            if name in _PYTHON_PATH_CALLS:
+            if name in execution_names:
+                argument = _python_call_argument(node)
+                if argument is not None:
+                    candidates = ((argument, "execute"),)
+            elif name in _PYTHON_PATH_CALLS:
                 argument = _python_call_argument(node)
                 if argument is not None:
                     access = "write" if name.startswith("write") else "read"
@@ -1600,7 +1875,13 @@ def _python_path_references(
     line_starts = tuple([0, *(match.end() for match in re.finditer("\n", content))])
     source_is_ascii = content.isascii()
     parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
-    path_names, pathlib_modules, subprocess_modules, subprocess_names = _python_symbols(tree)
+    (
+        path_names,
+        pathlib_modules,
+        subprocess_modules,
+        subprocess_names,
+        execution_names,
+    ) = _python_symbols(tree)
     indirect_accesses = _python_indirect_path_accesses(
         tree,
         parents,
@@ -1622,19 +1903,23 @@ def _python_path_references(
                 access = "execute"
             else:
                 name = _python_call_name(node.func)
-                if name not in _PYTHON_PATH_CALLS:
+                if name in execution_names:
+                    arguments = (_python_call_argument(node),)
+                    access = "execute"
+                elif name not in _PYTHON_PATH_CALLS:
                     continue
-                receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
-                if isinstance(receiver, ast.Call) and _python_is_path_constructor(
-                    receiver,
-                    path_names,
-                    pathlib_modules,
-                ):
-                    continue
-                arguments = (_python_call_argument(node),)
-                access = "write" if name.startswith("write") else "read"
-                if name == "open":
-                    access = _python_open_access(node)
+                else:
+                    receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+                    if isinstance(receiver, ast.Call) and _python_is_path_constructor(
+                        receiver,
+                        path_names,
+                        pathlib_modules,
+                    ):
+                        continue
+                    arguments = (_python_call_argument(node),)
+                    access = "write" if name.startswith("write") else "read"
+                    if name == "open":
+                        access = _python_open_access(node)
             for argument in arguments:
                 if argument is None:
                     continue
@@ -1682,6 +1967,7 @@ def _python_path_references(
         pathlib_modules=pathlib_modules,
         subprocess_modules=subprocess_modules,
         subprocess_names=subprocess_names,
+        execution_names=execution_names,
         base_offset=base_offset,
     )
 
@@ -2196,6 +2482,86 @@ def _javascript_static_bindings(
     )
 
 
+def _javascript_static_string(
+    tokens: Sequence[_JavaScriptToken],
+    start: int,
+    end: int,
+    *,
+    bindings: Mapping[str, tuple[tuple[int, int], ...]],
+    resolving: set[str],
+    depth: int = 0,
+) -> str | None:
+    if depth >= _MAX_STATIC_PROPAGATION_DEPTH or start >= end:
+        return None
+    if end - start == 1:
+        token = tokens[start]
+        if token.kind == "string":
+            return token.value
+        if token.kind != "identifier" or token.value in resolving:
+            return None
+        spans = bindings.get(token.value, ())
+        if len(spans) != 1:
+            return None
+        resolving.add(token.value)
+        value = _javascript_static_string(
+            tokens,
+            *spans[0],
+            bindings=bindings,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        resolving.remove(token.value)
+        return value
+
+    index = start
+    while index < end:
+        if tokens[index].value in {"(", "[", "{"}:
+            return None
+        if tokens[index].value == "+":
+            left = _javascript_static_string(
+                tokens,
+                start,
+                index,
+                bindings=bindings,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            right = _javascript_static_string(
+                tokens,
+                index + 1,
+                end,
+                bindings=bindings,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            return f"{left}{right}" if left is not None and right is not None else None
+        index += 1
+    return None
+
+
+def _javascript_path_call_aliases(content: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for pattern in (
+        _JAVASCRIPT_DESTRUCTURED_CHILD_PROCESS_RE,
+        _JAVASCRIPT_CHILD_PROCESS_IMPORT_RE,
+    ):
+        for match in pattern.finditer(content):
+            for member in match.group("members").split(","):
+                alias_match = re.fullmatch(
+                    r"\s*(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*"
+                    r"(?:(?::|\bas\b)\s*(?P<alias>[A-Za-z_$][A-Za-z0-9_$]*))?\s*",
+                    member,
+                    re.IGNORECASE,
+                )
+                if alias_match is None:
+                    continue
+                name = alias_match.group("name").casefold()
+                if name not in _JAVASCRIPT_PATH_CALLS:
+                    continue
+                aliases[(alias_match.group("alias") or name).casefold()] = name
+    return aliases
+
+
 def _javascript_path_taint(
     content: str,
     tokens: Sequence[_JavaScriptToken],
@@ -2207,21 +2573,43 @@ def _javascript_path_taint(
     resolving: set[str],
     depth: int = 0,
 ) -> _PathTaint:
-    if depth >= _MAX_STATIC_PROPAGATION_DEPTH or start >= end:
-        return _PathTaint(uncertain=depth >= _MAX_STATIC_PROPAGATION_DEPTH)
+    if depth >= _MAX_TAINT_PROPAGATION_DEPTH or start >= end:
+        return _PathTaint(uncertain=depth >= _MAX_TAINT_PROPAGATION_DEPTH)
 
     source_start = tokens[start].start
     source_end = tokens[end - 1].end
     source = content[source_start:source_end]
     plugin_match = _PLUGIN_VARIABLE_RE.search(source)
+    indirect_plugin_value: str | None = None
+    indirect_plugin_offset: int | None = None
+    indirect_match = _JAVASCRIPT_INDIRECT_ENV_RE.search(source)
+    if indirect_match is not None:
+        spans = bindings.get(indirect_match.group("key"), ())
+        if len(spans) == 1:
+            environment_name = _javascript_static_string(
+                tokens,
+                *spans[0],
+                bindings=bindings,
+                resolving=set(),
+            )
+            if (
+                environment_name is not None
+                and _PLUGIN_ENV_NAME_RE.fullmatch(environment_name) is not None
+            ):
+                indirect_plugin_value = environment_name
+                indirect_plugin_offset = source_start + indirect_match.start("key")
     direct = _PathTaint(
         repository=any(
             token.kind == "identifier" and token.value in {"__dirname", "__filename"}
             for token in tokens[start:end]
         )
         or _JAVASCRIPT_REPOSITORY_URL_RE.search(source) is not None,
-        plugin_value=plugin_match.group(0) if plugin_match is not None else None,
-        plugin_offset=source_start + plugin_match.start() if plugin_match is not None else None,
+        plugin_value=(plugin_match.group(0) if plugin_match is not None else indirect_plugin_value),
+        plugin_offset=(
+            source_start + plugin_match.start()
+            if plugin_match is not None
+            else indirect_plugin_offset
+        ),
     )
 
     propagated: list[_PathTaint] = []
@@ -2414,6 +2802,25 @@ def _javascript_call_argument_span(
     return spans[0] if spans else None
 
 
+def _javascript_execute_operand_spans(
+    tokens: Sequence[_JavaScriptToken],
+    index: int,
+    pairs: Mapping[int, int],
+) -> tuple[tuple[int, int], ...]:
+    opening = index + 1
+    closing = pairs.get(opening)
+    if opening >= len(tokens) or tokens[opening].value != "(" or closing is None:
+        return ()
+    arguments = _javascript_argument_spans(tokens, opening, closing, pairs)
+    operands: list[tuple[int, int]] = []
+    for start, end in arguments[1:]:
+        if start < end and tokens[start].value == "[" and pairs.get(start) == end - 1:
+            operands.extend(_javascript_argument_spans(tokens, start, end - 1, pairs))
+        else:
+            operands.append((start, end))
+    return tuple(operands)
+
+
 def _javascript_call_reference(
     content: str,
     tokens: list[_JavaScriptToken],
@@ -2462,6 +2869,7 @@ def _javascript_path_references(
     )
     memo: dict[str, _StaticPathValue | None] = {}
     taint_memo: dict[str, _PathTaint] = {}
+    call_aliases = _javascript_path_call_aliases(content)
     for path in _javascript_static_imports(tokens):
         yield _PathReference(
             path.value,
@@ -2471,9 +2879,82 @@ def _javascript_path_references(
         )
 
     for index, token in enumerate(tokens):
-        name = token.value.casefold()
+        name = call_aliases.get(token.value.casefold(), token.value.casefold())
         if token.kind != "identifier" or name not in _JAVASCRIPT_PATH_CALLS:
             continue
+        if _JAVASCRIPT_PATH_CALLS[name] == "execute":
+            opening = index + 1
+            closing = pairs.get(opening)
+            if opening < len(tokens) and tokens[opening].value == "(" and closing is not None:
+                for nested in tokens[opening + 1 : closing]:
+                    if nested.kind not in {"string", "template", "template_expression"}:
+                        continue
+                    if not _looks_shell_path(nested.value):
+                        continue
+                    yield _PathReference(
+                        nested.value,
+                        base_offset + nested.start,
+                        "execute",
+                        "javascript.execute_argument",
+                    )
+            if entry_path is not None:
+                for operand_start, operand_end in _javascript_execute_operand_spans(
+                    tokens,
+                    index,
+                    pairs,
+                ):
+                    taint = _javascript_path_taint(
+                        content,
+                        tokens,
+                        operand_start,
+                        operand_end,
+                        bindings=taint_bindings,
+                        memo=taint_memo,
+                        resolving=set(),
+                    )
+                    if taint.plugin_value is not None and taint.plugin_offset is not None:
+                        yield _PathReference(
+                            taint.plugin_value,
+                            base_offset + taint.plugin_offset,
+                            "execute",
+                            "javascript.plugin_tainted",
+                        )
+                        continue
+                    static_operand = _javascript_static_path_value(
+                        tokens,
+                        operand_start,
+                        operand_end,
+                        entry_path=entry_path,
+                        pairs=pairs,
+                        bindings=bindings,
+                        memo=memo,
+                        resolving=set(),
+                    )
+                    if static_operand is not None:
+                        operand_value = _static_reference_value(static_operand, entry_path)
+                        if static_operand.anchored_to_repository or _looks_shell_path(
+                            operand_value
+                        ):
+                            yield _PathReference(
+                                operand_value,
+                                base_offset + tokens[operand_start].start,
+                                "execute",
+                                "javascript.execute_static_argument",
+                            )
+                        continue
+                    if taint.repository or taint.uncertain or binding_overflow:
+                        yield _PathReference(
+                            content[tokens[operand_start].start : tokens[operand_end - 1].end],
+                            base_offset + tokens[operand_start].start,
+                            "execute",
+                            (
+                                "javascript.repo_tainted.expression"
+                                if taint.repository
+                                else "javascript.taint_limit.expression"
+                                if taint.uncertain
+                                else "javascript.binding_overflow.expression"
+                            ),
+                        )
         argument = _javascript_call_reference(content, tokens, index)
         if argument is None:
             continue
@@ -2654,6 +3135,8 @@ def _shell_segment_references(
     offsets: list[int],
     *,
     base_offset: int,
+    bindings: dict[str, str],
+    depth: int,
 ) -> Iterable[_PathReference]:
     if not tokens:
         return
@@ -2661,13 +3144,64 @@ def _shell_segment_references(
     if tokens[0] == "$":
         index += 1
     while index < len(tokens) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+        name, value = tokens[index].split("=", 1)
+        bindings[name] = value
         index += 1
     while index < len(tokens) and tokens[index] in {"env", "sudo"}:
         index += 1
     if index >= len(tokens):
         return
+
+    variable_re = re.compile(
+        r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+    )
+    indirect_variable_re = re.compile(r"\$\{!(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}")
+
+    def expand(value: str) -> str:
+        expanded = value
+        for _ in range(_MAX_STATIC_PROPAGATION_DEPTH):
+            replaced = indirect_variable_re.sub(
+                lambda match: (
+                    f"${{{bindings[match.group('name')]}}}"
+                    if re.fullmatch(
+                        r"[A-Za-z_][A-Za-z0-9_]*",
+                        bindings.get(match.group("name"), ""),
+                    )
+                    else match.group(0)
+                ),
+                expanded,
+            )
+            replaced = variable_re.sub(
+                lambda match: bindings.get(
+                    match.group("braced") or match.group("plain") or "",
+                    match.group(0),
+                ),
+                replaced,
+            )
+            if replaced == expanded:
+                break
+            expanded = replaced
+        return expanded
+
+    tokens = [*tokens[:index], *(expand(token) for token in tokens[index:])]
+    if tokens[index].casefold() == "exec":
+        index += 1
+        while index < len(tokens) and tokens[index].startswith("-"):
+            index += 1
+        if index >= len(tokens):
+            return
     command = tokens[index]
     operands = list(range(index + 1, len(tokens)))
+
+    if command.casefold() == "eval" and depth < _MAX_STATIC_PROPAGATION_DEPTH:
+        for operand_index in operands:
+            yield from _shell_path_references(
+                tokens[operand_index],
+                base_offset=base_offset + offsets[operand_index],
+                fail_closed=False,
+                depth=depth + 1,
+                bindings=bindings,
+            )
 
     if _looks_shell_command_path(command):
         yield _PathReference(command, base_offset + offsets[index], "execute", "shell.command")
@@ -2721,7 +3255,10 @@ def _shell_path_references(
     *,
     base_offset: int = 0,
     fail_closed: bool = True,
+    depth: int = 0,
+    bindings: dict[str, str] | None = None,
 ) -> Iterable[_PathReference]:
+    bindings = {} if bindings is None else bindings
     heredocs: list[tuple[str, bool]] = []
     for line, source_map in _shell_logical_lines(content):
         line_offset = source_map[0] if source_map else 0
@@ -2778,6 +3315,8 @@ def _shell_path_references(
                 tokens[segment_start:index],
                 offsets[segment_start:index],
                 base_offset=base_offset,
+                bindings=bindings,
+                depth=depth,
             )
             segment_start = index + 1
         heredocs.extend(_shell_heredoc_markers(tokens))
@@ -2870,7 +3409,7 @@ def _structured_path_references(
         return
 
     values: list[tuple[str, str]] = []
-    for field in _STRUCTURED_PATH_FIELDS:
+    for field in _STRUCTURED_PATH_FIELDS | _CONFIG_PATH_FIELDS:
         field_value = parsed.get(field)
         if isinstance(field_value, str):
             values.append((field, field_value))
@@ -2901,6 +3440,20 @@ def _structured_path_references(
             syntax = "json.glob"
         for reference in expanded:
             yield _PathReference(reference, offset, "read", syntax)
+
+
+def _text_config_path_references(content: str) -> Iterable[_PathReference]:
+    for offset, line in _iter_lines_with_offsets(content):
+        match = _TEXT_CONFIG_PATH_RE.match(line)
+        if match is None or match.group("field").casefold() not in _CONFIG_PATH_FIELDS:
+            continue
+        group = "quoted" if match.group("quoted") is not None else "plain"
+        yield _PathReference(
+            _clean_reference(match.group(group)),
+            offset + match.start(group),
+            "read",
+            f"config.{match.group('field').casefold()}",
+        )
 
 
 def _fenced_code_path_references(
@@ -3035,7 +3588,7 @@ def _frontmatter_path_references(
         if re.fullmatch(r"[|>](?:[+-][1-9]?|[1-9][+-]?)?", value):
             scalar_indent = len(match.group("indent"))
             continue
-        if match.group("key").casefold() not in {"file", "path", "root", "source"}:
+        if match.group("key").casefold() not in _CONFIG_PATH_FIELDS | {"root"}:
             continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
@@ -3254,6 +3807,19 @@ def _markdown_path_references(
             "markdown.link",
         )
 
+    for match in _MARKDOWN_BARE_ACTION_PATH_RE.finditer(content):
+        if _offset_in_ranges(match.start(), reference_exclusions) or _markdown_offset_is_escaped(
+            content,
+            match.start(),
+        ):
+            continue
+        yield _PathReference(
+            _clean_reference(match.group("path")),
+            match.start("path"),
+            "read",
+            "markdown.action_path",
+        )
+
     definitions: dict[str, tuple[str, int]] = {}
     used_labels: set[str] = set()
     pending_definition: str | None = None
@@ -3353,6 +3919,52 @@ def _markdown_path_references(
             )
 
 
+def _generic_runtime_path_references(
+    content: str,
+    *,
+    suffix: str,
+    normalize_backslashes: bool = False,
+) -> Iterable[_PathReference]:
+    active_literal_offsets = {
+        reference.offset
+        for reference in _generic_runtime_literal_references(content, suffix=suffix)
+    }
+    if suffix == ".rb":
+        yield from (
+            reference
+            for reference in _ruby_runtime_dataflow_references(content)
+            if reference.access != "unknown"
+        )
+    for match in _GENERIC_RUNTIME_WRITE_PATH_RE.finditer(content):
+        if match.start("path") not in active_literal_offsets:
+            continue
+        value = _clean_reference(match.group("path"))
+        if normalize_backslashes:
+            value = value.replace("\\", "/")
+        if not _looks_shell_path(value):
+            continue
+        yield _PathReference(
+            value,
+            match.start("path"),
+            "write",
+            "generic_runtime.consumer",
+        )
+    for match in _GENERIC_RUNTIME_PATH_RE.finditer(content):
+        if match.start("path") not in active_literal_offsets:
+            continue
+        value = _clean_reference(match.group("path"))
+        if normalize_backslashes:
+            value = value.replace("\\", "/")
+        if not _looks_shell_path(value):
+            continue
+        yield _PathReference(
+            value,
+            match.start("path"),
+            "read",
+            "generic_runtime.consumer",
+        )
+
+
 def _path_references(
     entry: InventoryEntry,
     candidate_root: str,
@@ -3390,16 +4002,523 @@ def _path_references(
             candidate_root=candidate_root,
             by_path=by_path,
         )
+    elif suffix in _TEXT_CONFIG_SUFFIXES:
+        yield from _text_config_path_references(content)
+    elif suffix in _GENERIC_RUNTIME_SUFFIXES:
+        yield from _generic_runtime_path_references(
+            content,
+            suffix=suffix,
+            normalize_backslashes=suffix in {".bat", ".cmd", ".ps1"},
+        )
+
+
+def _python_residual_literal_references(content: str) -> Iterable[_PathReference]:
+    line_starts = _source_line_starts(content)
+    emitted = 0
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(content).readline)
+        for token in tokens:
+            if token.type != tokenize.STRING:
+                continue
+            try:
+                value = ast.literal_eval(token.string)
+            except (SyntaxError, ValueError):
+                continue
+            if not isinstance(value, str):
+                continue
+            yield _PathReference(
+                value,
+                _source_position_offset(line_starts, token.start),
+                "unknown",
+                "python.residual_literal",
+            )
+            emitted += 1
+            if emitted > _MAX_RESIDUAL_LITERALS:
+                return
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        return
+
+
+def _javascript_residual_literal_references(content: str) -> Iterable[_PathReference]:
+    tokens, _failed = _javascript_tokens(content)
+    emitted = 0
+    for token in tokens:
+        if token.kind == "string":
+            value = token.value
+        elif token.kind == "template":
+            value = content[token.start : token.end]
+        else:
+            continue
+        yield _PathReference(
+            value,
+            token.start,
+            "unknown",
+            "javascript.residual_literal",
+        )
+        emitted += 1
+        if emitted > _MAX_RESIDUAL_LITERALS:
+            return
+
+
+def _shell_residual_literal_references(content: str) -> Iterable[_PathReference]:
+    emitted = 0
+    for line, source_offsets in _shell_logical_lines(content):
+        tokens, failed = _shell_tokens(line)
+        if failed:
+            continue
+        offsets = _shell_token_offsets(line, tokens)
+        for token, token_offset in zip(tokens, offsets, strict=True):
+            assignment = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=(?P<value>.*)", token)
+            if assignment is not None:
+                value = assignment.group("value")
+                token_offset += token.find("=") + 1
+            else:
+                value = token
+            if not value:
+                continue
+            source_offset = (
+                source_offsets[min(token_offset, len(source_offsets) - 1)] if source_offsets else 0
+            )
+            yield _PathReference(
+                value,
+                source_offset,
+                "unknown",
+                "shell.residual_literal",
+            )
+            emitted += 1
+            if emitted > _MAX_RESIDUAL_LITERALS:
+                return
+
+
+def _generic_runtime_comment_syntax(
+    suffix: str,
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    hash_comments = frozenset({".fish", ".php", ".pl", ".ps1", ".rb"})
+    slash_comments = frozenset(
+        {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cs",
+            ".cxx",
+            ".go",
+            ".h",
+            ".hpp",
+            ".java",
+            ".kt",
+            ".kts",
+            ".php",
+            ".rs",
+            ".swift",
+        }
+    )
+    line_markers: list[str] = []
+    block_markers: list[tuple[str, str]] = []
+    if suffix in hash_comments:
+        line_markers.append("#")
+    if suffix in slash_comments:
+        line_markers.append("//")
+        block_markers.append(("/*", "*/"))
+    if suffix == ".lua":
+        line_markers.append("--")
+        block_markers.append(("--[[", "]]"))
+    if suffix == ".ps1":
+        block_markers.append(("<#", "#>"))
+    return tuple(line_markers), tuple(block_markers)
+
+
+def _ruby_block_comment_end(content: str, offset: int) -> int | None:
+    """Return the byte after a column-zero Ruby =begin/=end comment block."""
+    marker_end = offset + len("=begin")
+    if not content.startswith("=begin", offset) or (
+        marker_end < len(content) and content[marker_end] not in " \t\r\n"
+    ):
+        return None
+    end_marker = re.search(r"(?m)^=end(?=[ \t\r\n]|$)", content[marker_end:])
+    if end_marker is None:
+        return len(content)
+    absolute_end = marker_end + end_marker.end()
+    line_end = content.find("\n", absolute_end)
+    return len(content) if line_end < 0 else line_end + 1
+
+
+def _generic_runtime_literal_references(
+    content: str,
+    *,
+    suffix: str,
+) -> Iterable[_PathReference]:
+    """Yield string literals from active generic-runtime code without executing it."""
+    line_markers, block_markers = _generic_runtime_comment_syntax(suffix)
+    quote_characters = {'"', "'"}
+    if suffix == ".go":
+        quote_characters.add("`")
+    escape_character = "`" if suffix == ".ps1" else "\\"
+    offset = 0
+    emitted = 0
+    line_start = True
+    while offset < len(content):
+        if suffix == ".rb" and line_start:
+            ruby_comment_end = _ruby_block_comment_end(content, offset)
+            if ruby_comment_end is not None:
+                offset = ruby_comment_end
+                line_start = True
+                continue
+        if line_start and suffix in {".bat", ".cmd"}:
+            line_end = content.find("\n", offset)
+            line_end = len(content) if line_end < 0 else line_end
+            stripped = content[offset:line_end].lstrip()
+            if stripped.startswith("::") or re.match(r"(?i:rem)(?:\s|$)", stripped):
+                offset = line_end
+                line_start = True
+                continue
+
+        block = next(
+            (marker for marker in block_markers if content.startswith(marker[0], offset)),
+            None,
+        )
+        if block is not None:
+            end = content.find(block[1], offset + len(block[0]))
+            offset = len(content) if end < 0 else end + len(block[1])
+            line_start = offset == 0 or content[offset - 1] in "\r\n"
+            continue
+        if any(content.startswith(marker, offset) for marker in line_markers):
+            end = content.find("\n", offset + 1)
+            offset = len(content) if end < 0 else end + 1
+            line_start = True
+            continue
+
+        character = content[offset]
+        if character in quote_characters:
+            quote = character
+            start = offset + 1
+            offset = start
+            while offset < len(content):
+                if content[offset] == escape_character and quote != "`":
+                    offset += 2
+                    continue
+                if content[offset] == quote:
+                    yield _PathReference(
+                        content[start:offset],
+                        start,
+                        "unknown",
+                        "generic_runtime.residual_literal",
+                    )
+                    emitted += 1
+                    offset += 1
+                    break
+                offset += 1
+            if emitted > _MAX_RESIDUAL_LITERALS:
+                return
+            line_start = False
+            continue
+
+        line_start = character in "\r\n"
+        offset += 1
+
+
+def _ruby_code_lines(content: str) -> Iterable[tuple[str, int]]:
+    offset = 0
+    in_block_comment = False
+    for raw_line in content.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        if in_block_comment:
+            if re.match(r"^=end(?=[ \t]|$)", line):
+                in_block_comment = False
+            offset += len(raw_line)
+            continue
+        if re.match(r"^=begin(?=[ \t]|$)", line):
+            in_block_comment = True
+            offset += len(raw_line)
+            continue
+
+        quote: str | None = None
+        escaped = False
+        code_end = len(line)
+        for index, character in enumerate(line):
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {'"', "'"}:
+                quote = character
+            elif character == "#":
+                code_end = index
+                break
+        yield line[:code_end], offset
+        offset += len(raw_line)
+
+
+def _split_generic_expression(
+    expression: str,
+    delimiter: str,
+) -> tuple[tuple[str, int], ...]:
+    parts: list[tuple[str, int]] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for index, character in enumerate(expression):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+        elif character in "([{":
+            depth += 1
+        elif character in ")]}" and depth:
+            depth -= 1
+        elif character == delimiter and depth == 0:
+            parts.append((expression[start:index], start))
+            start = index + 1
+    parts.append((expression[start:], start))
+    return tuple(parts)
+
+
+def _ruby_expression_value(
+    expression: str,
+    *,
+    base_offset: int,
+    bindings: Mapping[str, _GenericDataflowValue],
+    depth: int = 0,
+) -> _GenericDataflowValue | None:
+    if depth >= _MAX_STATIC_PROPAGATION_DEPTH or len(expression) > 4096:
+        raise _StaticAnalysisLimitError
+    leading = len(expression) - len(expression.lstrip())
+    expression = expression.strip()
+    base_offset += leading
+    if not expression:
+        return None
+    if expression.startswith("(") and expression.endswith(")"):
+        return _ruby_expression_value(
+            expression[1:-1],
+            base_offset=base_offset + 1,
+            bindings=bindings,
+            depth=depth + 1,
+        )
+    if (
+        len(expression) >= 2
+        and expression[0] == expression[-1]
+        and expression[0] in {'"', "'"}
+        and "#{" not in expression
+    ):
+        try:
+            value = ast.literal_eval(expression)
+        except (SyntaxError, ValueError):
+            return None
+        if isinstance(value, str):
+            return _GenericDataflowValue(value=value, offset=base_offset + 1)
+        return None
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", expression):
+        return bindings.get(expression)
+
+    join_match = re.fullmatch(r"File\.join\s*\((?P<arguments>.*)\)", expression)
+    if join_match is not None:
+        arguments_text = join_match.group("arguments")
+        arguments_offset = base_offset + join_match.start("arguments")
+        arguments = [
+            _ruby_expression_value(
+                item,
+                base_offset=arguments_offset + relative_offset,
+                bindings=bindings,
+                depth=depth + 1,
+            )
+            for item, relative_offset in _split_generic_expression(arguments_text, ",")
+        ]
+        if arguments and all(argument is not None for argument in arguments):
+            resolved_arguments = [argument for argument in arguments if argument is not None]
+            return _GenericDataflowValue(
+                value=posixpath.join(*(argument.value for argument in resolved_arguments)),
+                offset=resolved_arguments[0].offset,
+            )
+        return None
+
+    concatenated = _split_generic_expression(expression, "+")
+    if len(concatenated) > 1:
+        values = [
+            _ruby_expression_value(
+                item,
+                base_offset=base_offset + relative_offset,
+                bindings=bindings,
+                depth=depth + 1,
+            )
+            for item, relative_offset in concatenated
+        ]
+        if all(value is not None for value in values):
+            resolved_values = [value for value in values if value is not None]
+            return _GenericDataflowValue(
+                value="".join(value.value for value in resolved_values),
+                offset=resolved_values[0].offset,
+            )
+    return None
+
+
+def _ruby_runtime_dataflow_references(content: str) -> Iterable[_PathReference]:
+    bindings: dict[str, _GenericDataflowValue] = {}
+    operations = 0
+    benign_calls = frozenset({"p", "print", "printf", "puts", "raise", "warn"})
+    read_calls = frozenset({"file.open", "file.read", "load", "require"})
+    write_calls = frozenset({"file.binwrite", "file.write"})
+
+    for code_line, line_offset in _ruby_code_lines(content):
+        for statement, statement_offset in _split_generic_expression(code_line, ";"):
+            if not statement.strip():
+                continue
+            operations += 1
+            if operations > _MAX_STATIC_BINDINGS:
+                yield _PathReference(
+                    "static dataflow operation limit exceeded",
+                    line_offset + statement_offset,
+                    "unknown",
+                    "generic_runtime.analysis_limit",
+                )
+                return
+
+            assignment = re.fullmatch(
+                r"\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<expression>.+?)\s*",
+                statement,
+            )
+            if assignment is not None:
+                try:
+                    value = _ruby_expression_value(
+                        assignment.group("expression"),
+                        base_offset=(
+                            line_offset + statement_offset + assignment.start("expression")
+                        ),
+                        bindings=bindings,
+                    )
+                except _StaticAnalysisLimitError:
+                    yield _PathReference(
+                        "static expression limit exceeded",
+                        line_offset + statement_offset + assignment.start("expression"),
+                        "unknown",
+                        "generic_runtime.analysis_limit",
+                    )
+                    return
+                name = assignment.group("name")
+                if value is None:
+                    bindings.pop(name, None)
+                elif len(bindings) < _MAX_STATIC_BINDINGS or name in bindings:
+                    bindings[name] = value
+                else:
+                    yield _PathReference(
+                        "static binding limit exceeded",
+                        line_offset + statement_offset,
+                        "unknown",
+                        "generic_runtime.analysis_limit",
+                    )
+                    return
+                continue
+
+            if re.match(r"\s*(?:p|print|printf|puts|raise|warn)\b", statement):
+                continue
+            call = re.fullmatch(
+                r"\s*(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s*"
+                r"\((?P<arguments>.*)\)\s*",
+                statement,
+            )
+            if call is not None:
+                callee = call.group("callee").casefold()
+                arguments = _split_generic_expression(call.group("arguments"), ",")
+                if not arguments:
+                    continue
+                first_argument, relative_offset = arguments[0]
+                argument_offset = call.start("arguments") + relative_offset
+            else:
+                bare_call = re.fullmatch(
+                    r"\s*(?P<callee>[A-Za-z_][A-Za-z0-9_.]*)\s+"
+                    r"(?P<argument>.+?)\s*",
+                    statement,
+                )
+                if bare_call is None:
+                    continue
+                callee = bare_call.group("callee").casefold()
+                first_argument = bare_call.group("argument")
+                argument_offset = bare_call.start("argument")
+            if callee in benign_calls:
+                continue
+            try:
+                value = _ruby_expression_value(
+                    first_argument,
+                    base_offset=line_offset + statement_offset + argument_offset,
+                    bindings=bindings,
+                )
+            except _StaticAnalysisLimitError:
+                yield _PathReference(
+                    "static expression limit exceeded",
+                    line_offset + statement_offset + argument_offset,
+                    "unknown",
+                    "generic_runtime.analysis_limit",
+                )
+                return
+            if value is None:
+                continue
+            if callee in read_calls:
+                access = "read"
+            elif callee in write_calls:
+                access = "write"
+            else:
+                access = "unknown"
+            yield _PathReference(
+                value.value,
+                value.offset,
+                access,
+                "generic_runtime.dataflow",
+            )
+
+
+def _residual_literal_references(entry: InventoryEntry) -> Iterable[_PathReference]:
+    content = entry.content
+    if content is None:
+        return
+    suffix = PurePosixPath(entry.path).suffix.casefold()
+    shebang = content.partition("\n")[0].casefold() if content.startswith("#!") else ""
+    if suffix == ".py" or "python" in shebang:
+        yield from _python_residual_literal_references(content)
+    elif suffix in _JAVASCRIPT_SUFFIXES or any(
+        runtime in shebang for runtime in ("bun", "deno", "node")
+    ):
+        yield from _javascript_residual_literal_references(content)
+    elif suffix in _SHELL_SUFFIXES or entry.executable or content.startswith("#!"):
+        yield from _shell_residual_literal_references(content)
+    elif suffix in _GENERIC_RUNTIME_SUFFIXES:
+        yield from _generic_runtime_literal_references(content, suffix=suffix)
+        if suffix == ".rb":
+            yield from (
+                reference
+                for reference in _ruby_runtime_dataflow_references(content)
+                if reference.access == "unknown"
+            )
+
+
+def _decode_reference_with_status(value: str) -> tuple[str, bool]:
+    decoded = value
+    for _ in range(_MAX_REFERENCE_DECODING_ROUNDS):
+        current = unquote(decoded)
+        if current == decoded:
+            return decoded, False
+        decoded = current
+    return decoded, unquote(decoded) != decoded
 
 
 def _decode_reference(value: str) -> str:
-    decoded = value
-    for _ in range(4):
-        current = unquote(decoded)
-        if current == decoded:
-            break
-        decoded = current
-    return decoded
+    return _decode_reference_with_status(value)[0]
+
+
+def _normalize_relative_path_separators(value: str) -> str:
+    if "\\" not in value:
+        return value
+    if value.startswith("\\") or _WINDOWS_ABSOLUTE_RE.match(value) is not None:
+        return value
+    return value.replace("\\", "/")
 
 
 def _is_unsafe_host_reference(value: str) -> bool:
@@ -4131,7 +5250,7 @@ def _javascript_raw_context(
     )
 
 
-def _shell_heredoc_delimiter(line: str, offset: int) -> tuple[str, bool] | None:
+def _shell_heredoc_delimiter(line: str, offset: int) -> tuple[str, bool, bool] | None:
     cursor = offset + 2
     strip_tabs = cursor < len(line) and line[cursor] == "-"
     if strip_tabs:
@@ -4140,7 +5259,8 @@ def _shell_heredoc_delimiter(line: str, offset: int) -> tuple[str, bool] | None:
         cursor += 1
     if cursor >= len(line):
         return None
-    if line[cursor] in {'"', "'"}:
+    quoted = line[cursor] in {'"', "'"}
+    if quoted:
         quote = line[cursor]
         end = line.find(quote, cursor + 1)
         if end < 0:
@@ -4151,7 +5271,7 @@ def _shell_heredoc_delimiter(line: str, offset: int) -> tuple[str, bool] | None:
         if match is None:
             return None
         delimiter = match.group(0)
-    return (delimiter, strip_tabs) if delimiter else None
+    return (delimiter, strip_tabs, not quoted) if delimiter else None
 
 
 def _shell_raw_context(
@@ -4161,25 +5281,26 @@ def _shell_raw_context(
 ) -> _RawPluginContext:
     hard_inert: list[tuple[int, int]] = []
     double_quoted: list[tuple[int, int]] = []
-    heredocs: list[tuple[str, bool]] = []
+    heredocs: list[tuple[str, bool, bool]] = []
     line_offset = 0
     for line_number, physical_line in enumerate(content.splitlines(keepends=True)):
         line = physical_line.rstrip("\r\n")
         if heredocs:
-            hard_inert.append(
-                (
-                    base_offset + line_offset,
-                    base_offset + line_offset + len(physical_line),
-                )
-            )
-            delimiter, strip_tabs = heredocs[0]
+            delimiter, strip_tabs, expands = heredocs[0]
             candidate = line.lstrip("\t") if strip_tabs else line
+            if not expands or candidate == delimiter:
+                hard_inert.append(
+                    (
+                        base_offset + line_offset,
+                        base_offset + line_offset + len(physical_line),
+                    )
+                )
             if candidate == delimiter:
                 heredocs.pop(0)
             line_offset += len(physical_line)
             continue
 
-        pending: list[tuple[str, bool]] = []
+        pending: list[tuple[str, bool, bool]] = []
         cursor = 0
         while cursor < len(line):
             character = line[cursor]
@@ -4595,7 +5716,7 @@ def _missing_reference_is_package_context(
 ) -> bool:
     if reference.access == "import" and reference.syntax.startswith("markdown.fence."):
         return False
-    if reference.syntax.startswith(("json.", "markdown.")):
+    if reference.syntax.startswith(("config.", "json.", "markdown.")):
         return True
     if reference.syntax == "python.import":
         return True
@@ -4660,9 +5781,23 @@ def _analyze_forward_paths(
         for reference in references:
             raw = reference.value
             offset = reference.offset
-            decoded = _decode_reference(raw)
+            decoded, decoding_incomplete = _decode_reference_with_status(raw)
             if reference.access == "write":
                 written_values.add(decoded)
+                continue
+            if decoding_incomplete:
+                if collector.has_capacity(ReasonCode.STATIC_ANALYSIS_INCOMPLETE):
+                    collector.add(
+                        ReasonCode.STATIC_ANALYSIS_INCOMPLETE,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            raw,
+                            "static.forward.decode_limit",
+                            field="path",
+                        ),
+                    )
                 continue
             if reference.syntax.endswith(".parse_failure"):
                 if _is_proven_package_context(reference) and collector.has_capacity(
@@ -4687,6 +5822,20 @@ def _analyze_forward_paths(
             if reference.access == "read" and decoded in written_values:
                 continue
             plugin_variable = _PLUGIN_VARIABLE_RE.search(decoded)
+            if reference.syntax.endswith(".plugin_tainted"):
+                if collector.has_capacity(ReasonCode.PLUGIN_ROOT_VARIABLE):
+                    collector.add(
+                        ReasonCode.PLUGIN_ROOT_VARIABLE,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            decoded,
+                            "static.forward.plugin_root_variable_indirect",
+                            field="environment",
+                        ),
+                    )
+                continue
             if plugin_variable is not None:
                 if collector.has_capacity(ReasonCode.PLUGIN_ROOT_VARIABLE):
                     collector.add(
@@ -4725,7 +5874,21 @@ def _analyze_forward_paths(
                 raw,
                 by_path,
             )
-            if escaped or resolved is None:
+            if escaped:
+                if collector.has_capacity(ReasonCode.PATH_TRAVERSAL):
+                    collector.add(
+                        ReasonCode.PATH_TRAVERSAL,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset,
+                            raw if raw == decoded else f"{raw} -> {decoded}",
+                            "static.forward.path_traversal",
+                            field="path",
+                        ),
+                    )
+                continue
+            if resolved is None:
                 continue
 
             target = by_path.get(resolved)
@@ -4814,20 +5977,284 @@ def _analyze_forward_paths(
                 )
 
 
+def _analyze_residual_external_paths(
+    candidate: SkillCandidate,
+    inventory: Inventory,
+    collector: _ReasonCollector,
+) -> set[str]:
+    """Fail closed when an otherwise unknown source consumer may escape the skill."""
+    review_paths: set[str] = set()
+    by_path = inventory.by_path
+    for entry in inventory.entries:
+        if (
+            entry.kind != "file"
+            or entry.content is None
+            or not _is_within(entry.path, candidate.root)
+        ):
+            continue
+        suffix = PurePosixPath(entry.path).suffix.casefold()
+        if suffix not in _RESIDUAL_RUNTIME_SUFFIXES and not (
+            entry.executable or entry.content.startswith("#!")
+        ):
+            continue
+        proven_writes: set[tuple[int, str]] = set()
+        for proven_reference in _path_references(entry, candidate.root, by_path):
+            proven_value = _clean_reference(proven_reference.value)
+            proven_value = _normalize_relative_path_separators(_decode_reference(proven_value))
+            proven_key = (proven_reference.offset, proven_value)
+            if proven_reference.access == "write":
+                proven_writes.add(proven_key)
+
+        residual_references = tuple(_residual_literal_references(entry))
+        if len(residual_references) > _MAX_RESIDUAL_LITERALS:
+            overflow = residual_references[_MAX_RESIDUAL_LITERALS]
+            if collector.has_capacity(ReasonCode.STATIC_ANALYSIS_INCOMPLETE):
+                collector.add(
+                    ReasonCode.STATIC_ANALYSIS_INCOMPLETE,
+                    _text_evidence(
+                        entry.path,
+                        entry.content,
+                        overflow.offset,
+                        f"literal limit {_MAX_RESIDUAL_LITERALS} exceeded",
+                        "static.residual.literal_limit",
+                        field="limit",
+                    ),
+                )
+            residual_references = residual_references[:_MAX_RESIDUAL_LITERALS]
+
+        for reference in residual_references:
+            if reference.syntax.endswith(".analysis_limit"):
+                if collector.has_capacity(ReasonCode.STATIC_ANALYSIS_INCOMPLETE):
+                    collector.add(
+                        ReasonCode.STATIC_ANALYSIS_INCOMPLETE,
+                        _text_evidence(
+                            entry.path,
+                            entry.content,
+                            reference.offset,
+                            reference.value,
+                            "static.residual.analysis_limit",
+                            field="limit",
+                        ),
+                    )
+                continue
+            raw = _clean_reference(reference.value)
+            decoded, decoding_incomplete = _decode_reference_with_status(raw)
+            decoded = _normalize_relative_path_separators(decoded)
+            if decoding_incomplete:
+                if collector.has_capacity(ReasonCode.STATIC_ANALYSIS_INCOMPLETE):
+                    collector.add(
+                        ReasonCode.STATIC_ANALYSIS_INCOMPLETE,
+                        _text_evidence(
+                            entry.path,
+                            entry.content,
+                            reference.offset,
+                            raw,
+                            "static.residual.decode_limit",
+                            field="path",
+                        ),
+                    )
+                continue
+            if not _is_candidate_local_reference(decoded):
+                continue
+            if _is_unsafe_host_reference(decoded):
+                continue
+            if (reference.offset, decoded) in proven_writes:
+                continue
+            path_parts = PurePosixPath(decoded).parts
+            if not (_looks_explicit_path(decoded) or ".." in path_parts):
+                continue
+
+            resolved, escaped = _resolve_local_reference(
+                entry.path,
+                candidate.root,
+                decoded,
+                by_path,
+            )
+            if escaped:
+                if collector.has_capacity(ReasonCode.STATIC_ANALYSIS_INCOMPLETE):
+                    collector.add(
+                        ReasonCode.STATIC_ANALYSIS_INCOMPLETE,
+                        _text_evidence(
+                            entry.path,
+                            entry.content,
+                            reference.offset,
+                            f"{raw} -> <outside snapshot>",
+                            "static.residual.unproven_path",
+                            field="path",
+                        ),
+                    )
+                continue
+            if resolved is None or resolved not in by_path or _is_within(resolved, candidate.root):
+                continue
+            if collector.has_capacity(ReasonCode.STATIC_ANALYSIS_INCOMPLETE):
+                collector.add(
+                    ReasonCode.STATIC_ANALYSIS_INCOMPLETE,
+                    _text_evidence(
+                        entry.path,
+                        entry.content,
+                        reference.offset,
+                        f"{raw} -> {resolved}",
+                        "static.residual.unproven_path",
+                        field="path",
+                    ),
+                )
+                review_paths.add(resolved)
+    return review_paths
+
+
+def _directory_symlink_cycles(
+    candidate: SkillCandidate,
+    inventory: Inventory,
+) -> dict[str, str]:
+    by_path = inventory.by_path
+    nodes: set[str] = {candidate.root}
+    graph: dict[str, set[str]] = {}
+    reverse: dict[str, set[str]] = {}
+    symlink_edges: list[tuple[str, str, str, str]] = []
+
+    def add_edge(source: str, target: str) -> None:
+        nodes.update((source, target))
+        graph.setdefault(source, set()).add(target)
+        reverse.setdefault(target, set()).add(source)
+
+    def add_directory(path: str) -> None:
+        current = path
+        while _is_within(current, candidate.root):
+            nodes.add(current)
+            if current == candidate.root:
+                return
+            parent = PurePosixPath(current).parent.as_posix()
+            add_edge(parent, current)
+            current = parent
+
+    for entry in inventory.entries:
+        if entry.kind == "directory" and _is_within(entry.path, candidate.root):
+            add_directory(entry.path)
+
+    for entry in inventory.entries:
+        if entry.kind != "symlink" or not _is_within(entry.path, candidate.root):
+            continue
+        parent = PurePosixPath(entry.path).parent.as_posix()
+        add_directory(parent)
+        resolution = _resolve_inventory_symlink(
+            entry,
+            by_path,
+            allowed_root=candidate.root,
+        )
+        target: str | None = None
+        if resolution.terminal is not None and resolution.terminal.kind == "directory":
+            target = resolution.terminal.path
+        elif resolution.code is ReasonCode.MISSING_LOCAL_RESOURCE:
+            lexical, escaped = _collapse_path(
+                PurePosixPath(parent),
+                entry.symlink_target or "",
+            )
+            if not escaped and lexical == candidate.root:
+                target = candidate.root
+        if target is None:
+            continue
+        add_directory(target)
+        add_edge(parent, target)
+        symlink_edges.append((parent, target, entry.path, entry.symlink_target or ""))
+
+    visited: set[str] = set()
+    order: list[str] = []
+    for start in sorted(nodes):
+        if start in visited:
+            continue
+        visited.add(start)
+        stack: list[tuple[str, int, tuple[str, ...]]] = [
+            (start, 0, tuple(sorted(graph.get(start, ()))))
+        ]
+        while stack:
+            node, index, neighbours = stack[-1]
+            if index >= len(neighbours):
+                order.append(node)
+                stack.pop()
+                continue
+            target = neighbours[index]
+            stack[-1] = (node, index + 1, neighbours)
+            if target in visited:
+                continue
+            visited.add(target)
+            stack.append((target, 0, tuple(sorted(graph.get(target, ())))))
+
+    component_by_node: dict[str, int] = {}
+    component_sizes: list[int] = []
+    for start in reversed(order):
+        if start in component_by_node:
+            continue
+        component = len(component_sizes)
+        size = 0
+        pending = [start]
+        component_by_node[start] = component
+        while pending:
+            node = pending.pop()
+            size += 1
+            for source in reverse.get(node, ()):
+                if source in component_by_node:
+                    continue
+                component_by_node[source] = component
+                pending.append(source)
+        component_sizes.append(size)
+
+    cycles: dict[str, str] = {}
+    for source, target, path, raw_target in symlink_edges:
+        component_index = component_by_node.get(source)
+        if component_index is None or component_index != component_by_node.get(target):
+            continue
+        if source == target or component_sizes[component_index] > 1:
+            cycles[path] = f"{raw_target} -> {target}"
+    return cycles
+
+
 def _analyze_symlinks(
     candidate: SkillCandidate,
     inventory: Inventory,
     collector: _ReasonCollector,
 ) -> None:
     by_path = inventory.by_path
+    directory_cycles = _directory_symlink_cycles(candidate, inventory)
     for entry in inventory.entries:
         if entry.kind != "symlink" or not _is_within(entry.path, candidate.root):
+            continue
+        cycle_value = directory_cycles.get(entry.path)
+        if cycle_value is not None:
+            if collector.has_capacity(ReasonCode.SYMLINK_CYCLE):
+                collector.add(
+                    ReasonCode.SYMLINK_CYCLE,
+                    Evidence(
+                        path=entry.path,
+                        line=None,
+                        field="symlinkTarget",
+                        value=cycle_value,
+                        detector="static.symlink.directory_graph_cycle",
+                    ),
+                )
             continue
         resolution = _resolve_inventory_symlink(
             entry,
             by_path,
             allowed_root=candidate.root,
         )
+        if (
+            resolution.code is None
+            and resolution.terminal is not None
+            and resolution.terminal.kind == "directory"
+            and _is_within(entry.path, resolution.terminal.path)
+        ):
+            if collector.has_capacity(ReasonCode.SYMLINK_CYCLE):
+                collector.add(
+                    ReasonCode.SYMLINK_CYCLE,
+                    Evidence(
+                        path=entry.path,
+                        line=None,
+                        field="symlinkTarget",
+                        value=f"{entry.symlink_target} -> {resolution.terminal.path}",
+                        detector="static.symlink.ancestor_cycle",
+                    ),
+                )
+            continue
         if resolution.code is None or not collector.has_capacity(resolution.code):
             continue
         collector.add(
@@ -5183,6 +6610,15 @@ def _analyze_boundary_reverse_dependencies(
                 or entry.executable
                 or entry.path in owned.runtime_paths
                 or _is_known_runtime_component_path(entry.path, boundary)
+                or (
+                    PurePosixPath(entry.path).suffix.casefold() in _REVERSE_RUNTIME_SOURCE_SUFFIXES
+                    and not any(
+                        part.casefold() in {"test", "tests", "fixture", "fixtures"}
+                        for part in PurePosixPath(_relative_to(entry.path, boundary.root)).parts[
+                            :-1
+                        ]
+                    )
+                )
             )
         ):
             continue
@@ -5243,6 +6679,34 @@ def _analyze_boundary_reverse_dependencies(
                     max(original_offset, 0),
                     matched_value,
                     "static.reverse.skill_path",
+                    field="skillPath",
+                ),
+            )
+
+        for reference in _path_references(entry, boundary.root, by_path):
+            if reference.access == "write" or reference.syntax.endswith(".expression"):
+                continue
+            resolved, escaped = _resolve_local_reference(
+                entry.path,
+                boundary.root,
+                reference.value,
+                by_path,
+            )
+            if (
+                escaped
+                or resolved is None
+                or not _is_within(resolved, candidate.root)
+                or not collector.has_capacity(ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME)
+            ):
+                continue
+            collector.add(
+                ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME,
+                _text_evidence(
+                    entry.path,
+                    content,
+                    reference.offset,
+                    f"{reference.value} -> {resolved}",
+                    "static.reverse.consumed_skill_path",
                     field="skillPath",
                 ),
             )
@@ -5358,6 +6822,51 @@ def _sequence_of_strings(value: object) -> Iterable[str]:
                 yield item
 
 
+def _external_binaries_in_content(entry: InventoryEntry) -> set[str]:
+    content = entry.content or ""
+    binaries: set[str] = set()
+
+    def record(value: str | None) -> None:
+        if value is not None and value in _EXTERNAL_COMMANDS:
+            binaries.add(value)
+
+    for _, line in _iter_lines_with_offsets(content):
+        record(_command_binary(line))
+
+    for match in _MARKDOWN_INLINE_CODE_RE.finditer(content):
+        record(_command_binary(match.group("body")))
+
+    external_names = "|".join(sorted(_EXTERNAL_COMMANDS, key=len, reverse=True))
+    prose = re.compile(
+        rf"\b(?:needs?|requires?|use|using)\s+(?:the\s+)?(?P<binary>{external_names})\b",
+        re.IGNORECASE,
+    )
+    for match in prose.finditer(content):
+        record(match.group("binary").casefold())
+
+    suffix = PurePosixPath(entry.path).suffix.casefold()
+    shebang = content.partition("\n")[0].casefold() if content.startswith("#!") else ""
+    if suffix == ".py" or "python" in shebang:
+        try:
+            tree = ast.parse(content)
+        except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+            return binaries
+        _, _, subprocess_modules, subprocess_names, _ = _python_symbols(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not _python_is_subprocess_call(
+                node,
+                subprocess_modules,
+                subprocess_names,
+            ):
+                continue
+            argument = _python_call_argument(node)
+            if isinstance(argument, (ast.List, ast.Tuple)) and argument.elts:
+                argument = argument.elts[0]
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                record(_command_binary(argument.value))
+    return binaries
+
+
 def _external_requirements(
     validation: ValidationResult,
     candidate: SkillCandidate,
@@ -5387,8 +6896,7 @@ def _external_requirements(
             or not _is_within(entry.path, candidate.root)
         ):
             continue
-        for _, line in _iter_lines_with_offsets(entry.content):
-            binary = _command_binary(line)
+        for binary in _external_binaries_in_content(entry):
             if binary in _EXTERNAL_COMMANDS and binary.casefold() not in owned.binaries:
                 binaries.add(binary)
     return ExternalRequirements(
@@ -5408,6 +6916,8 @@ def _classification_for(
         return Classification.INVALID
     if reason_codes & _BOUND_CODES:
         return Classification.PLUGIN_BOUND
+    if ReasonCode.STATIC_ANALYSIS_INCOMPLETE in reason_codes:
+        return Classification.AMBIGUOUS
     boundary = candidate.enclosing_boundary
     if boundary is None:
         return Classification.PORTABLE
@@ -5443,7 +6953,11 @@ def _base_reason(
                 detector="static.classification.skills_only",
             ),
         )
-    if classification is Classification.AMBIGUOUS and candidate.enclosing_boundary is not None:
+    if (
+        classification is Classification.AMBIGUOUS
+        and candidate.enclosing_boundary is not None
+        and candidate.enclosing_boundary.package_kind == "mixed"
+    ):
         boundary = candidate.enclosing_boundary
         return (
             ReasonCode.MIXED_PLUGIN_AUTONOMY_UNPROVEN,
@@ -5498,6 +7012,7 @@ def analyze_static(
     owned = _aggregate_owned_components(ownerships)
     _analyze_symlinks(candidate, inventory, collector)
     _analyze_forward_paths(candidate, inventory, ownerships, collector)
+    residual_review_paths = _analyze_residual_external_paths(candidate, inventory, collector)
     _add_plugin_symbol_references(candidate, validation, inventory, owned, collector)
     _analyze_reverse_dependencies(
         candidate,
@@ -5520,5 +7035,5 @@ def analyze_static(
         classification=classification,
         reasons=reasons,
         external_requirements=_external_requirements(validation, candidate, inventory, owned),
-        review_paths=tuple(sorted(owned.runtime_paths)),
+        review_paths=tuple(sorted(owned.runtime_paths | residual_review_paths)),
     )

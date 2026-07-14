@@ -423,6 +423,185 @@ def test_github_urls_normalize_repository_ref_and_scope(
     assert "plugin.json" in inventory.by_path
 
 
+@pytest.mark.parametrize("route_kind", ["tree", "blob"])
+def test_github_url_with_full_commit_sha_is_immutable_without_explicit_ref(
+    route_kind: str,
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    head = create_git_repository(
+        repository,
+        {"tools/example/SKILL.md": SKILL_TEXT, "tools/example/assets/data.txt": "data"},
+    )
+    canonical_url = "https://github.com/acme/repo.git"
+    suffix = "tools/example" if route_kind == "tree" else "tools/example/SKILL.md"
+    resolver = SourceResolver(
+        limits=Limits(),
+        git_runner=LocalMirrorGitRunner(canonical_url, repository),
+    )
+
+    resolved = resolver.resolve(
+        parse_source_spec(
+            f"https://github.com/acme/repo/{route_kind}/{head}/{suffix}",
+            ref=None,
+            subpath=None,
+        ),
+        tmp_path / "workspace",
+    )
+
+    assert resolved.resolved_commit_sha == head
+    assert resolved.discovery_scope == "tools/example"
+
+
+@pytest.mark.parametrize("explicit_ref", [False, True])
+def test_github_url_disambiguates_slash_ref_starting_with_full_sha_shape(
+    explicit_ref: bool,
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_git_repository(
+        repository,
+        {"tools/example/SKILL.md": SKILL_TEXT, "plugin.json": "{}"},
+    )
+    branch = f"{'a' * 40}/feature"
+    run_git(repository, ["checkout", "-b", branch])
+    (repository / "branch-marker").write_text("feature", encoding="utf-8")
+    run_git(repository, ["add", "branch-marker"])
+    run_git(repository, ["commit", "-m", "feature"])
+    expected_sha = run_git(repository, ["rev-parse", branch])
+    canonical_url = "https://github.com/acme/repo.git"
+    resolver = SourceResolver(
+        limits=Limits(),
+        git_runner=LocalMirrorGitRunner(canonical_url, repository),
+    )
+
+    resolved = resolver.resolve(
+        parse_source_spec(
+            f"https://github.com/acme/repo/tree/{branch}/tools/example",
+            ref=branch if explicit_ref else None,
+            subpath=None,
+        ),
+        tmp_path / "workspace",
+    )
+
+    assert resolved.resolved_commit_sha == expected_sha
+    assert resolved.discovery_scope == "tools/example"
+
+
+@pytest.mark.parametrize(
+    "blob_target",
+    ["tools/example/MISSING.md", "tools/example"],
+)
+def test_github_blob_url_rejects_missing_or_non_file_target(
+    blob_target: str,
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_git_repository(
+        repository,
+        {"tools/example/SKILL.md": SKILL_TEXT, "tools/sibling/SKILL.md": SKILL_TEXT},
+    )
+    canonical_url = "https://github.com/acme/repo.git"
+    resolver = SourceResolver(
+        limits=Limits(),
+        git_runner=LocalMirrorGitRunner(canonical_url, repository),
+    )
+
+    with pytest.raises(ImporterError) as captured:
+        resolver.resolve(
+            parse_source_spec(
+                f"https://github.com/acme/repo/blob/main/{blob_target}",
+                ref=None,
+                subpath=None,
+            ),
+            tmp_path / "workspace",
+        )
+
+    assert captured.value.code == "INVALID_SOURCE"
+    assert "regular file" in captured.value.message
+
+
+def test_github_blob_url_rejects_symlink_target_without_following_it(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    create_git_repository(repository, {"tools/example/SKILL.md": SKILL_TEXT})
+    (repository / "tools/link.md").symlink_to("example/SKILL.md")
+    run_git(repository, ["add", "tools/link.md"])
+    run_git(repository, ["commit", "-m", "symlink"])
+    canonical_url = "https://github.com/acme/repo.git"
+    resolver = SourceResolver(
+        limits=Limits(),
+        git_runner=LocalMirrorGitRunner(canonical_url, repository),
+    )
+
+    with pytest.raises(ImporterError) as captured:
+        resolver.resolve(
+            parse_source_spec(
+                "https://github.com/acme/repo/blob/main/tools/link.md",
+                ref=None,
+                subpath=None,
+            ),
+            tmp_path / "workspace",
+        )
+
+    assert captured.value.code == "INVALID_SOURCE"
+    assert "regular file" in captured.value.message
+
+
+def test_github_url_rejects_unproven_slash_ref_boundary_during_ref_override(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    create_git_repository(
+        repository,
+        {
+            "feature/path/SKILL.md": SKILL_TEXT,
+            "path/SKILL.md": SKILL_TEXT,
+        },
+    )
+    canonical_url = "https://github.com/acme/repo.git"
+    resolver = SourceResolver(
+        limits=Limits(),
+        git_runner=LocalMirrorGitRunner(canonical_url, repository),
+    )
+
+    with pytest.raises(ImporterError) as captured:
+        resolver.resolve(
+            parse_source_spec(
+                "https://github.com/acme/repo/tree/deleted/feature/path",
+                ref="main",
+                subpath=None,
+            ),
+            tmp_path / "workspace",
+        )
+
+    assert captured.value.code == "AMBIGUOUS_GITHUB_REF"
+    assert "--subpath" in captured.value.message
+
+
+def test_explicit_subpath_makes_unadvertised_url_ref_boundary_irrelevant(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    head = create_git_repository(repository, {"path/SKILL.md": SKILL_TEXT})
+    canonical_url = "https://github.com/acme/repo.git"
+    resolver = SourceResolver(
+        limits=Limits(),
+        git_runner=LocalMirrorGitRunner(canonical_url, repository),
+    )
+
+    resolved = resolver.resolve(
+        parse_source_spec(
+            "https://github.com/acme/repo/tree/deleted/feature/path",
+            ref="main",
+            subpath="path",
+        ),
+        tmp_path / "workspace",
+    )
+
+    assert resolved.resolved_commit_sha == head
+    assert resolved.discovery_scope == "path"
+
+
 def test_explicit_subpath_overrides_github_url_scope(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     head = create_git_repository(

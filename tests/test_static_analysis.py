@@ -5,6 +5,7 @@ import hashlib
 import json
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -736,7 +737,7 @@ def test_markdown_templates_and_optional_context_do_not_hide_explicit_loads(
     } & result.reason_codes
 
 
-def test_repository_root_relative_escape_without_inventory_target_is_external(
+def test_repository_root_relative_escape_without_inventory_target_is_blocked(
     tmp_path: Path,
 ) -> None:
     result = _analyze(
@@ -745,16 +746,8 @@ def test_repository_root_relative_escape_without_inventory_target_is_external(
         root="skills/session-viewer",
     )
 
-    assert result.classification is Classification.PORTABLE
-    assert (
-        not {
-            ReasonCode.MISSING_LOCAL_RESOURCE,
-            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-            ReasonCode.PATH_TRAVERSAL,
-            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-        }
-        & result.reason_codes
-    )
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
 
 
 def test_local_reference_resolver_does_not_decode_raw_target_coordinates(
@@ -776,7 +769,7 @@ def test_local_reference_resolver_does_not_decode_raw_target_coordinates(
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
 
 
-def test_local_reference_resolver_treats_encoded_escape_as_external_runtime_data(
+def test_local_reference_resolver_blocks_encoded_escape(
     tmp_path: Path,
 ) -> None:
     result = _analyze(
@@ -789,16 +782,8 @@ def test_local_reference_resolver_treats_encoded_escape_as_external_runtime_data
         root="skills/session-viewer",
     )
 
-    assert result.classification is Classification.PORTABLE
-    assert (
-        not {
-            ReasonCode.MISSING_LOCAL_RESOURCE,
-            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
-            ReasonCode.PATH_TRAVERSAL,
-            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
-        }
-        & result.reason_codes
-    )
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
 
 
 def test_local_reference_resolver_prefers_candidate_root_for_nested_entry(
@@ -943,7 +928,10 @@ def test_markdown_dynamic_source_sink_remains_nonportable(tmp_path: Path) -> Non
     )
 
     assert result.classification is Classification.PLUGIN_BOUND
-    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+    assert {
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
 
 
 def test_known_source_parse_failure_is_not_a_package_dependency(tmp_path: Path) -> None:
@@ -1473,7 +1461,7 @@ def test_existing_parent_resource_is_outside_skill_and_nonportable(tmp_path: Pat
     assert evidence.value == "../shared/resource.txt -> skills/shared/resource.txt"
 
 
-def test_reference_traversing_beyond_snapshot_is_external_runtime_data(
+def test_reference_traversing_beyond_snapshot_is_blocked(
     tmp_path: Path,
 ) -> None:
     result = _analyze(
@@ -1481,9 +1469,8 @@ def test_reference_traversing_beyond_snapshot_is_external_runtime_data(
         {"skills/alpha/SKILL.md": _skill("Read [passwd](../../../../etc/passwd).\n")},
     )
 
-    assert result.classification is Classification.PORTABLE
-    assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
-    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -1493,8 +1480,6 @@ def test_reference_traversing_beyond_snapshot_is_external_runtime_data(
         r"C:\\Users\\alice\\secret.txt",
         "file:///etc/passwd",
         "file://localhost/etc/passwd",
-        "%2e%2e/%2e%2e/%2e%2e/etc/passwd",
-        "..%2f..%2f..%2fetc/passwd",
     ],
 )
 def test_explicit_host_or_encoded_traversal_reference_is_external_runtime_data(
@@ -1509,6 +1494,20 @@ def test_explicit_host_or_encoded_traversal_reference_is_external_runtime_data(
     assert result.classification is Classification.PORTABLE
     assert ReasonCode.PATH_TRAVERSAL not in result.reason_codes
     assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "reference",
+    ["%2e%2e/%2e%2e/%2e%2e/etc/passwd", "..%2f..%2f..%2fetc/passwd"],
+)
+def test_encoded_path_traversal_is_blocked(reference: str, tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/alpha/SKILL.md": _skill(f"Read [host file]({reference}).\n")},
+    )
+
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
 
 
 @pytest.mark.parametrize("shebang", ["#!/bin/sh", "#! /usr/bin/env sh"])
@@ -3218,6 +3217,314 @@ def test_development_fence_only_ignores_the_known_repository_validator(
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
 
 
+def test_shell_exec_of_repository_runtime_is_plugin_bound(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.sh": "exit 0\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.sh": "exec ../../../runtime/tool.sh\n",
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_shell_static_variable_path_to_repository_runtime_is_plugin_bound(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.py": "pass\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.sh": ('ROOT=../../..; python "$ROOT/runtime/tool.py"\n'),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import os\nfrom pathlib import Path\n"
+            "os.system(f\"python {Path(__file__).parents[3] / 'runtime/tool.py'}\")\n"
+        ),
+        (
+            "import runpy\nfrom pathlib import Path\n"
+            'runpy.run_path(Path(__file__).parents[3] / "runtime/tool.py")\n'
+        ),
+    ],
+)
+def test_python_execution_sink_for_repository_runtime_is_plugin_bound(
+    source: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.py": "pass\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.py": source,
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert {
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+    } & result.reason_codes
+
+
+def test_javascript_spawn_of_repository_runtime_is_plugin_bound(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.js": "export {};\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.js": (
+                'child_process.spawn("node", [path.join(__dirname, "../../../runtime/tool.js")]);\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_markdown_plain_action_path_to_repository_runtime_is_plugin_bound(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.sh": "exit 0\n",
+            "skills/x/SKILL.md": _skill("Run ../../runtime/tool.sh\n", name="x"),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_frontmatter_script_path_to_repository_runtime_is_plugin_bound(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.py": "pass\n",
+            "skills/x/SKILL.md": _skill(name="x", extra="script: ../../runtime/tool.py\n"),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("config.json", '{"script":"../../runtime/tool.py"}\n'),
+        ("config.yaml", "script: ../../runtime/tool.py\n"),
+        ("config.toml", 'script = "../../runtime/tool.py"\n'),
+        ("config.ini", "script = ../../runtime/tool.py\n"),
+    ],
+)
+def test_structured_config_runtime_path_is_plugin_bound(
+    path: str,
+    content: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.py": "pass\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            f"skills/x/{path}": content,
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "key_expression",
+    ['"PLUGIN_ROOT"', '"PLUGIN_" + "ROOT"'],
+)
+def test_indirect_python_plugin_root_lookup_is_plugin_bound(
+    key_expression: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": '{"name":"skills-only"}',
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.py": (
+                "import os\nfrom pathlib import Path\n"
+                f"key = {key_expression}\n"
+                "root = os.getenv(key)\n"
+                'open(Path(root) / "runtime/tool.py")\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+
+
+def test_unquoted_shell_heredoc_expands_plugin_root_and_is_plugin_bound(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": '{"name":"skills-only"}',
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.sh": (
+                'python <<EOF\nopen("${PLUGIN_ROOT}/runtime/tool.py")\nEOF\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+
+
+def test_quoted_shell_heredoc_keeps_plugin_root_literal_inert(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": '{"name":"skills-only"}',
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.sh": (
+                "python <<'EOF'\nopen(\"${PLUGIN_ROOT}/runtime/tool.py\")\nEOF\n"
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE not in result.reason_codes
+
+
+def test_shell_eval_rechecks_quoted_plugin_root_command(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": '{"name":"skills-only"}',
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.sh": ("eval 'python \"$PLUGIN_ROOT/runtime/tool.py\"'\n"),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("runtime_path", "runtime_source"),
+    [
+        ("lib/core.py", 'open("skills/x/SKILL.md")\n'),
+        ("src/core.py", 'open("skills/" + "x/SKILL.md")\n'),
+    ],
+)
+def test_plugin_code_reverse_reference_to_skill_is_plugin_bound(
+    runtime_path: str,
+    runtime_source: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": '{"runtime":"src/entry.py"}',
+            "src/entry.py": "pass\n",
+            runtime_path: runtime_source,
+            "skills/x/SKILL.md": _skill(name="x"),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME in result.reason_codes
+
+
+def test_symlink_to_skill_ancestor_directory_is_blocked_as_cycle(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/x/SKILL.md": _skill(name="x")},
+        root="skills/x",
+        symlinks={"skills/x/back": "."},
+        directories=frozenset({"skills/x"}),
+    )
+
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.SYMLINK_CYCLE in result.reason_codes
+
+
+def test_external_requirements_include_inline_prose_and_python_subprocess(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/x/SKILL.md": _skill(
+                "Run `git status`.\nUse docker to run the service.\n",
+                name="x",
+            ),
+            "skills/x/scripts/check.py": (
+                'import subprocess\nsubprocess.run(["gh", "repo", "view"], check=True)\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.external_requirements.binaries == ("docker", "gh", "git")
+
+
+def test_internal_python_script_paths_through_str_and_with_name_are_portable(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/tool.py": "pass\n",
+            "skills/x/scripts/harness.py": "pass\n",
+            "skills/x/tests/test_tool.py": (
+                "import runpy\nimport subprocess\nimport sys\nfrom pathlib import Path\n"
+                'SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "tool.py"\n'
+                "subprocess.run([sys.executable, str(SCRIPT)], check=True)\n"
+                'runpy.run_path(str(SCRIPT.with_name("harness.py")))\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert (
+        not {
+            ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+            ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+        }
+        & result.reason_codes
+    )
+
+
 def test_corrected_review_real_session_viewer_validate_section_is_inert(
     tmp_path: Path,
 ) -> None:
@@ -3729,7 +4036,10 @@ def test_python_repo_tainted_unresolved_read_fails_closed(
     )
 
     assert result.classification is Classification.PLUGIN_BOUND
-    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+    assert {
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
 
 
 def test_python_repo_relative_subprocess_script_is_nonportable(tmp_path: Path) -> None:
@@ -3748,7 +4058,10 @@ def test_python_repo_relative_subprocess_script_is_nonportable(tmp_path: Path) -
     )
 
     assert result.classification is Classification.PLUGIN_BOUND
-    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+    assert {
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+        ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT,
+    } & result.reason_codes
 
 
 def test_python_static_binding_budget_exhaustion_fails_closed(tmp_path: Path) -> None:
@@ -4352,3 +4665,556 @@ def test_overlong_internal_symlink_chain_fails_closed(tmp_path: Path) -> None:
 
     assert result.classification is Classification.PLUGIN_BOUND
     assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "target"),
+    [
+        ("scripts/run.rb", 'load "../../../runtime/tool.rb"\n', "runtime/tool.rb"),
+        (
+            "scripts/run.go",
+            'package main\nimport "os"\nfunc main() { os.ReadFile("../../../runtime/data.json") }\n',
+            "runtime/data.json",
+        ),
+        ("scripts/run.ps1", '. "..\\..\\..\\runtime\\tool.ps1"\n', "runtime/tool.ps1"),
+    ],
+)
+def test_unsupported_runtime_consumers_cannot_hide_outside_skill_dependencies(
+    path: str,
+    source: str,
+    target: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            target: "payload\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            f"skills/x/{path}": source,
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_unsupported_runtime_direct_traversal_is_blocked(tmp_path: Path) -> None:
+    raw = "../../../../etc/passwd"
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": f'File.read("{raw}")\n',
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.BLOCKED
+    evidence = _reason(result, ReasonCode.PATH_TRAVERSAL).evidence[0]
+    assert raw in evidence.value
+
+
+def test_aliased_python_execution_sink_cannot_hide_traversal(tmp_path: Path) -> None:
+    raw = "../../../../etc/passwd"
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.py": (f'from runpy import run_path as launch\nlaunch("{raw}")\n'),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.BLOCKED
+    evidence = _reason(result, ReasonCode.PATH_TRAVERSAL).evidence[0]
+    assert raw in evidence.value
+
+
+def test_aliased_javascript_execution_sink_cannot_hide_outside_dependency(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.js": "export {};\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.js": (
+                'const { spawn: launch } = require("node:child_process");\n'
+                'launch("../../../runtime/tool.js");\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("path", "source"),
+    [
+        (
+            "scripts/run.js",
+            'const key = "PLUGIN_" + "ROOT";\n'
+            "const root = process.env[key];\n"
+            'readFileSync(path.join(root, "runtime/tool.js"));\n',
+        ),
+        (
+            "scripts/run.sh",
+            '#!/usr/bin/env bash\nkey=PLUGIN_ROOT\nroot=${!key}\ncat "$root/runtime/tool"\n',
+        ),
+    ],
+)
+def test_static_indirect_plugin_environment_lookup_is_not_portable(
+    path: str,
+    source: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": '{"name":"skills-only"}',
+            "skills/x/SKILL.md": _skill(name="x"),
+            f"skills/x/{path}": source,
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+
+
+def test_javascript_spawn_resolves_static_path_in_argv_variable(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.js": "export {};\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.js": (
+                'const script = path.join(__dirname, "../../../runtime/tool.js");\n'
+                'spawn("node", [script]);\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_root_skill_symlink_to_itself_is_a_blocked_directory_cycle(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {"SKILL.md": _skill(name="root")},
+        root=".",
+        symlinks={"back": "."},
+    )
+
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.SYMLINK_CYCLE in result.reason_codes
+
+
+def test_sibling_directory_symlink_graph_cycle_is_blocked(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {"skills/x/SKILL.md": _skill(name="x")},
+        root="skills/x",
+        directories=frozenset({"skills/x/a", "skills/x/b"}),
+        symlinks={
+            "skills/x/a/to-b": "../b",
+            "skills/x/b/to-a": "../a",
+        },
+    )
+
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.SYMLINK_CYCLE in result.reason_codes
+
+
+def test_encoded_traversal_evidence_preserves_the_raw_match(tmp_path: Path) -> None:
+    raw = "..%2f..%2f..%2fetc/passwd"
+    result = _analyze(
+        tmp_path,
+        {"skills/x/SKILL.md": _skill(f"Read [passwd]({raw}).\n", name="x")},
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.BLOCKED
+    evidence = _reason(result, ReasonCode.PATH_TRAVERSAL).evidence[0]
+    assert raw in evidence.value
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "target"),
+    [
+        (
+            "scripts/run.rb",
+            'target = "../../../runtime/tool.rb"\nloader.call(target)\n',
+            "runtime/tool.rb",
+        ),
+        (
+            "scripts/run.py",
+            'from builtins import open as consume\nconsume("../../../runtime/data.txt")\n',
+            "runtime/data.txt",
+        ),
+        (
+            "scripts/run.js",
+            'const consume = fs.readFileSync;\nconsume("../../../runtime/data.txt");\n',
+            "runtime/data.txt",
+        ),
+    ],
+)
+def test_unproven_outside_path_dataflow_is_ambiguous_for_fm_review(
+    path: str,
+    source: str,
+    target: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            target: "payload\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            f"skills/x/{path}": source,
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    reason = _reason(result, ReasonCode.STATIC_ANALYSIS_INCOMPLETE)
+    assert reason.evidence[0].path == f"skills/x/{path}"
+    assert target in result.review_paths
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "extra_files"),
+    [
+        (
+            "scripts/run.rb",
+            'target = "../references/local.md"\nputs target\n',
+            {"references/local.md": "local\n"},
+        ),
+        (
+            "scripts/run.py",
+            'message = "ordinary text"\nprint(message)\n',
+            {},
+        ),
+        (
+            "scripts/run.js",
+            'const fixture = "../assets/data.txt";\nconsole.log(fixture);\n',
+            {"assets/data.txt": "local\n"},
+        ),
+    ],
+)
+def test_residual_analysis_keeps_internal_literals_and_ordinary_code_portable(
+    path: str,
+    source: str,
+    extra_files: Mapping[str, str],
+    tmp_path: Path,
+) -> None:
+    files = {
+        "skills/x/SKILL.md": _skill(name="x"),
+        f"skills/x/{path}": source,
+        **{f"skills/x/{name}": content for name, content in extra_files.items()},
+    }
+
+    result = _analyze(tmp_path, files, root="skills/x")
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE not in result.reason_codes
+
+
+def test_generic_runtime_comment_is_inert_for_dependency_analysis(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": ('# load "../../../runtime/tool.rb"\nputs :standalone\n'),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE not in result.reason_codes
+
+
+def test_generic_compound_parent_path_dataflow_is_ambiguous(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": (
+                'up = ".."\n'
+                'target = File.join(up, up, up, "runtime", "tool.rb")\n'
+                "loader = method(:load)\n"
+                "loader.call(target)\n"
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    reason = _reason(result, ReasonCode.STATIC_ANALYSIS_INCOMPLETE)
+    assert reason.evidence[0].detector == "static.residual.unproven_path"
+    assert "runtime/tool.rb" in result.review_paths
+
+
+def test_generic_compound_parent_path_from_concatenation_is_ambiguous(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": (
+                'dot = "."\n'
+                "up = dot + dot\n"
+                'target = File.join(up, up, up, "runtime", "tool.rb")\n'
+                "loader.call(target)\n"
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE in result.reason_codes
+    assert "runtime/tool.rb" in result.review_paths
+
+
+@pytest.mark.parametrize("consumer", ["consume target", "loader.call target"])
+def test_ruby_bare_unknown_consumer_is_ambiguous(
+    consumer: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": (
+                f'target = File.join("..", "..", "..", "runtime", "tool.rb")\n{consumer}\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE in result.reason_codes
+    assert "runtime/tool.rb" in result.review_paths
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "File.join(" + (" " * 5000) + '"..", "..", "..", "runtime", "tool.rb")',
+        ("(" * 40) + 'File.join("..", "..", "..", "runtime", "tool.rb")' + (")" * 40),
+    ],
+)
+def test_ruby_expression_limits_are_fail_closed(
+    expression: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": f"target = {expression}\nconsume(target)\n",
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    reason = _reason(result, ReasonCode.STATIC_ANALYSIS_INCOMPLETE)
+    assert reason.evidence[0].detector == "static.residual.analysis_limit"
+
+
+def test_user_defined_write_named_function_is_not_trusted_as_output_sink(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": (
+                'def write_file(path)\n  load path\nend\nwrite_file("../../../runtime/tool.rb")\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE in result.reason_codes
+    assert "runtime/tool.rb" in result.review_paths
+
+
+def test_ruby_logging_parent_marker_is_not_a_path_dependency(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": 'puts ".."\n',
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE not in result.reason_codes
+
+
+def test_residual_literal_limit_is_fail_closed(tmp_path: Path) -> None:
+    safe_literals = "".join(f'x{index} = "safe"\n' for index in range(4096))
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": (
+                f'{safe_literals}loader = method(:load)\nloader.call("../../../runtime/tool.rb")\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    reason = _reason(result, ReasonCode.STATIC_ANALYSIS_INCOMPLETE)
+    assert reason.evidence[0].detector == "static.residual.literal_limit"
+
+
+def test_ruby_block_comment_is_inert_for_residual_analysis(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": (
+                '=begin\nload "../../../runtime/tool.rb"\n=end\nputs :standalone\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE not in result.reason_codes
+
+
+def test_ruby_begin_substring_does_not_hide_active_dependency(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": ('obj.value=beginning\nload "../../../runtime/tool.rb"\n'),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_ruby_end_substring_does_not_terminate_block_comment(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.rb": "puts :runtime\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": (
+                '=begin\nnote =end marker\nload "../../../runtime/tool.rb"\n=end\n'
+                "puts :standalone\n"
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_ruby_static_internal_join_is_portable(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/references/local.md": "local\n",
+            "skills/x/scripts/run.rb": (
+                'target = File.join("..", "references", "local.md")\nload target\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE not in result.reason_codes
+
+
+def test_generic_runtime_write_target_is_not_a_dependency(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.rb": ('File.write("../../../runtime/output.txt", "payload")\n'),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE not in result.reason_codes
+
+
+def test_python_backslash_residual_path_is_ambiguous(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.py": "print('runtime')\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.py": (
+                'target = r"..\\..\\..\\runtime\\tool.py"\nconsume(target)\n'
+            ),
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE in result.reason_codes
+    assert "runtime/tool.py" in result.review_paths
+
+
+def test_deeply_encoded_residual_path_is_not_fail_open(tmp_path: Path) -> None:
+    encoded = "../../../runtime/tool.py"
+    for _ in range(5):
+        encoded = quote(encoded, safe="")
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.py": "print('runtime')\n",
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.py": f'target = "{encoded}"\nconsume(target)\n',
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert ReasonCode.STATIC_ANALYSIS_INCOMPLETE in result.reason_codes
+    assert "runtime/tool.py" in result.review_paths
+
+
+def test_residual_decode_limit_is_fail_closed(tmp_path: Path) -> None:
+    encoded = "../../../runtime/tool.py"
+    for _ in range(12):
+        encoded = quote(encoded, safe="")
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/x/SKILL.md": _skill(name="x"),
+            "skills/x/scripts/run.py": f'target = "{encoded}"\nconsume(target)\n',
+        },
+        root="skills/x",
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    reason = _reason(result, ReasonCode.STATIC_ANALYSIS_INCOMPLETE)
+    assert reason.evidence[0].detector == "static.residual.decode_limit"

@@ -298,6 +298,64 @@ def test_skills_only_manifest_declarations_remain_skills_only() -> None:
     assert detect_boundaries(inventory)[0].package_kind == "skills_only"
 
 
+@pytest.mark.parametrize(
+    ("metadata_path", "content"),
+    [
+        ("CONTRIBUTING.md", "Contribution guide\n"),
+        ("SECURITY.md", "Security policy\n"),
+        ("CODE_OF_CONDUCT.md", "Code of conduct\n"),
+        ("ARCHITECTURE.md", "Architecture notes\n"),
+        (".gitignore", ".venv/\n"),
+        (".editorconfig", "root = true\n"),
+        (
+            "package.json",
+            json.dumps(
+                {
+                    "name": "skills-distribution",
+                    "version": "1.0.0",
+                    "private": True,
+                    "description": "metadata only",
+                }
+            ),
+        ),
+    ],
+)
+def test_skills_only_package_ignores_distribution_metadata(
+    metadata_path: str,
+    content: str,
+) -> None:
+    inventory = _inventory(
+        {
+            "plugin.json": json.dumps({"name": "skills-only", "skills": ["skills/x"]}),
+            "skills/x/SKILL.md": "---\nname: x\ndescription: x\n---\n",
+            metadata_path: content,
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "skills_only"
+
+
+@pytest.mark.parametrize(
+    "runtime_declaration",
+    [
+        {"runtime": "runtime.py"},
+        {"scripts": {"start": "node index.js"}},
+    ],
+)
+def test_package_json_runtime_declaration_keeps_skills_plugin_mixed(
+    runtime_declaration: Mapping[str, object],
+) -> None:
+    inventory = _inventory(
+        {
+            "plugin.json": json.dumps({"name": "mixed", "skills": ["skills/x"]}),
+            "package.json": json.dumps({"name": "mixed", **runtime_declaration}),
+            "skills/x/SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
 def test_root_skill_with_metadata_only_plugin_manifest_is_skills_only() -> None:
     inventory = _inventory(
         {

@@ -873,6 +873,135 @@ def test_before_publish_race_preserves_competitor_and_cleans_own_staging(
     assert not list(tmp_path.glob(".out.skill-importer-*"))
 
 
+def test_before_publish_unexpected_staging_entry_fails_closed_without_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("staging-integrity")})
+    out = tmp_path / "out"
+    captured_staging: Path | None = None
+
+    def add_unexpected(staging: Path) -> None:
+        nonlocal captured_staging
+        captured_staging = staging
+        (staging / "unexpected").write_text("keep")
+
+    with pytest.raises(ImporterError) as captured:
+        _import(source, out, before_publish=add_unexpected)
+
+    assert captured.value.code == "STAGING_CHANGED"
+    assert not os.path.lexists(out)
+    assert captured_staging is not None
+    assert (captured_staging / "unexpected").read_text() == "keep"
+
+
+def test_before_publish_manifest_content_mutation_fails_closed_without_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("manifest-integrity")})
+    out = tmp_path / "out"
+    captured_manifest: Path | None = None
+    forged_manifest: bytes | None = None
+
+    def replace_manifest_bytes(staging: Path) -> None:
+        nonlocal captured_manifest, forged_manifest
+        captured_manifest = staging / "import-manifest.json"
+        original = captured_manifest.read_bytes()
+        forged_manifest = bytes([original[0] ^ 1]) + original[1:]
+        captured_manifest.write_bytes(forged_manifest)
+
+    with pytest.raises(ImporterError) as captured:
+        _import(source, out, before_publish=replace_manifest_bytes)
+
+    assert captured.value.code == "STAGING_CHANGED"
+    assert not os.path.lexists(out)
+    assert captured_manifest is not None
+    assert forged_manifest is not None
+    assert captured_manifest.read_bytes() == forged_manifest
+
+
+def test_before_publish_payload_content_mutation_fails_closed_without_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("payload-integrity")})
+    out = tmp_path / "out"
+    captured_payload: Path | None = None
+    forged_payload: bytes | None = None
+
+    def replace_payload_bytes(staging: Path) -> None:
+        nonlocal captured_payload, forged_payload
+        captured_payload = next(staging.glob("*/SKILL.md"))
+        original = captured_payload.read_bytes()
+        forged_payload = bytes([original[0] ^ 1]) + original[1:]
+        captured_payload.write_bytes(forged_payload)
+
+    with pytest.raises(ImporterError) as captured:
+        _import(source, out, before_publish=replace_payload_bytes)
+
+    assert captured.value.code == "STAGING_CHANGED"
+    assert not os.path.lexists(out)
+    assert captured_payload is not None
+    assert forged_payload is not None
+    assert captured_payload.read_bytes() == forged_payload
+
+
+def test_before_publish_payload_mode_mutation_fails_closed_without_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": _skill("mode-integrity")})
+    out = tmp_path / "out"
+    captured_payload: Path | None = None
+
+    def make_payload_world_readable(staging: Path) -> None:
+        nonlocal captured_payload
+        captured_payload = next(staging.glob("*/SKILL.md"))
+        captured_payload.chmod(0o644)
+
+    with pytest.raises(ImporterError) as captured:
+        _import(source, out, before_publish=make_payload_world_readable)
+
+    assert captured.value.code == "STAGING_CHANGED"
+    assert not os.path.lexists(out)
+    assert captured_payload is not None
+    assert stat.S_IMODE(captured_payload.stat().st_mode) == 0o644
+
+
+def test_before_publish_directory_mode_mutation_fails_closed_without_publication(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(
+        source,
+        {
+            "SKILL.md": _skill("directory-mode-integrity"),
+            "assets/data.txt": "data",
+        },
+    )
+    out = tmp_path / "out"
+    captured_directory: Path | None = None
+
+    def make_payload_directory_world_writable(staging: Path) -> None:
+        nonlocal captured_directory
+        captured_directory = next(staging.glob("*/assets"))
+        captured_directory.chmod(0o777)
+
+    with pytest.raises(ImporterError) as captured:
+        _import(source, out, before_publish=make_payload_directory_world_writable)
+
+    assert captured.value.code == "STAGING_CHANGED"
+    assert not os.path.lexists(out)
+    assert captured_directory is not None
+    assert stat.S_IMODE(captured_directory.stat().st_mode) == 0o777
+
+
 class _UnsupportedPublisher:
     def publish(self, parent_fd: int, staging_name: str, output_name: str) -> None:
         del parent_fd, staging_name, output_name
@@ -1055,6 +1184,42 @@ class _ReportOverridePipeline(SkillImporterPipeline):
     ) -> Iterator[ScanOperation]:
         with super().scan_operation(spec, options) as operation:
             yield self._transform(operation)
+
+
+def test_symlink_directory_cycle_defense_rejects_inconsistent_portable_plan(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(
+        source,
+        {
+            "tool/SKILL.md": _skill("cyclic-links"),
+            "tool/a/keep.txt": "a",
+            "tool/b/keep.txt": "b",
+        },
+    )
+    (source / "tool/a/to-b").symlink_to("../b")
+    (source / "tool/b/to-a").symlink_to("../a")
+
+    def promote(operation: ScanOperation) -> ScanOperation:
+        original = operation.report.skills[0]
+        promoted = replace(
+            original,
+            static_classification=Classification.PORTABLE,
+            classification=Classification.PORTABLE,
+            reasons=(_safe_reason(original.candidate.entrypoint),),
+        )
+        return replace(operation, report=ScanReport(source=operation.resolved, skills=(promoted,)))
+
+    importer = SkillImporter(pipeline=_ReportOverridePipeline(promote))
+    out = tmp_path / "out"
+
+    with pytest.raises(ImporterError) as captured:
+        importer.import_source(SourceSpec.local(source), out, ScanOptions(use_llm=False))
+
+    assert captured.value.code == "SYMLINK_CYCLE"
+    assert not os.path.lexists(out)
 
 
 @pytest.mark.parametrize("layout", ["equal", "nested"])
