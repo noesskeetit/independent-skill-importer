@@ -559,6 +559,61 @@ def test_repository_root_relative_resolution_preserves_entry_relative_precedence
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
 
 
+def test_markdown_bare_inline_destination_paths_are_not_dependencies(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            ".agents/plugins/marketplace.json": json.dumps({"plugins": []}),
+            ".agents/skills/plugin-creator/SKILL.md": _skill(
+                "The marketplace config is `.agents/plugins/marketplace.json`.\n"
+                "Generated plugin packages use `./plugins/` as their destination.\n"
+            ),
+        },
+        root=".agents/skills/plugin-creator",
+        directories=frozenset({"plugins"}),
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert result.reason_codes == frozenset({ReasonCode.STANDALONE_NO_PLUGIN_BOUNDARY})
+
+
+@pytest.mark.parametrize("verb", ["Run", "Read", "Load", "Source", "Execute"])
+def test_markdown_dependency_action_preserves_bare_inline_path(
+    verb: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            ".agents/plugins/marketplace.json": json.dumps({"plugins": []}),
+            ".agents/skills/plugin-creator/SKILL.md": _skill(
+                f"{verb} `.agents/plugins/marketplace.json`.\n"
+            ),
+        },
+        root=".agents/skills/plugin-creator",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_markdown_inline_shell_command_remains_a_dependency(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/env.sh": "export READY=1\n",
+            "skills/alpha/SKILL.md": _skill(
+                "Shell example: `source ../shared/env.sh`.\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
 def test_repository_root_relative_escape_without_inventory_target_is_external(
     tmp_path: Path,
 ) -> None:
@@ -1057,6 +1112,10 @@ def test_relative_write_destination_never_depends_on_existing_inventory_target(
             'const module = require("./missing.js");\n',
         ),
         (
+            "skills/alpha/scripts/module.ts",
+            'import { run } from "./missing";\n',
+        ),
+        (
             "skills/alpha/tsconfig.json",
             json.dumps({"extends": "./missing.json"}),
         ),
@@ -1077,6 +1136,34 @@ def test_missing_package_import_or_config_remains_nonportable(
 
     assert result.classification is Classification.PLUGIN_BOUND
     assert ReasonCode.MISSING_LOCAL_RESOURCE in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'import { setup } from "./app-insights";',
+        "const module = await import(`./${moduleName}`);",
+    ],
+)
+def test_markdown_typescript_fence_relative_import_is_consumer_example(
+    statement: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(
+                "See [the consumer example](references/example.md).\n"
+            ),
+            "skills/alpha/references/example.md": f"```ts\n{statement}\n```\n",
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert not {
+        ReasonCode.MISSING_LOCAL_RESOURCE,
+        ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
+    } & result.reason_codes
 
 
 @pytest.mark.parametrize(

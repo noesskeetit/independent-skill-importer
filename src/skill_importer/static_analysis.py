@@ -65,6 +65,13 @@ _MARKDOWN_DESTINATION_RE = re.compile(
     r"!?\[[^\]]*\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<plain>[^)\s]+))",
 )
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<body>[^`\r\n]+)`(?!`)")
+_MARKDOWN_INLINE_DEPENDENCY_ACTION_RE = re.compile(
+    r"\b(?:run|read|load|source|execute)"
+    r"(?:\s+(?:a|an|the|this))?"
+    r"(?:\s+(?:config(?:uration)?|directory|file|path|script))?"
+    r"(?:\s+(?:at|from))?\s*[:=-]?\s*$",
+    re.IGNORECASE,
+)
 _MARKDOWN_HEADING_RE = re.compile(
     r"^ {0,3}(?P<marker>#{1,6})(?:[ \t]+|$)(?P<title>.*?)(?:[ \t]+#+[ \t]*)?$"
 )
@@ -1747,8 +1754,9 @@ def _fenced_code_path_references(
     by_path: Mapping[str, InventoryEntry],
     base_offset: int,
 ) -> Iterable[_PathReference]:
+    references: Iterable[_PathReference]
     if language in {"py", "python"}:
-        yield from _python_path_references(
+        references = _python_path_references(
             body,
             entry_path=entry_path,
             candidate_root=candidate_root,
@@ -1757,13 +1765,32 @@ def _fenced_code_path_references(
             fail_closed=False,
         )
     elif language in {"javascript", "js", "jsx", "node", "ts", "tsx", "typescript"}:
-        yield from _javascript_path_references(body, base_offset=base_offset)
+        references = _javascript_path_references(body, base_offset=base_offset)
     elif language in {"bash", "sh", "shell", "zsh"}:
-        yield from _shell_path_references(
+        references = _shell_path_references(
             body,
             base_offset=base_offset,
             fail_closed=True,
         )
+    else:
+        return
+    for reference in references:
+        if reference.access == "import" and _decode_reference(reference.value).startswith(
+            ("./", "../")
+        ):
+            continue
+        yield reference
+
+
+def _markdown_inline_code_has_dependency_context(
+    content: str,
+    match: re.Match[str],
+) -> bool:
+    line_start = content.rfind("\n", 0, match.start()) + 1
+    if _MARKDOWN_INLINE_DEPENDENCY_ACTION_RE.search(content[line_start : match.start()]):
+        return True
+    tokens, failed = _shell_tokens(match.group("body"))
+    return not failed and len(tokens) > 1
 
 
 def _markdown_frontmatter_bounds(content: str) -> tuple[int, int, int] | None:
@@ -2098,6 +2125,8 @@ def _markdown_path_references(
 
     for match in _MARKDOWN_INLINE_CODE_RE.finditer(content):
         if _offset_in_ranges(match.start(), excluded_ranges):
+            continue
+        if not _markdown_inline_code_has_dependency_context(content, match):
             continue
         yield from _shell_path_references(
             match.group("body"),
