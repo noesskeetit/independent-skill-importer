@@ -67,6 +67,18 @@ plugins, examples и обычный code; как importer понимает, ка
 отбрасывается. Названия внутренних Python classes, детали hashing/TOCTOU и полный перечень regex
 detectors остаются только в internal reference.
 
+Короткий `TECH_LEAD_IMPORTER_ALGORITHM.md` также обязан явно показать:
+
+- **Вход:** local path или Git/GitHub URL, optional ref/subpath и optional `FM_API_KEY` из локального
+  `.env` текущей директории.
+- **Выход scan:** список найденных skill roots, classification, причины/evidence, enclosing package,
+  external requirements, conflicts/duplicates и counts; repository при этом не изменяется.
+- **Выход import:** новый output directory только с payloads итоговых `portable` skills и
+  `import-manifest.json` с provenance; остальные candidates перечислены как rejected.
+- **Сквозной пример:** в одном repository лежат standalone skill, plugin-bound skill и mixed-plugin
+  ambiguous skill; документ показывает их scan verdicts, optional FM только для ambiguous и то,
+  что import копирует лишь подтверждённые portable payloads.
+
 ## Проверки
 
 - TDD: `.env` key используется обеими CLI-командами; process env побеждает; legacy fallback
