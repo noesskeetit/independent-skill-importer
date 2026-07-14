@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -65,6 +66,40 @@ def test_inventory_never_follows_symlink(tmp_path: Path) -> None:
     assert entry.kind == "symlink"
     assert entry.symlink_target == str(tmp_path / "secret.txt")
     assert entry.content is None
+
+
+def test_local_snapshot_rejects_hardlink_to_file_outside_source(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("must remain outside", encoding="utf-8")
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": SKILL_TEXT})
+    os.link(outside, source / "linked-secret.txt")
+    workspace = tmp_path / "workspace"
+
+    with pytest.raises(ImporterError) as captured:
+        snapshot_local(source, workspace, Limits())
+
+    assert captured.value.code == "PATH_TRAVERSAL"
+    assert outside.read_text(encoding="utf-8") == "must remain outside"
+    snapshots = list(workspace.glob("snapshot-*"))
+    assert len(snapshots) == 1
+    assert not (snapshots[0] / "linked-secret.txt").exists()
+
+
+def test_local_snapshot_conservatively_rejects_any_hardlinked_regular_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    write_tree(source, {"SKILL.md": SKILL_TEXT, "asset.txt": "shared"})
+    os.link(source / "asset.txt", source / "asset-alias.txt")
+
+    with pytest.raises(ImporterError) as captured:
+        snapshot_local(source, tmp_path / "workspace", Limits())
+
+    assert captured.value.code == "PATH_TRAVERSAL"
+    assert "hardlink" in captured.value.message
 
 
 def test_local_snapshot_excludes_vcs_metadata(tmp_path: Path) -> None:

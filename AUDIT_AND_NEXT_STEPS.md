@@ -47,6 +47,16 @@ baseline, а не manual oracle и не актуальный verdict.
 7. **Bounded findings.** Static reason collector сохраняет не более 64 уникальных evidence records
    на reason code. Отдельных counters для отброшенных повторов пока нет; это остаётся production
    observability backlog.
+8. **Static path composition.** Bounded propagation распознаёт consumed Python paths от
+   `Path(__file__)`, `parents[N]`, `/`, `joinpath()` и JavaScript `path.join(__dirname, ...)`, не
+   исполняя source code. Активный plugin-root literal через `expandvars`/subprocess больше не
+   скрывается как fixture string.
+9. **Extraction aliases.** Local snapshot консервативно отклоняет regular files с hardlink count,
+   отличным от одного, до публикации payload. Root-level OpenClaw extension declaration сохраняет
+   mixed package и не позволяет выдать plugin runtime за skill payload.
+10. **Markdown fail-closed contexts.** Explicit parent traversal и plugin-root variables не
+    скрываются заголовками Development/Tests/Validate; dev-only bare validator commands и
+    доказанные write/destination examples по-прежнему не считаются runtime dependency.
 
 Регрессии закреплены focused tests в `tests/test_static_analysis.py` и acceptance fixtures. Реальный
 corpus хранится отдельно и не подменяет unit/fixture coverage.
@@ -65,8 +75,8 @@ Runner вызывает только public `SkillImporterPipeline.scan()`, не
 uv run pytest -q tests/test_real_world_benchmark.py
 ```
 
-Полный online static corpus после последних функциональных commits **ещё не является частью
-combined audit** и должен быть явно перезапущен:
+Последний полный online static corpus дал **9/9 source/semantic matches, 1/1 expected operational
+guard и 0 disagreements**. Повторяемая команда:
 
 ```bash
 uv run python benchmarks/real_world/run.py \
@@ -118,6 +128,6 @@ OpenClaw scale case честно ожидает текущий operational `SCAN
 - Если skill требует часть plugin, его нужно отклонить с reason/evidence, а не «починить» скрытым
   копированием внешних files.
 - Новые detectors сначала получают fixture/focused test, затем regression на pinned real source.
-- API key передаётся только через process environment в момент FM review; `.env` не читается и не
-  изменяется.
+- API key передаётся только через process environment (`FM_API_KEY`, либо `LLM_API_KEY` fallback)
+  в момент FM review; `.env` не читается и не изменяется.
 - Runtime security checking остаётся отдельной подсистемой после package-autonomy import decision.

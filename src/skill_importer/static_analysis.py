@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import posixpath
 import re
 import shlex
 import tokenize
@@ -35,6 +36,8 @@ _MAX_MANIFEST_NODES = 4096
 _MAX_MANIFEST_DEPTH = 64
 _MAX_SYMLINK_CHAIN = 64
 _PLUGIN_NEGATION_CONTEXT_CHARS = 256
+_MAX_STATIC_PROPAGATION_DEPTH = 32
+_MAX_STATIC_BINDINGS = 4096
 _PLUGIN_ENV_NAME_PATTERN = (
     r"(?:(?:CLAUDE_|CODEX_|CURSOR_|GEMINI_|OPENCLAW_)?PLUGIN_(?:ROOT|DIR|PATH)"
     r"|EXTENSION_(?:ROOT|DIR|PATH))"
@@ -65,11 +68,28 @@ _MARKDOWN_DESTINATION_RE = re.compile(
     r"!?\[[^\]]*\]\(\s*(?:<(?P<angle>[^>]+)>|(?P<plain>[^)\s]+))",
 )
 _MARKDOWN_INLINE_CODE_RE = re.compile(r"(?<!`)`(?P<body>[^`\r\n]+)`(?!`)")
-_MARKDOWN_INLINE_DEPENDENCY_ACTION_RE = re.compile(
-    r"\b(?:run|read|load|source|execute)"
-    r"(?:\s+(?:a|an|the|this))?"
-    r"(?:\s+(?:config(?:uration)?|directory|file|path|script))?"
-    r"(?:\s+(?:at|from))?\s*[:=-]?\s*$",
+_MARKDOWN_INLINE_WRITE_ACTION_RE = re.compile(
+    r"^\s*(?:(?:[-*+]|\d+[.)]|>)\s+)*"
+    r"(?:(?:then|please|always)\s+)?"
+    r"(?:(?:you\s+)?(?:must|should|need\s+to)\s+)?"
+    r"(?:create|edit|generate|keep|replace|update|write)\b",
+    re.IGNORECASE,
+)
+_MARKDOWN_INLINE_OUTPUT_NOUN_RE = re.compile(
+    r"\b(?:destination|output\s+path|write\s+target)\b",
+    re.IGNORECASE,
+)
+_MARKDOWN_INLINE_MARKETPLACE_LOCATION_RE = re.compile(
+    r"\bmarketplace\s+config\s+is\s*$",
+    re.IGNORECASE,
+)
+_MARKDOWN_INLINE_OPTIONAL_WORKSPACE_RE = re.compile(
+    r"\bif\s+the\s+current\s+git\s+repo\s+already\s+has\b",
+    re.IGNORECASE,
+)
+_MARKDOWN_INLINE_SCHEMA_EXAMPLE_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)*.*(?:\bexample\b|\bpersonal\s+plugin\b|"
+    r"\brepo/team\s+plugin\b|`?path`?\s*\([^)]*\)\s*:)",
     re.IGNORECASE,
 )
 _MARKDOWN_HEADING_RE = re.compile(
@@ -104,6 +124,7 @@ _PYTHON_PATH_TYPES = frozenset({"path", "purepath"})
 _PYTHON_WRITE_METHODS = frozenset(
     {"chmod", "mkdir", "rename", "replace", "rmdir", "touch", "unlink", "write_bytes", "write_text"}
 )
+_PYTHON_READ_METHODS = frozenset({"open", "read_bytes", "read_text"})
 _PYTHON_SUBPROCESS_CALLS = frozenset({"call", "check_call", "check_output", "popen", "run"})
 _JAVASCRIPT_PATH_CALLS = {
     "import": "import",
@@ -253,6 +274,8 @@ _RUNTIME_DIRECTORIES = frozenset(
         "src",
         "config",
         "configs",
+        "extension",
+        "extensions",
         "orchestration",
         "workflow",
         "workflows",
@@ -310,6 +333,8 @@ _RUNTIME_MANIFEST_KEYS = frozenset(
         "entrypoint",
         "executable",
         "executables",
+        "extension",
+        "extensions",
         "hook",
         "hooks",
         "main",
@@ -403,6 +428,13 @@ class _PathReference:
     offset: int
     access: str
     syntax: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticPathValue:
+    value: str
+    anchored_to_repository: bool = False
+    propagated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -766,7 +798,10 @@ def _python_indirect_path_accesses(
     bindings: dict[str, ast.Call] = {}
     ambiguous: set[str] = set()
     assignment_targets: set[int] = set()
+    names_by_identifier: dict[str, list[ast.Name]] = {}
     for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names_by_identifier.setdefault(node.id.casefold(), []).append(node)
         target: ast.expr | None = None
         value: ast.expr | None = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -793,9 +828,7 @@ def _python_indirect_path_accesses(
         if name in ambiguous:
             accesses[id(constructor)] = "read"
             continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Name) or node.id.casefold() != name:
-                continue
+        for node in names_by_identifier.get(name, ()):
             if id(node) in assignment_targets:
                 continue
             if not isinstance(node.ctx, ast.Load):
@@ -878,6 +911,340 @@ def _python_subprocess_arguments(call: ast.Call) -> tuple[ast.expr, ...]:
             index += 1
         return ()
     return (argument,) if argument is not None else ()
+
+
+def _static_path_join(values: Sequence[_StaticPathValue]) -> _StaticPathValue | None:
+    if not values:
+        return None
+    first, *remaining = values
+    if any(value.anchored_to_repository for value in remaining):
+        return None
+    joined = first.value
+    for value in remaining:
+        joined = posixpath.join(joined, value.value)
+    return _StaticPathValue(
+        joined,
+        anchored_to_repository=first.anchored_to_repository,
+        propagated=True,
+    )
+
+
+def _static_reference_value(value: _StaticPathValue, entry_path: str) -> str:
+    if not value.anchored_to_repository:
+        return value.value
+    source_parent = str(PurePosixPath(entry_path).parent)
+    return posixpath.relpath(posixpath.normpath(value.value), start=source_parent)
+
+
+def _python_static_bindings(tree: ast.AST) -> dict[str, ast.expr]:
+    bindings: dict[str, ast.expr] = {}
+    ambiguous: set[str] = set()
+    for node in ast.walk(tree):
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        if not isinstance(target, ast.Name) or value is None:
+            continue
+        name = target.id.casefold()
+        if name in bindings:
+            ambiguous.add(name)
+        elif len(bindings) < _MAX_STATIC_BINDINGS:
+            bindings[name] = value
+    return {name: value for name, value in bindings.items() if name not in ambiguous}
+
+
+def _python_static_path_value(
+    node: ast.expr,
+    *,
+    entry_path: str,
+    bindings: Mapping[str, ast.expr],
+    path_names: set[str],
+    pathlib_modules: set[str],
+    memo: dict[str, _StaticPathValue | None],
+    resolving: set[str],
+    depth: int = 0,
+) -> _StaticPathValue | None:
+    if depth >= _MAX_STATIC_PROPAGATION_DEPTH:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return _StaticPathValue(node.value)
+    if isinstance(node, ast.Name):
+        name = node.id.casefold()
+        if name == "__file__":
+            return _StaticPathValue(entry_path, anchored_to_repository=True, propagated=True)
+        if name in memo:
+            return memo[name]
+        binding = bindings.get(name)
+        if binding is None or name in resolving:
+            return None
+        resolving.add(name)
+        resolved = _python_static_path_value(
+            binding,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        resolving.remove(name)
+        if resolved is not None:
+            resolved = _StaticPathValue(
+                resolved.value,
+                anchored_to_repository=resolved.anchored_to_repository,
+                propagated=True,
+            )
+        memo[name] = resolved
+        return resolved
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left = _python_static_path_value(
+            node.left,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        right = _python_static_path_value(
+            node.right,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        return _static_path_join((left, right)) if left is not None and right is not None else None
+    if isinstance(node, ast.Attribute) and node.attr.casefold() == "parent":
+        value = _python_static_path_value(
+            node.value,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        if value is None:
+            return None
+        return _StaticPathValue(
+            str(PurePosixPath(value.value).parent),
+            anchored_to_repository=value.anchored_to_repository,
+            propagated=True,
+        )
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr.casefold() == "parents"
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, int)
+        and node.slice.value >= 0
+    ):
+        value = _python_static_path_value(
+            node.value.value,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        if value is None:
+            return None
+        try:
+            parent = PurePosixPath(value.value).parents[node.slice.value]
+        except IndexError:
+            return None
+        return _StaticPathValue(
+            str(parent),
+            anchored_to_repository=value.anchored_to_repository,
+            propagated=True,
+        )
+    if not isinstance(node, ast.Call):
+        return None
+    if _python_is_path_constructor(node, path_names, pathlib_modules):
+        argument = _python_call_argument(node)
+        if argument is None:
+            return None
+        return _python_static_path_value(
+            argument,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+    call_name = _python_call_name(node.func)
+    if isinstance(node.func, ast.Attribute) and call_name in {"absolute", "resolve"}:
+        value = _python_static_path_value(
+            node.func.value,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        if value is None:
+            return None
+        return _StaticPathValue(
+            value.value,
+            anchored_to_repository=value.anchored_to_repository,
+            propagated=True,
+        )
+    if isinstance(node.func, ast.Attribute) and call_name == "joinpath":
+        receiver = _python_static_path_value(
+            node.func.value,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        arguments = [
+            _python_static_path_value(
+                argument,
+                entry_path=entry_path,
+                bindings=bindings,
+                path_names=path_names,
+                pathlib_modules=pathlib_modules,
+                memo=memo,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            for argument in node.args
+        ]
+        if receiver is None or any(argument is None for argument in arguments):
+            return None
+        return _static_path_join((receiver, *(argument for argument in arguments if argument)))
+    if call_name in {"dirname", "expandvars"}:
+        argument = _python_call_argument(node)
+        if argument is None:
+            return None
+        value = _python_static_path_value(
+            argument,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        if value is None:
+            return None
+        transformed = (
+            str(PurePosixPath(value.value).parent) if call_name == "dirname" else value.value
+        )
+        return _StaticPathValue(
+            transformed,
+            anchored_to_repository=value.anchored_to_repository,
+            propagated=True,
+        )
+    if call_name == "join":
+        arguments = [
+            _python_static_path_value(
+                argument,
+                entry_path=entry_path,
+                bindings=bindings,
+                path_names=path_names,
+                pathlib_modules=pathlib_modules,
+                memo=memo,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            for argument in node.args
+        ]
+        if not arguments or any(argument is None for argument in arguments):
+            return None
+        return _static_path_join(tuple(argument for argument in arguments if argument))
+    return None
+
+
+def _python_static_consumed_path_references(
+    tree: ast.AST,
+    content: str,
+    *,
+    entry_path: str,
+    line_starts: tuple[int, ...],
+    path_names: set[str],
+    pathlib_modules: set[str],
+    subprocess_modules: set[str],
+    subprocess_names: set[str],
+    base_offset: int,
+) -> Iterable[_PathReference]:
+    bindings = _python_static_bindings(tree)
+    memo: dict[str, _StaticPathValue | None] = {}
+    emitted: set[tuple[str, int, str]] = set()
+
+    def resolved(node: ast.expr) -> _StaticPathValue | None:
+        return _python_static_path_value(
+            node,
+            entry_path=entry_path,
+            bindings=bindings,
+            path_names=path_names,
+            pathlib_modules=pathlib_modules,
+            memo=memo,
+            resolving=set(),
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        candidates: tuple[tuple[ast.expr, str], ...] = ()
+        plugin_only = False
+        if _python_is_subprocess_call(node, subprocess_modules, subprocess_names):
+            argument = _python_call_argument(node)
+            if isinstance(argument, (ast.List, ast.Tuple)):
+                candidates = tuple((element, "execute") for element in argument.elts)
+            elif argument is not None:
+                candidates = ((argument, "execute"),)
+            plugin_only = True
+        else:
+            name = _python_call_name(node.func)
+            if name in _PYTHON_PATH_CALLS:
+                argument = _python_call_argument(node)
+                if argument is not None:
+                    access = "write" if name.startswith("write") else "read"
+                    if name == "open":
+                        access = _python_open_access(node)
+                    candidates = ((argument, access),)
+            elif isinstance(node.func, ast.Attribute) and name in _PYTHON_READ_METHODS:
+                access = _python_open_access(node) if name == "open" else "read"
+                candidates = ((node.func.value, access),)
+
+        for expression, access in candidates:
+            if access == "write":
+                continue
+            value = resolved(expression)
+            if value is None:
+                continue
+            reference = _static_reference_value(value, entry_path)
+            has_plugin_variable = _PLUGIN_VARIABLE_RE.search(reference) is not None
+            if plugin_only and not has_plugin_variable:
+                continue
+            if not value.propagated and not has_plugin_variable:
+                continue
+            offset = base_offset + _node_offset(content, expression, line_starts)
+            identity = (reference, offset, access)
+            if identity in emitted:
+                continue
+            emitted.add(identity)
+            yield _PathReference(reference, offset, access, "python.static")
 
 
 def _python_import_reference(
@@ -999,6 +1366,17 @@ def _python_path_references(
                     "import",
                     "python.import",
                 )
+    yield from _python_static_consumed_path_references(
+        tree,
+        content,
+        entry_path=entry_path,
+        line_starts=line_starts,
+        path_names=path_names,
+        pathlib_modules=pathlib_modules,
+        subprocess_modules=subprocess_modules,
+        subprocess_names=subprocess_names,
+        base_offset=base_offset,
+    )
 
 
 _JAVASCRIPT_REGEX_PREFIX_KEYWORDS = frozenset(
@@ -1328,6 +1706,239 @@ def _javascript_static_imports(
         index = max(cursor, index + 1)
 
 
+def _javascript_matching_pairs(tokens: Sequence[_JavaScriptToken]) -> dict[int, int]:
+    pairs: dict[int, int] = {}
+    stack: list[tuple[str, int]] = []
+    closing = {")": "(", "]": "[", "}": "{"}
+    for index, token in enumerate(tokens):
+        if token.value in {"(", "[", "{"}:
+            stack.append((token.value, index))
+        elif token.value in closing and stack and stack[-1][0] == closing[token.value]:
+            _, opening = stack.pop()
+            pairs[opening] = index
+    return pairs
+
+
+def _javascript_expression_end(
+    tokens: Sequence[_JavaScriptToken],
+    start: int,
+    stop: int,
+    pairs: Mapping[int, int],
+) -> int:
+    index = start
+    while index < stop:
+        if tokens[index].value in {"(", "[", "{"} and index in pairs:
+            index = pairs[index] + 1
+            continue
+        if tokens[index].value in {",", ";"}:
+            return index
+        index += 1
+    return stop
+
+
+def _javascript_argument_spans(
+    tokens: Sequence[_JavaScriptToken],
+    opening: int,
+    closing: int,
+    pairs: Mapping[int, int],
+) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    start = opening + 1
+    index = start
+    while index < closing:
+        if tokens[index].value in {"(", "[", "{"} and index in pairs:
+            index = pairs[index] + 1
+            continue
+        if tokens[index].value == ",":
+            if start < index:
+                spans.append((start, index))
+            start = index + 1
+        index += 1
+    if start < closing:
+        spans.append((start, closing))
+    return tuple(spans)
+
+
+def _javascript_static_bindings(
+    tokens: Sequence[_JavaScriptToken],
+    pairs: Mapping[int, int],
+) -> dict[str, tuple[int, int]]:
+    bindings: dict[str, tuple[int, int]] = {}
+    ambiguous: set[str] = set()
+    for index, token in enumerate(tokens):
+        if token.value not in {"const", "let", "var"} or index + 3 >= len(tokens):
+            continue
+        name = tokens[index + 1]
+        if name.kind != "identifier" or tokens[index + 2].value != "=":
+            continue
+        end = _javascript_expression_end(tokens, index + 3, len(tokens), pairs)
+        normalized = name.value.casefold()
+        if normalized in bindings:
+            ambiguous.add(normalized)
+        elif len(bindings) < _MAX_STATIC_BINDINGS:
+            bindings[normalized] = (index + 3, end)
+    return {name: span for name, span in bindings.items() if name not in ambiguous}
+
+
+def _javascript_static_path_value(
+    tokens: Sequence[_JavaScriptToken],
+    start: int,
+    end: int,
+    *,
+    entry_path: str,
+    pairs: Mapping[int, int],
+    bindings: Mapping[str, tuple[int, int]],
+    memo: dict[str, _StaticPathValue | None],
+    resolving: set[str],
+    depth: int = 0,
+) -> _StaticPathValue | None:
+    if depth >= _MAX_STATIC_PROPAGATION_DEPTH or start >= end:
+        return None
+    if tokens[start].value == "(" and pairs.get(start) == end - 1:
+        return _javascript_static_path_value(
+            tokens,
+            start + 1,
+            end - 1,
+            entry_path=entry_path,
+            pairs=pairs,
+            bindings=bindings,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+    if end - start == 1:
+        token = tokens[start]
+        if token.kind in {"string", "template"}:
+            return _StaticPathValue(token.value)
+        if token.kind != "identifier":
+            return None
+        name = token.value.casefold()
+        if name == "__dirname":
+            return _StaticPathValue(
+                str(PurePosixPath(entry_path).parent),
+                anchored_to_repository=True,
+                propagated=True,
+            )
+        if name in memo:
+            return memo[name]
+        span = bindings.get(name)
+        if span is None or name in resolving:
+            return None
+        resolving.add(name)
+        value = _javascript_static_path_value(
+            tokens,
+            *span,
+            entry_path=entry_path,
+            pairs=pairs,
+            bindings=bindings,
+            memo=memo,
+            resolving=resolving,
+            depth=depth + 1,
+        )
+        resolving.remove(name)
+        if value is not None:
+            value = _StaticPathValue(
+                value.value,
+                anchored_to_repository=value.anchored_to_repository,
+                propagated=True,
+            )
+        memo[name] = value
+        return value
+
+    call_opening: int | None = None
+    call_name: str | None = None
+    if (
+        start + 3 < end
+        and tokens[start].kind == "identifier"
+        and tokens[start + 1].value == "."
+        and tokens[start + 2].kind == "identifier"
+        and tokens[start + 3].value == "("
+    ):
+        call_opening = start + 3
+        call_name = tokens[start + 2].value.casefold()
+    elif start + 1 < end and tokens[start].kind == "identifier" and tokens[start + 1].value == "(":
+        call_opening = start + 1
+        call_name = tokens[start].value.casefold()
+    if (
+        call_opening is not None
+        and pairs.get(call_opening) == end - 1
+        and call_name in {"join", "resolve"}
+    ):
+        values = [
+            _javascript_static_path_value(
+                tokens,
+                argument_start,
+                argument_end,
+                entry_path=entry_path,
+                pairs=pairs,
+                bindings=bindings,
+                memo=memo,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            for argument_start, argument_end in _javascript_argument_spans(
+                tokens,
+                call_opening,
+                end - 1,
+                pairs,
+            )
+        ]
+        if not values or any(value is None for value in values):
+            return None
+        return _static_path_join(tuple(value for value in values if value))
+
+    index = start
+    while index < end:
+        if tokens[index].value in {"(", "[", "{"} and index in pairs:
+            index = pairs[index] + 1
+            continue
+        if tokens[index].value == "+":
+            left = _javascript_static_path_value(
+                tokens,
+                start,
+                index,
+                entry_path=entry_path,
+                pairs=pairs,
+                bindings=bindings,
+                memo=memo,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            right = _javascript_static_path_value(
+                tokens,
+                index + 1,
+                end,
+                entry_path=entry_path,
+                pairs=pairs,
+                bindings=bindings,
+                memo=memo,
+                resolving=resolving,
+                depth=depth + 1,
+            )
+            if left is None or right is None or right.anchored_to_repository:
+                return None
+            return _StaticPathValue(
+                f"{left.value}{right.value}",
+                anchored_to_repository=left.anchored_to_repository,
+                propagated=True,
+            )
+        index += 1
+    return None
+
+
+def _javascript_call_argument_span(
+    tokens: Sequence[_JavaScriptToken],
+    index: int,
+    pairs: Mapping[int, int],
+) -> tuple[int, int] | None:
+    opening = index + 1
+    closing = pairs.get(opening)
+    if opening >= len(tokens) or tokens[opening].value != "(" or closing is None:
+        return None
+    spans = _javascript_argument_spans(tokens, opening, closing, pairs)
+    return spans[0] if spans else None
+
+
 def _javascript_call_reference(
     content: str,
     tokens: list[_JavaScriptToken],
@@ -1356,6 +1967,7 @@ def _javascript_call_reference(
 def _javascript_path_references(
     content: str,
     *,
+    entry_path: str | None = None,
     base_offset: int = 0,
 ) -> Iterable[_PathReference]:
     tokens, failed = _javascript_tokens(content)
@@ -1367,6 +1979,9 @@ def _javascript_path_references(
             "javascript.parse_failure",
         )
         return
+    pairs = _javascript_matching_pairs(tokens)
+    bindings = _javascript_static_bindings(tokens, pairs)
+    memo: dict[str, _StaticPathValue | None] = {}
     for path in _javascript_static_imports(tokens):
         yield _PathReference(
             path.value,
@@ -1383,6 +1998,20 @@ def _javascript_path_references(
         if argument is None:
             continue
         value, offset, dynamic = argument
+        span = _javascript_call_argument_span(tokens, index, pairs)
+        if entry_path is not None and span is not None:
+            static_value = _javascript_static_path_value(
+                tokens,
+                *span,
+                entry_path=entry_path,
+                pairs=pairs,
+                bindings=bindings,
+                memo=memo,
+                resolving=set(),
+            )
+            if static_value is not None:
+                value = _static_reference_value(static_value, entry_path)
+                dynamic = False
         syntax = "javascript.expression" if dynamic else "javascript.call"
         yield _PathReference(
             value,
@@ -1767,7 +2396,11 @@ def _fenced_code_path_references(
             fail_closed=False,
         )
     elif language in {"javascript", "js", "jsx", "node", "ts", "tsx", "typescript"}:
-        references = _javascript_path_references(body, base_offset=base_offset)
+        references = _javascript_path_references(
+            body,
+            entry_path=entry_path,
+            base_offset=base_offset,
+        )
     elif language in {"bash", "sh", "shell", "zsh"}:
         references = _shell_path_references(
             body,
@@ -1780,8 +2413,14 @@ def _fenced_code_path_references(
         if reference.access == "import" and _decode_reference(reference.value).startswith(
             ("./", "../")
         ):
-            continue
-        yield reference
+            yield _PathReference(
+                reference.value,
+                reference.offset,
+                reference.access,
+                f"markdown.fence.{reference.syntax}",
+            )
+        else:
+            yield reference
 
 
 def _markdown_inline_code_has_dependency_context(
@@ -1789,13 +2428,29 @@ def _markdown_inline_code_has_dependency_context(
     match: re.Match[str],
 ) -> bool:
     line_start = content.rfind("\n", 0, match.start()) + 1
-    if _MARKDOWN_INLINE_DEPENDENCY_ACTION_RE.search(content[line_start : match.start()]):
-        return True
+    line_end = content.find("\n", match.end())
+    if line_end < 0:
+        line_end = len(content)
+    prefix = content[line_start : match.start()]
+    suffix = content[match.end() : line_end]
     body = match.group("body").strip()
     if not any(character.isspace() for character in body) and _looks_shell_path(body):
-        return False
+        line = f"{prefix} {suffix}"
+        proven_output_context = (
+            _MARKDOWN_INLINE_WRITE_ACTION_RE.search(prefix) is not None
+            or _MARKDOWN_INLINE_OUTPUT_NOUN_RE.search(line) is not None
+            or _MARKDOWN_INLINE_MARKETPLACE_LOCATION_RE.search(prefix) is not None
+            or _MARKDOWN_INLINE_OPTIONAL_WORKSPACE_RE.search(prefix) is not None
+            or _MARKDOWN_INLINE_SCHEMA_EXAMPLE_RE.search(prefix) is not None
+        )
+        return not proven_output_context
     tokens, failed = _shell_tokens(body)
     return not failed and len(tokens) > 1
+
+
+def _development_fence_reference_is_relevant(reference: _PathReference) -> bool:
+    decoded = _decode_reference(reference.value)
+    return _PLUGIN_VARIABLE_RE.search(decoded) is not None or ".." in PurePosixPath(decoded).parts
 
 
 def _markdown_frontmatter_bounds(content: str) -> tuple[int, int, int] | None:
@@ -2035,7 +2690,7 @@ def _markdown_path_references(
         )
     structural_exclusions = _merge_offset_ranges(structural_ranges)
     development_ranges = _markdown_development_ranges(content, structural_exclusions)
-    excluded_ranges = _merge_offset_ranges((*structural_exclusions, *development_ranges))
+    excluded_ranges = structural_exclusions
     code_span_ranges = _markdown_code_span_ranges(content, structural_exclusions)
     reference_exclusions = _merge_offset_ranges((*excluded_ranges, *code_span_ranges))
 
@@ -2115,9 +2770,7 @@ def _markdown_path_references(
             yield _PathReference(value, offset, "read", "markdown.reference")
 
     for fence in fences:
-        if _offset_in_ranges(fence.start, development_ranges):
-            continue
-        yield from _fenced_code_path_references(
+        references = _fenced_code_path_references(
             fence.language,
             content[fence.body_start : fence.body_end],
             entry_path=entry_path,
@@ -2125,6 +2778,14 @@ def _markdown_path_references(
             by_path=by_path,
             base_offset=fence.body_start,
         )
+        if _offset_in_ranges(fence.start, development_ranges):
+            yield from (
+                reference
+                for reference in references
+                if _development_fence_reference_is_relevant(reference)
+            )
+        else:
+            yield from references
 
     for match in _MARKDOWN_INLINE_CODE_RE.finditer(content):
         if _offset_in_ranges(match.start(), excluded_ranges):
@@ -2165,7 +2826,7 @@ def _path_references(
     elif suffix in _JAVASCRIPT_SUFFIXES or any(
         runtime in shebang for runtime in ("bun", "deno", "node")
     ):
-        yield from _javascript_path_references(content)
+        yield from _javascript_path_references(content, entry_path=entry.path)
     elif suffix in _SHELL_SUFFIXES or entry.executable or content.startswith("#!"):
         yield from _shell_path_references(content)
     elif suffix == ".json":
@@ -3049,15 +3710,7 @@ def _complement_offset_ranges(
 
 def _markdown_raw_context(content: str) -> _RawPluginContext:
     fences = _markdown_fences(content)
-    structural_ranges: list[tuple[int, int]] = [(fence.start, fence.end) for fence in fences]
-    frontmatter = _markdown_frontmatter_bounds(content)
-    if frontmatter is not None:
-        structural_ranges.append((0, frontmatter[2]))
-    development_ranges = _markdown_development_ranges(
-        content,
-        _merge_offset_ranges(structural_ranges),
-    )
-    ranges: list[tuple[int, int]] = list(development_ranges)
+    ranges: list[tuple[int, int]] = []
     active_ranges: list[tuple[int, int]] = []
     python_languages = {"py", "python"}
     javascript_languages = {
@@ -3071,8 +3724,6 @@ def _markdown_raw_context(content: str) -> _RawPluginContext:
     }
     shell_languages = {"bash", "sh", "shell", "zsh"}
     for fence in fences:
-        if _offset_in_ranges(fence.start, development_ranges):
-            continue
         body = content[fence.body_start : fence.body_end]
         if fence.language in python_languages:
             ranges.extend(_python_raw_inert_ranges(body, base_offset=fence.body_start))
@@ -3368,6 +4019,8 @@ def _is_owned_runtime_path(
 
 
 def _is_proven_package_context(reference: _PathReference) -> bool:
+    if reference.access == "import" and reference.syntax.startswith("markdown.fence."):
+        return False
     return reference.access == "import" or reference.syntax.startswith(("json.", "markdown."))
 
 
@@ -3375,6 +4028,8 @@ def _missing_reference_is_package_context(
     reference: _PathReference,
     value: str,
 ) -> bool:
+    if reference.access == "import" and reference.syntax.startswith("markdown.fence."):
+        return False
     if reference.syntax.startswith(("json.", "markdown.")):
         return True
     if reference.syntax == "python.import":
@@ -3466,7 +4121,19 @@ def _analyze_forward_paths(
                 continue
             if reference.access == "read" and decoded in written_values:
                 continue
-            if _PLUGIN_VARIABLE_RE.search(decoded) is not None:
+            plugin_variable = _PLUGIN_VARIABLE_RE.search(decoded)
+            if plugin_variable is not None:
+                if collector.has_capacity(ReasonCode.PLUGIN_ROOT_VARIABLE):
+                    collector.add(
+                        ReasonCode.PLUGIN_ROOT_VARIABLE,
+                        _text_evidence(
+                            entry.path,
+                            content,
+                            offset + plugin_variable.start(),
+                            plugin_variable.group(0),
+                            "static.forward.plugin_root_variable",
+                        ),
+                    )
                 continue
             if reference.syntax.endswith(".expression") or (
                 reference.syntax != "json.glob" and _DYNAMIC_RE.search(decoded) is not None
@@ -3991,7 +4658,7 @@ def _analyze_boundary_reverse_dependencies(
             if (
                 match := re.search(
                     rf"(?<![A-Za-z0-9_./-])(?:\./)?{re.escape(skill_root)}"
-                    rf"(?:/[A-Za-z0-9_./-]+)?",
+                    rf"(?:/[A-Za-z0-9_./-]+)?(?![A-Za-z0-9_.-])",
                     path_search_content,
                 )
             )

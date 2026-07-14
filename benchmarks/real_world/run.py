@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import secrets
 import sys
 import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -160,7 +163,7 @@ class CaseResult:
     candidate_agreement: bool | None
     reason_code_match: bool | None
     error_agreement: bool
-    agreement: bool
+    agreement: bool | None
     duration_ms: float
 
     def to_dict(self) -> JsonObject:
@@ -202,15 +205,24 @@ class BenchmarkResult:
     cases: tuple[CaseResult, ...]
 
     def to_dict(self) -> JsonObject:
-        agreed = sum(item.agreement for item in self.cases)
+        source_semantic_verified = sum(item.agreement is True for item in self.cases)
+        expected_operational_guards = sum(
+            item.expected_error is not None
+            and item.actual_error is not None
+            and item.error_agreement
+            for item in self.cases
+        )
         return {
             "schemaVersion": _SCHEMA_VERSION,
             "mode": self.mode,
             "cases": [item.to_dict() for item in self.cases],
             "summary": {
                 "total": len(self.cases),
-                "agreed": agreed,
-                "disagreed": len(self.cases) - agreed,
+                "sourceSemanticVerified": source_semantic_verified,
+                "expectedOperationalGuards": expected_operational_guards,
+                "disagreed": (
+                    len(self.cases) - source_semantic_verified - expected_operational_guards
+                ),
                 "operationalErrors": sum(item.actual_error is not None for item in self.cases),
             },
         }
@@ -620,7 +632,7 @@ def _compare_candidates(
         if root in actual_by_root
     )
     reason_match = expected_roots <= actual_roots and all(
-        set(item.reason_codes) <= set(actual_by_root[root].reason_codes)
+        set(item.reason_codes) == set(actual_by_root[root].reason_codes)
         for root, item in expected_by_root.items()
     )
     return candidate_match, reason_match
@@ -667,7 +679,11 @@ def run_benchmark(
                     candidate_agreement=None,
                     reason_code_match=None,
                     error_agreement=error_agreement,
-                    agreement=error_agreement,
+                    agreement=(
+                        None
+                        if error_agreement and case.expected.operational_error is not None
+                        else False
+                    ),
                     duration_ms=duration_ms,
                 )
             )
@@ -740,9 +756,10 @@ def render_markdown(result: BenchmarkResult) -> str:
         "# Real-world skill importer benchmark",
         "",
         f"Mode: `{result.mode}`. Cases: {summary['total']}. "
-        f"Agreement: {summary['agreed']}/{summary['total']}.",
+        f"Source/semantic verified: {summary['sourceSemanticVerified']}/{summary['total']}. "
+        f"Expected operational guards: {summary['expectedOperationalGuards']}.",
         "",
-        "| Case | SHA | Expected | Actual | Agreement | Reasons | Duration | Error |",
+        "| Case | SHA | Expected | Actual | Outcome | Reasons | Duration | Error |",
         "|---|---|---|---|---|---|---:|---|",
     ]
     for item in result.cases:
@@ -769,7 +786,15 @@ def render_markdown(result: BenchmarkResult) -> str:
                             item.expected_candidates, item.actual_candidates, use_actual=True
                         )
                     ),
-                    "yes" if item.agreement else "no",
+                    (
+                        "verified"
+                        if item.agreement is True
+                        else (
+                            "guard match"
+                            if item.agreement is None and item.error_agreement
+                            else "disagreed"
+                        )
+                    ),
                     (
                         "n/a"
                         if item.reason_code_match is None
@@ -794,23 +819,109 @@ def write_outputs(
     *,
     json_path: Path,
     markdown_path: Path,
+    protected_paths: Sequence[tuple[str, Path]] = (),
 ) -> None:
     """Write deterministic JSON and Markdown result files."""
-    _ensure_distinct_paths((("JSON", json_path), ("Markdown", markdown_path)))
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(
-        json.dumps(
-            result.to_dict(),
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-            allow_nan=False,
+    _ensure_distinct_paths((*protected_paths, ("JSON", json_path), ("Markdown", markdown_path)))
+    json_target, json_parent_fd = _pin_output_parent(json_path)
+    try:
+        markdown_target, markdown_parent_fd = _pin_output_parent(markdown_path)
+        try:
+            _ensure_distinct_paths(
+                (
+                    *protected_paths,
+                    ("pinned JSON", json_target),
+                    ("pinned Markdown", markdown_target),
+                )
+            )
+            _atomic_write_text(
+                json_target.name,
+                json.dumps(
+                    result.to_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                parent_fd=json_parent_fd,
+            )
+            _atomic_write_text(
+                markdown_target.name,
+                render_markdown(result),
+                parent_fd=markdown_parent_fd,
+            )
+        finally:
+            os.close(markdown_parent_fd)
+    finally:
+        os.close(json_parent_fd)
+
+
+def _pin_output_parent(path: Path) -> tuple[Path, int]:
+    requested = Path(os.path.abspath(path.expanduser()))
+    parent = requested.parent.resolve(strict=False)
+    target = parent / requested.name
+    parts = parent.parts
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(parts[0], flags)
+    try:
+        for part in parts[1:]:
+            try:
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return target, descriptor
+
+
+def _atomic_write_text(name: str, content: str, *, parent_fd: int) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = -1
+    temporary_name = ""
+    for _attempt in range(100):
+        temporary_name = f".{name}.{secrets.token_hex(8)}"
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                mode=0o600,
+                dir_fd=parent_fd,
+            )
+            break
+        except FileExistsError:
+            continue
+    else:  # pragma: no cover - cryptographically random collisions
+        raise FileExistsError(f"could not allocate temporary output for {name}")
+
+    temporary_exists = True
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
         )
-        + "\n",
-        encoding="utf-8",
-    )
-    markdown_path.write_text(render_markdown(result), encoding="utf-8")
+        temporary_exists = False
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    finally:
+        if temporary_exists:
+            with suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_fd)
 
 
 def _ensure_distinct_paths(named_paths: Sequence[tuple[str, Path]]) -> None:
@@ -874,13 +985,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         manifest = load_manifest(args.manifest)
         result = run_benchmark(manifest, use_llm=args.with_llm)
-        write_outputs(result, json_path=args.json_out, markdown_path=args.markdown_out)
+        write_outputs(
+            result,
+            json_path=args.json_out,
+            markdown_path=args.markdown_out,
+            protected_paths=(("manifest", args.manifest),),
+        )
     except (ManifestValidationError, OSError, ValueError) as exc:
         print(f"benchmark failed: {exc}", file=sys.stderr)
         return 2
     summary = _scan_object(result.to_dict()["summary"], "summary")
     print(
-        f"benchmark complete: {summary['agreed']}/{summary['total']} cases agree; "
+        "benchmark complete: "
+        f"{summary['sourceSemanticVerified']} source/semantic verified; "
+        f"{summary['expectedOperationalGuards']} expected operational guards; "
+        f"{summary['disagreed']} disagreed; "
         f"JSON={args.json_out} Markdown={args.markdown_out}"
     )
     return 0

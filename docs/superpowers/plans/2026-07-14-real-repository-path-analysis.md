@@ -128,7 +128,7 @@ Run:
 ```bash
 uv run pytest -q
 uv run ruff check .
-uv run mypy src tests
+uv run mypy src
 uv lock --check
 uv build
 ```

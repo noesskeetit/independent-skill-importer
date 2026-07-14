@@ -268,7 +268,9 @@ static `ambiguous`. Детерминированные `portable`, `plugin_bound
 
 CLI включает review по умолчанию; `--no-llm` оставляет static ambiguity без сети. Текущий adapter
 использует Cloud.ru chat completions, model `zai-org/GLM-5.1` по умолчанию и ключ только из process
-environment `LLM_API_KEY`. `.env` не загружается и не изменяется.
+environment: primary `FM_API_KEY`, затем compatibility fallback `LLM_API_KEY`, если primary
+variable отсутствует. Явный invalid primary fail-closed и не переключается на fallback. `.env` не
+загружается и не изменяется.
 
 Fail-closed contract:
 

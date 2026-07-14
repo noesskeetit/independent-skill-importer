@@ -48,7 +48,8 @@ enclosing runtime.
   десяти вручную размеченным GitHub cases, pinned на полные commit SHA. Manifest находится в
   [`benchmarks/real_world/cases.json`](benchmarks/real_world/cases.json); обычные tests полностью
   offline, а сеть включается только явным `--online`. Проверенный static baseline:
-  [10/10 cases](benchmarks/real_world/BASELINE.md).
+  [9/9 source/semantic cases + 1 expected operational guard](benchmarks/real_world/BASELINE.md)
+  без disagreements.
 - [Аудит и следующие шаги](AUDIT_AND_NEXT_STEPS.md) отделяет уже реализованные функциональные
   исправления от отложенного combined audit и production backlog.
 
@@ -199,10 +200,12 @@ FM не вызывается для static `portable`, `plugin_bound`, `invalid`
 - timeout: 20 seconds;
 - `temperature: 0`, JSON response format и disabled thinking.
 
-Ключ берётся **только** из process environment:
+Ключ берётся **только** из process environment. `FM_API_KEY` — primary name;
+`LLM_API_KEY` поддерживается как compatibility fallback, только если primary variable вообще
+отсутствует:
 
 ```bash
-export LLM_API_KEY='...'
+export FM_API_KEY='...'
 uv run skill-importer scan ../source
 ```
 
@@ -212,9 +215,11 @@ inventory и, если находится внутри portable skill root, бы
 исключается из FM envelope. Ключ нельзя передать CLI option; он не включается в semantic request
 body, scan JSON, errors или import manifest.
 
-Если static `ambiguous` требует review, но `LLM_API_KEY` отсутствует/некорректен, network call не
-выполняется: candidate остаётся `ambiguous` с `FM_REVIEW_UNAVAILABLE`. То же fail-closed поведение
-применяется к timeout, transport failure, invalid JSON, hash mismatch и invented evidence.
+Если static `ambiguous` требует review, но оба ключа отсутствуют либо выбранный по этому precedence
+ключ некорректен, network call не выполняется: candidate остаётся `ambiguous` с
+`FM_REVIEW_UNAVAILABLE`. Явно заданный пустой/некорректный `FM_API_KEY` не откатывается к legacy
+key. То же fail-closed поведение применяется к timeout, transport failure, invalid JSON, hash
+mismatch и invented evidence.
 
 Перед отправкой repository data ограничиваются context budget, sensitive files исключаются, а
 credential-like values редактируются. Ответ привязан к SHA-256 exact canonical envelope; evidence

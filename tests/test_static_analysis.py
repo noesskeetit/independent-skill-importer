@@ -1,8 +1,9 @@
 """Evidence-first static portability analysis."""
 
+import ast
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -566,8 +567,13 @@ def test_markdown_bare_inline_destination_paths_are_not_dependencies(
             ".agents/plugins/marketplace.json": json.dumps({"plugins": []}),
             ".agents/skills/plugin-creator/SKILL.md": _skill(
                 "The marketplace config is `.agents/plugins/marketplace.json`.\n"
+                "If the current Git repo already has `.agents/plugins/marketplace.json`, ask "
+                "which marketplace to update.\n"
                 "Generated plugin packages use `./plugins/` as their destination.\n"
                 "Keep source.path as `./plugins/<plugin-name>`.\n"
+                "- Repo/team plugin: `./plugins/<plugin-name>`\n"
+                "- Example: with `~/.agents/plugins/marketplace.json`, "
+                "`./plugins/<plugin-name>` resolves under the selected destination.\n"
             ),
         },
         root=".agents/skills/plugin-creator",
@@ -578,7 +584,7 @@ def test_markdown_bare_inline_destination_paths_are_not_dependencies(
     assert result.reason_codes == frozenset({ReasonCode.STANDALONE_NO_PLUGIN_BOUNDARY})
 
 
-@pytest.mark.parametrize("verb", ["Run", "Read", "Load", "Source", "Execute"])
+@pytest.mark.parametrize("verb", ["Run", "Read", "Load", "Source", "Execute", "Use"])
 def test_markdown_dependency_action_preserves_bare_inline_path(
     verb: str,
     tmp_path: Path,
@@ -592,6 +598,41 @@ def test_markdown_dependency_action_preserves_bare_inline_path(
             ),
         },
         root=".agents/skills/plugin-creator",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_markdown_dependency_action_allows_helper_noun_before_inline_path(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/tool.py": "pass\n",
+            "skills/alpha/SKILL.md": _skill("Run the helper at `../shared/tool.py`.\n"),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["Invoke ", "Call ", "The runtime helper is "],
+)
+def test_markdown_inline_existing_path_is_fail_closed_without_proven_output_context(
+    prefix: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/shared/tool.py": "pass\n",
+            "skills/alpha/SKILL.md": _skill(f"{prefix}`../shared/tool.py`.\n"),
+        },
     )
 
     assert result.classification is Classification.PLUGIN_BOUND
@@ -984,6 +1025,23 @@ def test_review_generated_output_read_is_not_an_input_dependency(tmp_path: Path)
         }
         & result.reason_codes
     )
+
+
+def test_markdown_operational_fence_existing_outside_import_is_nonportable(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.js": "export {};\n",
+            "skills/alpha/SKILL.md": _skill(
+                "Run this module:\n```js\nimport '../../runtime/tool.js';\n```\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
 
 
 @pytest.mark.parametrize(
@@ -1808,6 +1866,21 @@ def test_reverse_boundary_relative_skill_path_from_command_is_plugin_bound(
     assert evidence.value == "skills/alpha/SKILL.md"
 
 
+def test_reverse_similar_skill_path_does_not_match_candidate_prefix(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "runtime/engine.py"}),
+            "runtime/engine.py": 'open("skills/alpha-other/SKILL.md")',
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha-other/SKILL.md": _skill(name="alpha-other"),
+        },
+    )
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert ReasonCode.REFERENCED_BY_PLUGIN_RUNTIME not in result.reason_codes
+
+
 def test_outer_plugin_runtime_reference_reaches_nested_skill_package(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
@@ -2621,6 +2694,24 @@ def test_skill_root_equal_to_mixed_plugin_root_is_plugin_bound(tmp_path: Path) -
     assert ReasonCode.PLUGIN_RUNTIME_INSIDE_SKILL_ROOT in result.reason_codes
 
 
+def test_root_openclaw_plugin_runtime_is_not_importable_as_skill_payload(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "openclaw.plugin.json": json.dumps({"id": "root-plugin"}),
+            "package.json": json.dumps({"openclaw": {"extensions": ["./index.ts"]}}),
+            "index.ts": "export default {};\n",
+            "SKILL.md": _skill(),
+        },
+        root=".",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_RUNTIME_INSIDE_SKILL_ROOT in result.reason_codes
+
+
 def test_skill_root_equal_to_truly_skills_only_plugin_root_is_portable(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
@@ -2923,7 +3014,7 @@ def test_deep_manifest_is_bounded_and_does_not_abort_scan(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("heading", ["Development", "Tests", "Validate"])
-def test_corrected_review_development_sections_are_not_runtime_dependencies(
+def test_development_heading_does_not_hide_explicit_plugin_dependencies(
     heading: str,
     tmp_path: Path,
 ) -> None:
@@ -2939,13 +3030,13 @@ def test_corrected_review_development_sections_are_not_runtime_dependencies(
         },
     )
 
-    assert result.classification is Classification.PORTABLE
-    assert ReasonCode.PLUGIN_ROOT_VARIABLE not in result.reason_codes
-    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
 
 
 @pytest.mark.parametrize("underline", ["===========", "-----------"])
-def test_corrected_review_setext_development_section_is_inert(
+def test_setext_development_heading_does_not_hide_explicit_plugin_dependencies(
     underline: str,
     tmp_path: Path,
 ) -> None:
@@ -2962,9 +3053,34 @@ def test_corrected_review_setext_development_section_is_inert(
         },
     )
 
-    assert result.classification is Classification.PORTABLE
-    assert ReasonCode.PLUGIN_ROOT_VARIABLE not in result.reason_codes
-    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+
+
+def test_development_fence_tracks_parent_traversal_but_not_bare_dev_validator(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/tool.js": "export {};\n",
+            "scripts/validate-skills": "#!/bin/sh\nexit 0\n",
+            "skills/alpha/SKILL.md": _skill(
+                "## Development\n"
+                "```bash\n"
+                "scripts/validate-skills\n"
+                "node ../../runtime/tool.js\n"
+                "```\n"
+            ),
+        },
+        executables=frozenset({"scripts/validate-skills"}),
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    reason = _reason(result, ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT)
+    assert any("../../runtime/tool.js" in evidence.value for evidence in reason.evidence)
+    assert all("scripts/validate-skills" not in evidence.value for evidence in reason.evidence)
 
 
 def test_corrected_review_real_session_viewer_validate_section_is_inert(
@@ -3291,6 +3407,85 @@ def test_corrected_review_indirect_path_read_still_tracks_dependency(tmp_path: P
 
 
 @pytest.mark.parametrize(
+    "expression",
+    [
+        'root / "runtime/engine.py"',
+        'root.joinpath("runtime", "engine.py")',
+    ],
+)
+def test_python_file_relative_composed_runtime_read_is_plugin_bound(
+    expression: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "runtime/engine.py"}),
+            "runtime/engine.py": "def run(): pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runner.py": (
+                "from pathlib import Path\n"
+                "root = Path(__file__).resolve().parents[2]\n"
+                f"engine = {expression}\n"
+                "engine.read_text()\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+    assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE in result.reason_codes
+
+
+def test_javascript_dirname_join_runtime_read_is_plugin_bound(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "plugin.json": json.dumps({"runtime": "runtime/engine.js"}),
+            "runtime/engine.js": "export const run = () => {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/runner.js": (
+                'const path = require("node:path");\n'
+                'const { readFileSync } = require("node:fs");\n'
+                'readFileSync(path.join(__dirname, "../../../runtime/engine.js"), "utf8");\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
+    assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE in result.reason_codes
+
+
+def test_python_indirect_path_analysis_walk_count_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_walk = static_analysis_module.ast.walk
+    walk_calls = 0
+
+    def counted_walk(tree: ast.AST) -> Iterator[ast.AST]:
+        nonlocal walk_calls
+        walk_calls += 1
+        return original_walk(tree)
+
+    monkeypatch.setattr(static_analysis_module.ast, "walk", counted_walk)
+    bindings = "\n".join(
+        f'p{index} = Path("outputs/{index}.txt")\np{index}.write_text("ok")' for index in range(64)
+    )
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/render.py": f"from pathlib import Path\n{bindings}\n",
+        },
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert walk_calls < 20
+
+
+@pytest.mark.parametrize(
     ("path", "content"),
     [
         ("skills/alpha/tests/fixture.py", 'fixture = "${PLUGIN_ROOT}/tool.py"\n'),
@@ -3315,6 +3510,50 @@ def test_corrected_review_inert_plugin_root_fixture_does_not_bind(
 
     assert result.classification is Classification.PORTABLE
     assert ReasonCode.PLUGIN_ROOT_VARIABLE not in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        "open(tool).read()",
+        "Path(tool).read_text()",
+    ],
+)
+def test_python_expandvars_plugin_root_consumed_by_read_is_plugin_bound(
+    sink: str,
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runtime.py": (
+                "import os\n"
+                "from pathlib import Path\n"
+                'tool = os.path.expandvars("$PLUGIN_ROOT/scripts/tool.py")\n'
+                f"{sink}\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
+
+
+def test_python_subprocess_command_plugin_root_is_plugin_bound(tmp_path: Path) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runtime.py": (
+                "import subprocess\n"
+                'subprocess.run(["bash", "-c", "python $PLUGIN_ROOT/scripts/tool.py"], check=True)\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.PLUGIN_ROOT_VARIABLE in result.reason_codes
 
 
 @pytest.mark.parametrize(

@@ -359,6 +359,19 @@ def test_root_skill_manifest_runtime_declaration_keeps_package_mixed() -> None:
     assert detect_boundaries(inventory)[0].package_kind == "mixed"
 
 
+def test_root_openclaw_extension_declaration_keeps_package_mixed() -> None:
+    inventory = _inventory(
+        {
+            "openclaw.plugin.json": json.dumps({"id": "root-plugin"}),
+            "package.json": json.dumps({"openclaw": {"extensions": ["./index.ts"]}}),
+            "index.ts": "export default {};\n",
+            "SKILL.md": "---\nname: x\ndescription: x\n---\n",
+        }
+    )
+
+    assert detect_boundaries(inventory)[0].package_kind == "mixed"
+
+
 def test_root_skill_known_runtime_directory_keeps_package_mixed() -> None:
     inventory = _inventory(
         {

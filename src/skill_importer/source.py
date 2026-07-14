@@ -359,6 +359,10 @@ def _copy_local_tree(source: Path, destination: Path, limits: Limits) -> None:
                 finally:
                     os.close(child_fd)
             elif stat.S_ISREG(child_stat.st_mode):
+                if child_stat.st_nlink != 1:
+                    raise ImporterError(
+                        "PATH_TRAVERSAL", "source contains an unsafe hardlinked file"
+                    )
                 if child_stat.st_size > limits.max_file_bytes:
                     raise ImporterError("FILE_TOO_LARGE", "source file exceeds the file size limit")
                 flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -368,6 +372,10 @@ def _copy_local_tree(source: Path, destination: Path, limits: Limits) -> None:
                     if not stat.S_ISREG(current_stat.st_mode):
                         raise ImporterError(
                             "UNSUPPORTED_ENTRY", "source entry changed to an unsafe type"
+                        )
+                    if current_stat.st_nlink != 1:
+                        raise ImporterError(
+                            "PATH_TRAVERSAL", "source contains an unsafe hardlinked file"
                         )
                     copied = 0
                     with child_target.open("xb") as output:
@@ -386,6 +394,10 @@ def _copy_local_tree(source: Path, destination: Path, limits: Limits) -> None:
                                     "SCAN_LIMIT_EXCEEDED", "source exceeds the scan byte limit"
                                 )
                             output.write(chunk)
+                    if os.fstat(file_fd).st_nlink != 1:
+                        raise ImporterError(
+                            "PATH_TRAVERSAL", "source contains an unsafe hardlinked file"
+                        )
                     os.chmod(child_target, 0o700 if current_stat.st_mode & 0o111 else 0o600)
                 finally:
                     os.close(file_fd)

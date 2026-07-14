@@ -157,20 +157,20 @@
       }
     },
     {
-      "id": "C05-anthropic-reverse-dependency",
+      "id": "C05-openai-reverse-dependency",
       "category": "reverse_plugin_runtime_dependency",
       "coverageMode": "exact",
       "source": {
-        "inputUrl": "https://github.com/anthropics/claude-plugins-official/tree/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/example-plugin/skills/example-command",
-        "canonicalUrl": "https://github.com/anthropics/claude-plugins-official.git",
-        "commitSha": "ba1611e22a569ea036c3bc1c6889a41319130fe8"
+        "inputUrl": "https://github.com/openai/plugins/tree/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/cloudflare/skills/building-ai-agent-on-cloudflare",
+        "canonicalUrl": "https://github.com/openai/plugins.git",
+        "commitSha": "11c74d6ba24d3a6d48f54a194cd00ef3beea18f9"
       },
       "expected": {
         "operationalError": null,
         "candidates": [
           {
-            "root": "plugins/example-plugin/skills/example-command",
-            "name": "example-command",
+            "root": "plugins/cloudflare/skills/building-ai-agent-on-cloudflare",
+            "name": "building-ai-agent-on-cloudflare",
             "staticClassification": "plugin_bound",
             "finalClassification": "plugin_bound",
             "staticReasonCodes": [
@@ -180,8 +180,9 @@
               "REFERENCED_BY_PLUGIN_RUNTIME"
             ],
             "provenanceLinks": [
-              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/example-plugin/commands/example-command.md#L1-L11",
-              "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/example-plugin/skills/example-command/SKILL.md#L1-L10"
+              "https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/cloudflare/.codex-plugin/plugin.json#L1-L25",
+              "https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/cloudflare/commands/build-agent.md#L15-L23",
+              "https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/cloudflare/skills/building-ai-agent-on-cloudflare/SKILL.md#L1-L12"
             ]
           }
         ]

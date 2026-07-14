@@ -170,6 +170,14 @@ def _default_transport_factory(limits: Limits) -> FmTransport:
 
 
 def _environment_api_key() -> str | None:
+    """Prefer explicitly configured FM_API_KEY, then fall back to LLM_API_KEY.
+
+    Presence, rather than truthiness, controls precedence so an explicitly empty or
+    malformed primary value reaches the reviewer validation and fails closed instead
+    of silently selecting the legacy key.
+    """
+    if "FM_API_KEY" in os.environ:
+        return os.environ["FM_API_KEY"]
     return os.environ.get("LLM_API_KEY")
 
 

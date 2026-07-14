@@ -47,6 +47,7 @@ def _scan(
 class _CountingTransport:
     def __init__(self) -> None:
         self.calls = 0
+        self.authorizations: list[str | None] = []
 
     def send(
         self,
@@ -56,8 +57,9 @@ class _CountingTransport:
         *,
         timeout_seconds: int,
     ) -> bytes:
-        del endpoint, headers, request, timeout_seconds
+        del endpoint, request, timeout_seconds
         self.calls += 1
+        self.authorizations.append(headers.get("Authorization"))
         return b"{}"
 
 
@@ -232,6 +234,59 @@ def test_default_missing_key_records_fail_closed_fm_reason_without_network(tmp_p
     assert skill.classification is Classification.AMBIGUOUS
     assert skill.analysis_method == "static+fm"
     assert ReasonCode.FM_REVIEW_UNAVAILABLE in skill.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("primary_key", "expected_key"),
+    [("primary-test-key", "primary-test-key"), (None, "legacy-test-key")],
+)
+def test_default_key_provider_uses_documented_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    primary_key: str | None,
+    expected_key: str,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    _mixed_tree(source)
+    if primary_key is None:
+        monkeypatch.delenv("FM_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("FM_API_KEY", primary_key)
+    monkeypatch.setenv("LLM_API_KEY", "legacy-test-key")
+    transport = _CountingTransport()
+
+    pipeline = SkillImporterPipeline(
+        fm_transport_factory=lambda limits: transport,
+    )
+
+    pipeline.scan(SourceSpec.local(source))
+
+    assert transport.authorizations == [f"Bearer {expected_key}"]
+
+
+@pytest.mark.parametrize("primary_key", ["", "bad\r\nInjected: yes"])
+def test_explicit_invalid_fm_api_key_does_not_fall_back_to_legacy_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    primary_key: str,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    _mixed_tree(source)
+    monkeypatch.setenv("FM_API_KEY", primary_key)
+    monkeypatch.setenv("LLM_API_KEY", "legacy-test-key")
+
+    transport = _CountingTransport()
+    pipeline = SkillImporterPipeline(
+        fm_transport_factory=lambda limits: transport,
+    )
+
+    skill = pipeline.scan(SourceSpec.local(source)).skills[0]
+
+    assert skill.classification is Classification.AMBIGUOUS
+    assert ReasonCode.FM_REVIEW_UNAVAILABLE in skill.reason_codes
+    assert transport.calls == 0
 
 
 def test_no_llm_keeps_static_ambiguity_and_does_not_read_key(tmp_path: Path) -> None:

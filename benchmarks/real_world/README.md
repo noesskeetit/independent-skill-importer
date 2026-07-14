@@ -38,9 +38,10 @@ uv run python benchmarks/real_world/run.py \
   --markdown-out .artifacts/real-world-benchmark-fm.md
 ```
 
-FM lane использует уже существующую конфигурацию importer и `LLM_API_KEY` из
-process environment. Runner не читает и не создаёт `.env`, не реализует свой FM
-client и не вызывает FM для deterministic decisions.
+FM lane использует уже существующую конфигурацию importer: primary `FM_API_KEY`
+или compatibility fallback `LLM_API_KEY` из process environment. Runner не читает
+и не создаёт `.env`, не реализует свой FM client и не вызывает FM для
+deterministic decisions.
 
 ## Что находится в manifest
 
@@ -51,18 +52,22 @@ client и не вызывает FM для deterministic decisions.
 - optional discovery `subpath`;
 - `exact` либо `focused` coverage mode;
 - manual static и final classifications;
-- обязательное подмножество reason codes;
+- точный набор reason codes для выбранного lane;
 - source-addressable provenance links.
 
 `focused` используется только для Microsoft duplicate case: scan под `.github`
 возвращает много candidates, а oracle сравнивает две известные exact copies.
 Остальные candidates остаются в JSON result и не скрываются.
 
-Manual labels никогда не переписываются фактическим output. Несовпадение
-становится benchmark result (`agreement=false`), а не новой «истиной» manifest.
+Manual labels никогда не переписываются фактическим output. Semantic/source
+несовпадение становится benchmark result (`agreement=false`), а не новой
+«истиной» manifest. Совпавший expected operational guard хранится отдельно:
+`errorAgreement=true`, а `agreement=null`, потому что source identity, SHA и
+semantic oracle при таком раннем отказе не проверены.
 
-Текущий проверенный static результат и его ограничения зафиксированы в
-[`BASELINE.md`](BASELINE.md): 10/10 agreement на pinned corpus от 2026-07-14.
+Проверенный static baseline и его ограничения зафиксированы в
+[`BASELINE.md`](BASELINE.md): 9/9 source/semantic cases, 1/1 expected operational
+guard и 0 disagreements на pinned corpus от 2026-07-14.
 
 ## Expected operational error
 
@@ -77,6 +82,10 @@ OpenClaw case честно размечен двумя слоями:
 expectation даст disagreement. После ручной проверки manifest можно будет
 изменить отдельным review; runner сам labels не мутирует.
 
+Поэтому summary разделяет `sourceSemanticVerified`,
+`expectedOperationalGuards` и `disagreed`: совпавший guard C08 не увеличивает
+число source/semantic-verified cases.
+
 ## Outputs
 
 JSON сохраняет для каждого case:
@@ -86,7 +95,7 @@ JSON сохраняет для каждого case:
 - expected и все actual candidates;
 - selected expected/actual classification;
 - reason-code match;
-- SHA, candidate, error и overall agreement;
+- SHA, candidate, error, source/semantic agreement и отдельный operational guard;
 - duration и bounded public error.
 
 Markdown — компактная таблица для человека. Полная информация всегда остаётся
