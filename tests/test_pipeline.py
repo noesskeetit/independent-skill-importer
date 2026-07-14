@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -57,10 +58,37 @@ class _CountingTransport:
         *,
         timeout_seconds: int,
     ) -> bytes:
-        del endpoint, request, timeout_seconds
+        del endpoint, timeout_seconds
         self.calls += 1
         self.authorizations.append(headers.get("Authorization"))
-        return b"{}"
+        messages = request["messages"]
+        assert isinstance(messages, list)
+        user_content = messages[1]["content"]
+        assert isinstance(user_content, str)
+        hash_marker = "ANALYSIS_HASH: "
+        analysis_hash = user_content[user_content.index(hash_marker) + len(hash_marker) :][:71]
+        begin = "UNTRUSTED_REPOSITORY_DATA_BEGIN\n"
+        end = "\nUNTRUSTED_REPOSITORY_DATA_END"
+        envelope = json.loads(user_content.split(begin, 1)[1].split(end, 1)[0])
+        record = next(item for item in envelope["files"] if item["lines"])
+        line = record["lines"][0]
+        completion = json.dumps(
+            {
+                "analysis_hash": analysis_hash,
+                "verdict": "portable",
+                "confidence": 0.95,
+                "reason_codes": ["SELF_CONTAINED_FILES"],
+                "evidence": [
+                    {
+                        "path": record["path"],
+                        "line": line["line"],
+                        "value": line["value"],
+                    }
+                ],
+                "rationale": "Test transport verifies a self-contained candidate.",
+            }
+        )
+        return json.dumps({"choices": [{"message": {"content": completion}}]}).encode()
 
 
 def _mixed_tree(root: Path, *, skill_count: int = 1) -> None:

@@ -211,13 +211,19 @@ def _fm_payload(
     *,
     verdict: str = "portable",
     confidence: float = 0.97,
+    reason_codes: list[str] | None = None,
     evidence: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    default_reason_codes = {
+        "portable": ["SELF_CONTAINED_FILES"],
+        "plugin_bound": ["PLUGIN_DEPENDENCY"],
+        "ambiguous": ["AUTONOMY_UNPROVEN"],
+    }
     return {
         "analysis_hash": _analysis_hash(request),
         "verdict": verdict,
         "confidence": confidence,
-        "reason_codes": ["SELF_CONTAINED_FILES"],
+        "reason_codes": reason_codes or default_reason_codes[verdict],
         "evidence": evidence
         if evidence is not None
         else [
@@ -312,6 +318,20 @@ def test_review_envelope_is_canonical_hash_bound_and_path_private(tmp_path: Path
     assert "snapshot_root" not in first.canonical_json
     assert not first.redacted
     assert not first.truncated
+
+
+def test_review_envelope_exposes_source_as_exact_line_records(tmp_path: Path) -> None:
+    envelope = build_review_envelope(_context(tmp_path), Limits())
+    payload = json.loads(envelope.canonical_json)
+    skill_file = next(
+        record for record in payload["files"] if record["path"] == "skills/alpha/SKILL.md"
+    )
+
+    assert "content" not in skill_file
+    assert skill_file["lines"][4] == {
+        "line": 5,
+        "value": "No plugin runtime required.",
+    }
 
 
 def test_outside_runtime_review_path_expands_to_snapshot_scope(tmp_path: Path) -> None:
@@ -607,6 +627,72 @@ def test_valid_ambiguous_verdict_stays_ambiguous(tmp_path: Path) -> None:
 
     assert result.classification is Classification.AMBIGUOUS
     assert result.reason.code is ReasonCode.FM_REVIEW_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    ("verdict", "reason_code"),
+    [
+        ("portable", "AUTONOMY_UNPROVEN"),
+        ("plugin_bound", "SELF_CONTAINED_FILES"),
+        ("ambiguous", "SELF_CONTAINED_FILES"),
+    ],
+)
+def test_reason_code_must_support_model_verdict(
+    verdict: str,
+    reason_code: str,
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(
+        lambda request: json.dumps(
+            _fm_payload(request, verdict=verdict, reason_codes=[reason_code])
+        )
+    )
+
+    result = _reviewer(transport).review(_context(tmp_path))
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert result.reason.code is ReasonCode.FM_INVALID_RESPONSE
+    assert len(transport.requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("verdict", "reason_codes"),
+    [
+        ("portable", ["SELF_CONTAINED_FILES", "AUTONOMY_UNPROVEN"]),
+        ("plugin_bound", ["PLUGIN_DEPENDENCY", "SELF_CONTAINED_FILES"]),
+        ("ambiguous", ["AUTONOMY_UNPROVEN", "PLUGIN_DEPENDENCY"]),
+    ],
+)
+def test_canonical_reason_codes_cannot_contradict_model_verdict(
+    verdict: str,
+    reason_codes: list[str],
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport(
+        lambda request: json.dumps(_fm_payload(request, verdict=verdict, reason_codes=reason_codes))
+    )
+
+    result = _reviewer(transport).review(_context(tmp_path))
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert result.reason.code is ReasonCode.FM_INVALID_RESPONSE
+    assert len(transport.requests) == 2
+
+
+def test_unique_adjacent_evidence_line_is_normalized_to_snapshot(tmp_path: Path) -> None:
+    evidence = [
+        {
+            "path": "skills/alpha/SKILL.md",
+            "line": 4,
+            "value": "No plugin runtime required.",
+        }
+    ]
+    transport = FakeTransport(lambda request: json.dumps(_fm_payload(request, evidence=evidence)))
+
+    result = _reviewer(transport).review(_context(tmp_path))
+
+    assert result.classification is Classification.PORTABLE
+    assert result.reason.evidence[0].line == 5
 
 
 def _mutated_response(mutation: str) -> Responder:
@@ -1036,6 +1122,49 @@ def test_repository_prompt_injection_stays_in_untrusted_user_block(tmp_path: Pat
     assert injection not in messages[0]["content"]
 
 
+def test_system_prompt_allows_evidence_only_from_line_addressed_files(tmp_path: Path) -> None:
+    transport = FakeTransport()
+
+    _reviewer(transport).review(_context(tmp_path))
+
+    request = transport.requests[0]["request"]
+    assert isinstance(request, dict)
+    messages = request["messages"]
+    assert isinstance(messages, list)
+    system_prompt = messages[0]["content"]
+    assert "files[].lines[]" in system_prompt
+    assert "Never cite enclosingPackage, staticAnalysis, or contextStatus" in system_prompt
+
+
+def test_system_prompt_requires_non_empty_machine_reason_codes(tmp_path: Path) -> None:
+    transport = FakeTransport()
+
+    _reviewer(transport).review(_context(tmp_path))
+
+    request = transport.requests[0]["request"]
+    assert isinstance(request, dict)
+    messages = request["messages"]
+    assert isinstance(messages, list)
+    system_prompt = messages[0]["content"]
+    normalized_prompt = " ".join(system_prompt.split())
+    assert "reason_codes must contain 1 to 8 unique uppercase identifiers" in normalized_prompt
+    assert "SELF_CONTAINED_FILES" in normalized_prompt
+
+
+def test_system_prompt_does_not_treat_mixed_package_alone_as_dependency(tmp_path: Path) -> None:
+    transport = FakeTransport()
+
+    _reviewer(transport).review(_context(tmp_path))
+
+    request = transport.requests[0]["request"]
+    assert isinstance(request, dict)
+    messages = request["messages"]
+    assert isinstance(messages, list)
+    normalized_prompt = " ".join(messages[0]["content"].split())
+    assert "A mixed enclosing package alone is not a plugin dependency" in normalized_prompt
+    assert "Do not require dynamic execution to return portable" in normalized_prompt
+
+
 def test_cloud_request_uses_exact_contract_and_keeps_key_out_of_body(tmp_path: Path) -> None:
     transport = FakeTransport()
     reviewer = _reviewer(transport)
@@ -1045,7 +1174,7 @@ def test_cloud_request_uses_exact_contract_and_keeps_key_out_of_body(tmp_path: P
     captured = transport.requests[0]
     request = captured["request"]
     assert captured["endpoint"] == CLOUD_RU_FM_ENDPOINT
-    assert captured["timeoutSeconds"] == 20
+    assert captured["timeoutSeconds"] == 60
     assert captured["headers"] == {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
@@ -1211,6 +1340,40 @@ def test_invalid_cloud_response_shape_stays_ambiguous(
 
     assert result.classification is Classification.AMBIGUOUS
     assert result.reason.code is ReasonCode.FM_INVALID_RESPONSE
+
+
+def test_invalid_model_contract_is_retried_once(tmp_path: Path) -> None:
+    attempts = 0
+
+    def respond(request: Mapping[str, object]) -> str:
+        nonlocal attempts
+        attempts += 1
+        payload = _fm_payload(request)
+        if attempts == 1:
+            payload["reason_codes"] = []
+        return json.dumps(payload)
+
+    transport = FakeTransport(respond)
+
+    result = _reviewer(transport).review(_context(tmp_path))
+
+    assert result.classification is Classification.PORTABLE
+    assert len(transport.requests) == 2
+
+
+def test_invalid_model_contract_retry_is_bounded(tmp_path: Path) -> None:
+    def respond(request: Mapping[str, object]) -> str:
+        payload = _fm_payload(request)
+        payload["reason_codes"] = []
+        return json.dumps(payload)
+
+    transport = FakeTransport(respond)
+
+    result = _reviewer(transport).review(_context(tmp_path))
+
+    assert result.classification is Classification.AMBIGUOUS
+    assert result.reason.code is ReasonCode.FM_INVALID_RESPONSE
+    assert len(transport.requests) == 2
 
 
 def test_injected_transport_cannot_bypass_response_byte_cap(tmp_path: Path) -> None:

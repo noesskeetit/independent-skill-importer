@@ -425,6 +425,48 @@ def test_fm_reason_must_be_present_in_analyzed_reasons(tmp_path: Path) -> None:
         )
 
 
+def test_fm_reason_evidence_order_does_not_change_semantic_presence(tmp_path: Path) -> None:
+    static_skill = _analyzed_skill(tmp_path)
+    first = Evidence(
+        path="z-runtime.py",
+        line=2,
+        field=None,
+        value="runtime",
+        detector="fm.review",
+    )
+    second = Evidence(
+        path="skills/x/SKILL.md",
+        line=5,
+        field=None,
+        value="self-contained",
+        detector="fm.review",
+    )
+    fm_reason = DecisionReason(
+        code=ReasonCode.FM_REVIEW_UNAVAILABLE,
+        message="review",
+        evidence=(first, second),
+    )
+    canonical_reason = replace(fm_reason, evidence=(second, first))
+    review = FmReview(
+        analysis_hash=f"sha256:{SHA256}",
+        classification=Classification.AMBIGUOUS,
+        confidence=0.9,
+        reason=fm_reason,
+        rationale="review",
+    )
+
+    analyzed = replace(
+        static_skill,
+        static_classification=Classification.AMBIGUOUS,
+        classification=Classification.AMBIGUOUS,
+        fm_review=review,
+        analysis_method="static+fm",
+        reasons=(canonical_reason,),
+    )
+
+    assert analyzed.fm_review is review
+
+
 def test_valid_fm_promotion_can_enter_import_plan(tmp_path: Path) -> None:
     static_skill = _analyzed_skill(tmp_path)
     review = FmReview(
@@ -973,6 +1015,7 @@ def test_limits_are_immutable_and_match_approved_defaults() -> None:
     limits = Limits()
 
     assert limits.git_timeout_seconds == 60
+    assert limits.fm_timeout_seconds == 60
     assert limits.max_archive_bytes == 100 * 1024 * 1024
     assert limits.max_entries == 10_000
     assert limits.max_candidates == 1_000

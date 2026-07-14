@@ -321,16 +321,20 @@ Fail-closed contract:
 2. Sensitive files исключаются, credential-like values редактируются, repository text обрамляется
    как untrusted data.
 3. Canonical envelope связывается `analysisHash = sha256(exact JSON)`.
-4. Model обязана вернуть exact JSON schema с verdict, confidence, reason codes и evidence.
-5. Каждая cited line/value проверяется по sanitized context, file SHA-256, size и immutable
-   inventory.
-6. `ambiguous -> portable` разрешено только при confidence `>= 0.90`, непустом проверенном evidence
+4. Repository text передаётся как `files[].lines[]`; model может брать evidence только из этих
+   явно пронумерованных строк, а не из `enclosingPackage` или `staticAnalysis` metadata.
+5. Model обязана вернуть exact JSON schema с verdict, confidence, reason codes и evidence.
+6. Каждая cited line/value проверяется по sanitized context, file SHA-256, size и immutable
+   inventory. Допустима только уникальная коррекция на одну соседнюю строку в том же файле;
+   в публичный evidence попадает фактический исправленный номер.
+7. `ambiguous -> portable` разрешено только при confidence `>= 0.90`, непустом проверенном evidence
    и полностью non-redacted/non-truncated context.
 
 Timeout, отсутствующий key, transport error, invalid JSON, hash mismatch, invented evidence,
 redaction или truncation не доказывают автономность: candidate остаётся `ambiguous` с FM reason.
 Verified `plugin_bound` усиливает запрет; verified `portable` разрешает import только в рамках этих
-инвариантов.
+инвариантов. Transport/contract failure повторяется максимум один раз, причём обе попытки входят в
+общий `max_fm_reviews`; два невалидных ответа завершаются fail-closed.
 
 ## 7. Reasons, evidence и внешний контракт scan
 
@@ -539,7 +543,7 @@ Default `Limits`:
 | Параметр | Значение | Защищаемый ресурс |
 |---|---:|---|
 | `git_timeout_seconds` | 60 s | Каждый Git command/archive stream |
-| `fm_timeout_seconds` | 20 s | Один FM request |
+| `fm_timeout_seconds` | 60 s | Один FM request |
 | `max_archive_bytes` | 100 MiB | `git archive` tar |
 | `max_entries` | 10,000 | Source/import entries |
 | `max_candidates` | 1,000 | Candidates, допускаемые к анализу за operation |
@@ -548,7 +552,7 @@ Default `Limits`:
 | `max_depth` | 64 | Path depth |
 | `max_fm_context_chars` | 128 Ki chars | Canonical FM context |
 | `max_fm_response_bytes` | 1 MiB | Raw FM response |
-| `max_fm_reviews` | 50 | Reviews за operation |
+| `max_fm_reviews` | 50 | FM attempts за operation, включая bounded retry |
 | `max_manifest_bytes` | 10 MiB | Canonical import manifest |
 
 Во время scan/import запрещено:

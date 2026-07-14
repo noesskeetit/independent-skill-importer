@@ -591,7 +591,13 @@ class AnalyzedSkill:
             return
         if self.classification is not self.fm_review.classification:
             raise ValueError("final classification must match FM review classification")
-        if self.fm_review.reason not in self.reasons:
+        fm_reason = self.fm_review.reason
+        if not any(
+            reason.code is fm_reason.code
+            and reason.message == fm_reason.message
+            and frozenset(reason.evidence) == frozenset(fm_reason.evidence)
+            for reason in self.reasons
+        ):
             raise ValueError("FM reason must be present in analyzed reasons")
         if self.classification is Classification.PORTABLE:
             if self.fm_review.confidence is None or self.fm_review.confidence < 0.90:

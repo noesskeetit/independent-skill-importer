@@ -8,7 +8,7 @@ class Limits:
     """Immutable resource limits with conservative POC defaults."""
 
     git_timeout_seconds: int = 60
-    fm_timeout_seconds: int = 20
+    fm_timeout_seconds: int = 60
     max_archive_bytes: int = 100 * 1024 * 1024
     max_entries: int = 10_000
     max_scan_bytes: int = 250 * 1024 * 1024
