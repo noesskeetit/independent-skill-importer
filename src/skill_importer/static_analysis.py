@@ -940,6 +940,7 @@ def _python_static_bindings(
     bindings: dict[str, ast.expr] = {}
     values_by_name: dict[str, list[ast.expr]] = {}
     overflow = False
+    stored_assignments = 0
     assignments = sorted(
         ast.walk(tree),
         key=lambda node: (
@@ -958,11 +959,12 @@ def _python_static_bindings(
         if not isinstance(target, ast.Name) or value is None:
             continue
         name = target.id
-        if name not in bindings and len(bindings) >= _MAX_STATIC_BINDINGS:
+        if stored_assignments >= _MAX_STATIC_BINDINGS:
             overflow = True
             continue
         bindings[name] = value
         values_by_name.setdefault(name, []).append(value)
+        stored_assignments += 1
     return (
         bindings,
         {name: tuple(values) for name, values in values_by_name.items()},
@@ -994,6 +996,7 @@ def _python_path_taint(
     content: str,
     line_starts: tuple[int, ...],
     bindings: Mapping[str, tuple[ast.expr, ...]],
+    memo: dict[str, _PathTaint],
     resolving: set[str],
     depth: int = 0,
 ) -> _PathTaint:
@@ -1013,6 +1016,8 @@ def _python_path_taint(
     )
 
     if isinstance(node, ast.Name):
+        if node.id in memo:
+            return _merge_path_taints((direct, memo[node.id]))
         if node.id in resolving:
             return direct
         values = bindings.get(node.id, ())
@@ -1025,12 +1030,14 @@ def _python_path_taint(
                 content=content,
                 line_starts=line_starts,
                 bindings=bindings,
+                memo=memo,
                 resolving=resolving,
                 depth=depth + 1,
             )
             for value in values
         )
         resolving.remove(node.id)
+        memo[node.id] = propagated
         return _merge_path_taints((direct, propagated))
 
     children = tuple(child for child in ast.iter_child_nodes(node) if isinstance(child, ast.expr))
@@ -1045,6 +1052,7 @@ def _python_path_taint(
                     content=content,
                     line_starts=line_starts,
                     bindings=bindings,
+                    memo=memo,
                     resolving=resolving,
                     depth=depth + 1,
                 )
@@ -1287,6 +1295,7 @@ def _python_static_consumed_path_references(
 ) -> Iterable[_PathReference]:
     bindings, taint_bindings, binding_overflow = _python_static_bindings(tree)
     memo: dict[str, _StaticPathValue | None] = {}
+    taint_memo: dict[str, _PathTaint] = {}
     emitted: set[tuple[str, int, str]] = set()
 
     def resolved(node: ast.expr) -> _StaticPathValue | None:
@@ -1331,6 +1340,7 @@ def _python_static_consumed_path_references(
                 content=content,
                 line_starts=line_starts,
                 bindings=taint_bindings,
+                memo=taint_memo,
                 resolving=set(),
             )
             if taint.plugin_value is not None and taint.plugin_offset is not None:
@@ -1345,7 +1355,12 @@ def _python_static_consumed_path_references(
                     )
                 continue
             value = resolved(expression)
-            if value is None:
+            uncertain_repository_value = (
+                value is not None
+                and not value.anchored_to_repository
+                and (taint.repository or (binding_overflow and value.propagated))
+            )
+            if value is None or uncertain_repository_value:
                 if taint.repository or binding_overflow:
                     reference = (
                         ast.get_source_segment(content, expression) or type(expression).__name__
@@ -1937,6 +1952,7 @@ def _javascript_static_bindings(
     bindings: dict[str, tuple[int, int]] = {}
     spans_by_name: dict[str, list[tuple[int, int]]] = {}
     overflow = False
+    stored_bindings = 0
     for index, token in enumerate(tokens):
         if token.value not in {"const", "let", "var"} or index + 3 >= len(tokens):
             continue
@@ -1945,12 +1961,13 @@ def _javascript_static_bindings(
             continue
         end = _javascript_expression_end(content, tokens, index + 3, len(tokens), pairs)
         identifier = name.value
-        if identifier not in bindings and len(bindings) >= _MAX_STATIC_BINDINGS:
+        if stored_bindings >= _MAX_STATIC_BINDINGS:
             overflow = True
             continue
         span = (index + 3, end)
         bindings[identifier] = span
         spans_by_name.setdefault(identifier, []).append(span)
+        stored_bindings += 1
     return (
         bindings,
         {name: tuple(spans) for name, spans in spans_by_name.items()},
@@ -1965,6 +1982,7 @@ def _javascript_path_taint(
     end: int,
     *,
     bindings: Mapping[str, tuple[tuple[int, int], ...]],
+    memo: dict[str, _PathTaint],
     resolving: set[str],
     depth: int = 0,
 ) -> _PathTaint:
@@ -1987,23 +2005,30 @@ def _javascript_path_taint(
     for token in tokens[start:end]:
         if token.kind != "identifier" or token.value in resolving:
             continue
+        if token.value in memo:
+            propagated.append(memo[token.value])
+            continue
         spans = bindings.get(token.value, ())
         if not spans:
             continue
         resolving.add(token.value)
-        propagated.extend(
+        binding_taints = tuple(
             _javascript_path_taint(
                 content,
                 tokens,
                 span_start,
                 span_end,
                 bindings=bindings,
+                memo=memo,
                 resolving=resolving,
                 depth=depth + 1,
             )
             for span_start, span_end in spans
         )
         resolving.remove(token.value)
+        combined = _merge_path_taints(binding_taints)
+        memo[token.value] = combined
+        propagated.append(combined)
     return _merge_path_taints((direct, *propagated))
 
 
@@ -2213,6 +2238,7 @@ def _javascript_path_references(
         pairs,
     )
     memo: dict[str, _StaticPathValue | None] = {}
+    taint_memo: dict[str, _PathTaint] = {}
     for path in _javascript_static_imports(tokens):
         yield _PathReference(
             path.value,
@@ -2236,6 +2262,7 @@ def _javascript_path_references(
                 tokens,
                 *span,
                 bindings=taint_bindings,
+                memo=taint_memo,
                 resolving=set(),
             )
             if taint.plugin_value is not None and taint.plugin_offset is not None:
@@ -2255,7 +2282,12 @@ def _javascript_path_references(
                 memo=memo,
                 resolving=set(),
             )
-            if static_value is not None:
+            uncertain_repository_value = (
+                static_value is not None
+                and not static_value.anchored_to_repository
+                and (taint.repository or (binding_overflow and static_value.propagated))
+            )
+            if static_value is not None and not uncertain_repository_value:
                 value = _static_reference_value(static_value, entry_path)
                 dynamic = False
             elif taint.repository or binding_overflow:

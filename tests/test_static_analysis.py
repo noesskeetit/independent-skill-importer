@@ -3530,6 +3530,51 @@ def test_python_reassigned_repo_root_is_not_dropped_as_ambiguous(tmp_path: Path)
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
 
 
+def test_python_earlier_repo_root_use_survives_later_local_reassignment(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.py": "def run(): pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runner.py": (
+                "from pathlib import Path\n"
+                "root = Path(__file__).resolve().parents[2]\n"
+                '(root / "runtime/engine.py").read_text()\n'
+                'root = Path("local-output")\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
+def test_python_repo_root_in_one_function_survives_same_local_name_elsewhere(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.py": "def run(): pass\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/runner.py": (
+                "from pathlib import Path\n"
+                "def plugin_read():\n"
+                "    root = Path(__file__).resolve().parents[2]\n"
+                '    return (root / "runtime/engine.py").read_text()\n'
+                "def local_write():\n"
+                '    root = Path("local-output")\n'
+                '    root.write_text("ok")\n'
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
+
+
 @pytest.mark.parametrize(
     "expression",
     [
@@ -3641,6 +3686,33 @@ def test_javascript_static_path_bindings_are_case_sensitive(tmp_path: Path) -> N
     assert result.classification is Classification.PLUGIN_BOUND
     assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT in result.reason_codes
     assert ReasonCode.PLUGIN_RUNTIME_FILE_REFERENCE in result.reason_codes
+
+
+def test_javascript_repo_root_in_one_function_survives_same_local_name_elsewhere(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "runtime/engine.js": "export const run = () => {};\n",
+            "skills/alpha/SKILL.md": _skill(),
+            "skills/alpha/scripts/runner.js": (
+                'const path = require("node:path");\n'
+                'const { readFileSync } = require("node:fs");\n'
+                "function pluginRead() {\n"
+                '  const root = path.join(__dirname, "../../../runtime/engine.js");\n'
+                '  readFileSync(root, "utf8");\n'
+                "}\n"
+                "function localRead() {\n"
+                '  const root = "local-output";\n'
+                '  readFileSync(root, "utf8");\n'
+                "}\n"
+            ),
+        },
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED in result.reason_codes
 
 
 def test_javascript_semicolonless_repo_relative_read_is_nonportable(tmp_path: Path) -> None:
