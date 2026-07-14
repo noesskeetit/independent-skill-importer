@@ -606,18 +606,18 @@ def _resolve_local_reference(
     if decoded != raw and ".." in PurePosixPath(decoded).parts:
         return None, True
 
-    primary, escaped = _collapse_path(PurePosixPath(entry_path).parent, decoded)
+    primary, escaped = _collapse_path(PurePosixPath(entry_path).parent, raw)
     if escaped or primary is None:
         return None, True
     if primary in by_path:
         return primary, False
 
-    if ".." in PurePosixPath(decoded).parts:
+    if ".." in PurePosixPath(raw).parts:
         return primary, False
 
     seen = {primary}
     for base in (PurePosixPath(candidate_root), PurePosixPath(".")):
-        resolved, fallback_escaped = _collapse_path(base, decoded)
+        resolved, fallback_escaped = _collapse_path(base, raw)
         if fallback_escaped or resolved is None or resolved in seen:
             continue
         seen.add(resolved)
@@ -1488,8 +1488,9 @@ def _analyze_forward_paths(
             )
 
         for source_value, offset in _path_references(content):
-            raw = _decode_reference(source_value)
-            if _is_unsafe_host_reference(raw):
+            raw = source_value
+            decoded = _decode_reference(raw)
+            if _is_unsafe_host_reference(decoded):
                 if collector.has_capacity(ReasonCode.PATH_TRAVERSAL):
                     collector.add(
                         ReasonCode.PATH_TRAVERSAL,
@@ -1503,11 +1504,11 @@ def _analyze_forward_paths(
                         ),
                     )
                 continue
-            if not _is_candidate_local_reference(raw):
+            if not _is_candidate_local_reference(decoded):
                 continue
-            if _PLUGIN_VARIABLE_RE.search(raw) is not None:
+            if _PLUGIN_VARIABLE_RE.search(decoded) is not None:
                 continue
-            if _DYNAMIC_RE.search(raw) is not None:
+            if _DYNAMIC_RE.search(decoded) is not None:
                 if collector.has_capacity(ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED):
                     collector.add(
                         ReasonCode.DYNAMIC_REFERENCE_UNRESOLVED,
@@ -1515,7 +1516,7 @@ def _analyze_forward_paths(
                             entry.path,
                             content,
                             offset,
-                            raw,
+                            decoded,
                             "static.forward.dynamic_reference",
                             field="path",
                         ),

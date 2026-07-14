@@ -576,6 +576,64 @@ def test_repository_root_relative_resolution_keeps_snapshot_traversal_blocked(
     assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
 
 
+def test_local_reference_resolver_does_not_decode_raw_target_coordinates(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/session-viewer/SKILL.md": _skill(
+                "Run [script](skills%252Fsession-viewer%252Fscripts%252Fsession-viewer.ts).\n"
+            ),
+            "skills/session-viewer/scripts/session-viewer.ts": "export {};\n",
+        },
+        root="skills/session-viewer",
+    )
+
+    assert result.classification is Classification.PLUGIN_BOUND
+    assert ReasonCode.MISSING_LOCAL_RESOURCE in result.reason_codes
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
+def test_local_reference_resolver_keeps_double_encoded_traversal_blocked(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "skills/session-viewer/SKILL.md": _skill(
+                "Read [passwd](%252e%252e%252f%252e%252e%252f"
+                "%252e%252e%252fetc%252fpasswd).\n"
+            )
+        },
+        root="skills/session-viewer",
+    )
+
+    assert result.classification is Classification.BLOCKED
+    assert ReasonCode.PATH_TRAVERSAL in result.reason_codes
+
+
+def test_local_reference_resolver_prefers_candidate_root_for_nested_entry(
+    tmp_path: Path,
+) -> None:
+    result = _analyze(
+        tmp_path,
+        {
+            "references/guide.md": "repository guide",
+            "skills/session-viewer/SKILL.md": _skill(),
+            "skills/session-viewer/references/guide.md": "candidate guide",
+            "skills/session-viewer/scripts/session-viewer.ts": (
+                'readFileSync("references/guide.md");\n'
+            ),
+        },
+        root="skills/session-viewer",
+    )
+
+    assert result.classification is Classification.PORTABLE
+    assert ReasonCode.MISSING_LOCAL_RESOURCE not in result.reason_codes
+    assert ReasonCode.REFERENCE_OUTSIDE_SKILL_ROOT not in result.reason_codes
+
+
 def test_existing_parent_resource_is_outside_skill_and_nonportable(tmp_path: Path) -> None:
     result = _analyze(
         tmp_path,
