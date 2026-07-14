@@ -569,6 +569,7 @@ def test_markdown_bare_inline_destination_paths_are_not_dependencies(
             ".agents/skills/plugin-creator/SKILL.md": _skill(
                 "The marketplace config is `.agents/plugins/marketplace.json`.\n"
                 "Generated plugin packages use `./plugins/` as their destination.\n"
+                "Keep source.path as `./plugins/<plugin-name>`.\n"
             ),
         },
         root=".agents/skills/plugin-creator",

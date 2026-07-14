@@ -174,14 +174,10 @@
             "staticClassification": "plugin_bound",
             "finalClassification": "plugin_bound",
             "staticReasonCodes": [
-              "REFERENCED_BY_PLUGIN_RUNTIME",
-              "PLUGIN_RUNTIME_FILE_REFERENCE",
-              "REFERENCE_OUTSIDE_SKILL_ROOT"
+              "REFERENCED_BY_PLUGIN_RUNTIME"
             ],
             "finalReasonCodes": [
-              "REFERENCED_BY_PLUGIN_RUNTIME",
-              "PLUGIN_RUNTIME_FILE_REFERENCE",
-              "REFERENCE_OUTSIDE_SKILL_ROOT"
+              "REFERENCED_BY_PLUGIN_RUNTIME"
             ],
             "provenanceLinks": [
               "https://github.com/anthropics/claude-plugins-official/blob/ba1611e22a569ea036c3bc1c6889a41319130fe8/plugins/example-plugin/commands/example-command.md#L1-L11",

@@ -1789,7 +1789,10 @@ def _markdown_inline_code_has_dependency_context(
     line_start = content.rfind("\n", 0, match.start()) + 1
     if _MARKDOWN_INLINE_DEPENDENCY_ACTION_RE.search(content[line_start : match.start()]):
         return True
-    tokens, failed = _shell_tokens(match.group("body"))
+    body = match.group("body").strip()
+    if not any(character.isspace() for character in body) and _looks_shell_path(body):
+        return False
+    tokens, failed = _shell_tokens(body)
     return not failed and len(tokens) > 1
 
 
