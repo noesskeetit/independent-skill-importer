@@ -42,6 +42,31 @@
    `docs/INTERNAL_IMPLEMENTATION_REFERENCE.md`.
 4. README-ссылки и описание FM key обновляются под новую структуру и автозагрузку `.env`.
 
+### Форма документа для техлида
+
+Документ про решение об импорте должен отвечать на один практический вопрос: «нам передали
+произвольный repository, где вперемешку могут лежать marketplace, skillsets, Codex/Claude/другие
+plugins, examples и обычный code; как importer понимает, какие skills можно безопасно забрать на
+платформу?» Объяснение помещается примерно на одну страницу и строится простым языком:
+
+1. Importer не пытается сначала угадать тип всего repository; он рекурсивно находит каждую
+   директорию с `SKILL.md`/`skill.md` и рассматривает её отдельно.
+2. Для candidate определяется enclosing plugin/package boundary, но сам plugin никогда не
+   импортируется.
+3. Проверяется, всё ли необходимое находится внутри skill root. Ссылки или вызовы plugin runtime,
+   MCP, hooks, commands, agents, providers, scripts/resources снаружи означают зависимость.
+4. Проверяется обратная связь: использует ли runtime/конфигурация plugin этот skill как внутреннюю
+   часть orchestration.
+5. Если зависимости нет и автономность доказана — `portable`; явная зависимость — `plugin_bound`;
+   некорректный skill — `invalid`; traversal/symlink escape — `blocked`; недостаток статических
+   доказательств — `ambiguous` и только тогда optional FM review.
+6. `import` копирует только итоговые `portable` и только содержимое их skill root.
+
+Текст должен сопровождаться одной небольшой decision table и двумя примерами: standalone skill,
+который импортируется, и skill внутри plugin, вызывающий `${PLUGIN_ROOT}/scripts/tool`, который
+отбрасывается. Названия внутренних Python classes, детали hashing/TOCTOU и полный перечень regex
+detectors остаются только в internal reference.
+
 ## Проверки
 
 - TDD: `.env` key используется обеими CLI-командами; process env побеждает; legacy fallback
